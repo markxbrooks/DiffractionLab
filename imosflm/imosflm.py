@@ -8,7 +8,7 @@ import fabio  # Import FabIO
 import matplotlib.pyplot as plt
 import cv2
 import numpy as np
-import h5py
+import h5py"} "
 
 # Set environment variables
 os.environ['MAINTAINER'] = 'mosflm@mrc-lmb.cam.ac.uk'
