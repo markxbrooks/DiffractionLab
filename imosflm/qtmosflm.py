@@ -84,44 +84,83 @@ def is_readable_hdf5(path: Path) -> bool:
         return False
 
 
+def _is_broken_symlink(path: Path) -> bool:
+    """Return True if *path* is a symlink whose target is missing."""
+    try:
+        return path.is_symlink() and not path.exists()
+    except OSError:
+        return False
+
+
 def find_external_data_file(master_dir: Path, filename: str) -> Path | None:
     """Locate an externally linked NeXus data file near a master HDF5.
 
-    DLS / browser downloads often leave files in ``name.h5.download/name.h5``
-    instead of beside the master as the ExternalLink expects.
-    """
-    expected = master_dir / filename
-    if expected.is_file():
-        return expected.resolve()
+    Handles common browser download quirks:
 
-    candidates = [
+    - files left in ``name.h5.download/name.h5``
+    - Safari/Chrome renames such as ``name-2.h5`` / ``name (1).h5`` when a
+      broken symlink already occupies ``name.h5``
+    """
+    stem = Path(filename).stem
+    suffix = Path(filename).suffix  # typically .h5
+
+    candidates: list[Path] = [
+        master_dir / filename,
         master_dir / f"{filename}.download" / filename,
-        master_dir / f"{Path(filename).stem}.download" / filename,
-        master_dir / Path(filename).stem / filename,
+        master_dir / f"{stem}.download" / filename,
+        master_dir / stem / filename,
     ]
+    # Browser duplicate-name renames: stem-2.h5, stem-3.h5, stem (1).h5, …
+    for n in range(2, 10):
+        candidates.append(master_dir / f"{stem}-{n}{suffix}")
+        candidates.append(master_dir / f"{stem} ({n - 1}){suffix}")
+
     try:
         for sub in master_dir.iterdir():
             if not sub.is_dir():
                 continue
             candidates.append(sub / filename)
+            for n in range(2, 6):
+                candidates.append(sub / f"{stem}-{n}{suffix}")
     except OSError:
         pass
 
+    # Exact-name recursive matches, then stem-* renames in the master directory.
+    try:
+        candidates.extend(sorted(master_dir.glob(f"**/{filename}")))
+        candidates.extend(sorted(master_dir.glob(f"{stem}-*{suffix}")))
+    except OSError:
+        pass
+
+    seen: set[Path] = set()
+    readable: list[Path] = []
     for cand in candidates:
         try:
-            if cand.is_file():
-                return cand.resolve()
+            if _is_broken_symlink(cand):
+                continue
+            if not cand.is_file():
+                continue
+            resolved = cand.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            if is_readable_hdf5(resolved):
+                readable.append(resolved)
         except OSError:
             continue
 
-    try:
-        matches = sorted(master_dir.glob(f"**/{filename}"))
-    except OSError:
-        matches = []
-    for match in matches:
-        if match.is_file():
-            return match.resolve()
-    return None
+    if not readable:
+        return None
+
+    # Prefer the canonical filename if it is a real, readable file; otherwise
+    # the largest readable candidate (complete re-download vs partial).
+    for path in readable:
+        if path.name == filename and not path.is_symlink():
+            return path
+    for path in readable:
+        if path.name == filename:
+            return path
+    return max(readable, key=lambda p: p.stat().st_size)
 
 
 def ensure_nexus_external_links(
@@ -129,8 +168,9 @@ def ensure_nexus_external_links(
 ) -> tuple[dict[str, Path], list[str], list[str]]:
     """Resolve ``/entry/data`` ExternalLinks for a NeXus master file.
 
-    Creates sibling symlinks when a linked file is found in an alternate
-    location (e.g. a browser ``*.download`` folder).
+    Creates or repairs sibling symlinks when a linked file is found under an
+    alternate name/location (browser ``*.download`` folders or ``*-2.h5``
+    renames).
 
     :returns: ``(resolved, missing_filenames, incomplete_filenames)``
     """
@@ -149,37 +189,65 @@ def ensure_nexus_external_links(
             if not isinstance(link, h5py.ExternalLink):
                 continue
             target_name = str(link.filename)
+            expected = master_dir / target_name
             found = find_external_data_file(master_dir, target_name)
             if found is None:
-                missing.append(target_name)
-                logging.error(
-                    "Missing external data file for %s: expected %s next to %s",
-                    name,
-                    target_name,
-                    master_dir,
-                )
+                # Distinguish "present but truncated" from truly missing when
+                # only a broken symlink / partial download occupies the name.
+                partial = None
+                for cand in (
+                    expected,
+                    master_dir / f"{target_name}.download" / target_name,
+                ):
+                    try:
+                        if cand.is_file() and not is_readable_hdf5(cand):
+                            partial = cand
+                            break
+                    except OSError:
+                        continue
+                if partial is not None:
+                    incomplete.append(target_name)
+                    logging.error(
+                        "Incomplete/truncated data file for %s at %s",
+                        name,
+                        partial,
+                    )
+                else:
+                    missing.append(target_name)
+                    logging.error(
+                        "Missing external data file for %s: expected %s next to %s",
+                        name,
+                        target_name,
+                        master_dir,
+                    )
                 continue
-            if not is_readable_hdf5(found):
-                incomplete.append(target_name)
-                logging.error(
-                    "Incomplete/truncated data file for %s at %s "
-                    "(download still in progress?)",
-                    name,
-                    found,
-                )
-                continue
-            expected = master_dir / target_name
-            if not expected.exists():
-                try:
+
+            # Repair broken / stale symlink so h5py ExternalLinks also work.
+            try:
+                if _is_broken_symlink(expected) or (
+                    expected.is_symlink() and expected.resolve() != found
+                ):
+                    expected.unlink()
+                    logging.info("Removed stale symlink %s", expected)
+                if not expected.exists():
                     expected.symlink_to(found)
                     logging.info("Created symlink %s -> %s", expected, found)
-                except OSError as ex:
-                    logging.warning(
-                        "Could not symlink %s -> %s (%s); will open data file directly",
-                        expected,
+                elif expected.resolve() != found and expected.name != found.name:
+                    # Canonical name already exists as a different real file;
+                    # open the resolved path directly.
+                    logging.info(
+                        "Using %s for link %s (canonical name occupied)",
                         found,
-                        ex,
+                        name,
                     )
+            except OSError as ex:
+                logging.warning(
+                    "Could not repair symlink %s -> %s (%s); "
+                    "will open data file directly",
+                    expected,
+                    found,
+                    ex,
+                )
             resolved[name] = found
     return resolved, missing, incomplete
 
@@ -831,9 +899,9 @@ class IMosflmApp(QMainWindow):
                     + "\n\n".join(problems)
                     + f"\n\nMaster: {master_path}\n\n"
                     "Eiger masters expect files like `…_000001.h5` beside the "
-                    "master. Browser downloads often leave them in "
-                    "`name.h5.download/` until finished — wait for the download "
-                    "to complete, then reopen."
+                    "master. Browsers may leave them in `name.h5.download/` or "
+                    "rename completed downloads to `name-2.h5` when a broken "
+                    "symlink still occupies the original name."
                 )
                 if not resolved:
                     QMessageBox.critical(self, "HDF5 data files not ready", message)
