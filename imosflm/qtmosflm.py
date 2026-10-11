@@ -11,19 +11,195 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import h5py
-from PySide6.QtWidgets import QApplication, QMainWindow, QFileDialog, QVBoxLayout, QHBoxLayout, QLabel, QSlider, QPushButton, QTextEdit, QWidget, QComboBox, QCheckBox
-from PySide6.QtGui import QImage, QPixmap, QPalette, QColor, QPainter, QPen
-from PySide6.QtCore import Qt, QSize, QPoint
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QFileDialog,
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QSlider,
+    QStatusBar,
+    QToolBar,
+    QVBoxLayout,
+    QWidget,
+)
+from PySide6.QtGui import QAction, QColor, QIcon, QImage, QPainter, QPen, QPixmap
+from PySide6.QtCore import Qt, QSize
 
-from PIL import Image, ImageTk, ImageOps, ImageEnhance
+from PIL import Image, ImageOps
 import fabio  # Import FabIO
 import matplotlib.pyplot as plt
 import cv2
 import numpy as np
-# from contourpy.chunk import two_factors
-# from pefile import two_way_dict
 
-# from image_grouping import *
+try:
+    from picoui.icons import IconRegistry
+    from picoui.theme import ThemeManager, ThemeType
+
+    _HAS_PICOUI = True
+except ImportError:  # pragma: no cover - optional when run outside ElMo venv
+    IconRegistry = None  # type: ignore[assignment, misc]
+    ThemeManager = None  # type: ignore[assignment, misc]
+    ThemeType = None  # type: ignore[assignment, misc]
+    _HAS_PICOUI = False
+
+
+def _registry_icon(icon_key: str) -> QIcon:
+    """Return an IconRegistry icon, or an empty icon if PicoUI is unavailable."""
+    if not _HAS_PICOUI or not icon_key:
+        return QIcon()
+    return IconRegistry.get_icon_safe(icon_key)
+
+
+def _theme_colors() -> dict[str, str]:
+    """Return ThemeManager CSS colors, with dark fallbacks when unavailable."""
+    if _HAS_PICOUI:
+        try:
+            return dict(ThemeManager.css_colors())
+        except Exception:
+            pass
+    return {
+        "base": "#202124",
+        "button": "#3f4042",
+        "window": "#202124",
+        "text": "#e1e5e9",
+        "mid": "#3f4042",
+        "highlight": "#8ab4f7",
+        "highlighted_text": "#202124",
+        "alternate": "#ffffff",
+    }
+
+
+def is_readable_hdf5(path: Path) -> bool:
+    """Return True if *path* opens as a complete HDF5 file."""
+    try:
+        with h5py.File(path, "r"):
+            return True
+    except OSError as ex:
+        logging.warning("HDF5 not readable yet (%s): %s", path, ex)
+        return False
+
+
+def find_external_data_file(master_dir: Path, filename: str) -> Path | None:
+    """Locate an externally linked NeXus data file near a master HDF5.
+
+    DLS / browser downloads often leave files in ``name.h5.download/name.h5``
+    instead of beside the master as the ExternalLink expects.
+    """
+    expected = master_dir / filename
+    if expected.is_file():
+        return expected.resolve()
+
+    candidates = [
+        master_dir / f"{filename}.download" / filename,
+        master_dir / f"{Path(filename).stem}.download" / filename,
+        master_dir / Path(filename).stem / filename,
+    ]
+    try:
+        for sub in master_dir.iterdir():
+            if not sub.is_dir():
+                continue
+            candidates.append(sub / filename)
+    except OSError:
+        pass
+
+    for cand in candidates:
+        try:
+            if cand.is_file():
+                return cand.resolve()
+        except OSError:
+            continue
+
+    try:
+        matches = sorted(master_dir.glob(f"**/{filename}"))
+    except OSError:
+        matches = []
+    for match in matches:
+        if match.is_file():
+            return match.resolve()
+    return None
+
+
+def ensure_nexus_external_links(
+    master_path: Path,
+) -> tuple[dict[str, Path], list[str], list[str]]:
+    """Resolve ``/entry/data`` ExternalLinks for a NeXus master file.
+
+    Creates sibling symlinks when a linked file is found in an alternate
+    location (e.g. a browser ``*.download`` folder).
+
+    :returns: ``(resolved, missing_filenames, incomplete_filenames)``
+    """
+    master_path = Path(master_path).resolve()
+    master_dir = master_path.parent
+    resolved: dict[str, Path] = {}
+    missing: list[str] = []
+    incomplete: list[str] = []
+
+    with h5py.File(master_path, "r") as handle:
+        if "entry/data" not in handle:
+            return resolved, missing, incomplete
+        group = handle["entry/data"]
+        for name in group.keys():
+            link = group.get(name, getlink=True)
+            if not isinstance(link, h5py.ExternalLink):
+                continue
+            target_name = str(link.filename)
+            found = find_external_data_file(master_dir, target_name)
+            if found is None:
+                missing.append(target_name)
+                logging.error(
+                    "Missing external data file for %s: expected %s next to %s",
+                    name,
+                    target_name,
+                    master_dir,
+                )
+                continue
+            if not is_readable_hdf5(found):
+                incomplete.append(target_name)
+                logging.error(
+                    "Incomplete/truncated data file for %s at %s "
+                    "(download still in progress?)",
+                    name,
+                    found,
+                )
+                continue
+            expected = master_dir / target_name
+            if not expected.exists():
+                try:
+                    expected.symlink_to(found)
+                    logging.info("Created symlink %s -> %s", expected, found)
+                except OSError as ex:
+                    logging.warning(
+                        "Could not symlink %s -> %s (%s); will open data file directly",
+                        expected,
+                        found,
+                        ex,
+                    )
+            resolved[name] = found
+    return resolved, missing, incomplete
+
+
+def list_entry_data_names(master_path: Path) -> list[str]:
+    """List ``/entry/data`` image link names without opening external files."""
+    names: list[str] = []
+    with h5py.File(master_path, "r") as handle:
+        if "entry/data" not in handle:
+            return names
+        group = handle["entry/data"]
+        for name in group.keys():
+            link = group.get(name, getlink=True)
+            if isinstance(link, h5py.ExternalLink):
+                names.append(name)
+            elif isinstance(link, h5py.HardLink):
+                # Skip non-image auxiliaries such as omega.
+                if name.lower().startswith("data"):
+                    names.append(name)
+    return names
 
 # Set environment variables
 os.environ["QT_LOGGING_RULES"] = "*.debug=false"
@@ -224,118 +400,250 @@ class IMosflmApp(QMainWindow):
         self.incident_wavelength = None
         self.x_pixel_size = 0.075
         self.y_pixel_size = 0.075
-        self.setWindowTitle("iMosflm")
-        self.setGeometry(100, 100, 800, 1000)
+        self.setWindowTitle("qtMosflm")
+        self.setGeometry(100, 100, 900, 1000)
         self.current_image = None
         self.current_file = None
         self.dataset = None
+        self._h5_master = None
+        self._h5_data = None
+        self._external_data_paths: dict[str, Path] = {}
         self.num_frames = 0
         self.slice_size = 10  # Number of frames to load at once
         self.beam_center = None
         self.image_inverted = False
         self.show_rings = True  # Default to showing rings
-        # Main widget and layout
+
+        if _HAS_PICOUI:
+            self.setWindowIcon(_registry_icon(IconRegistry.DATASET_PROCESSING))
+
+        self._build_actions()
+        self._build_menus()
+        self._build_toolbar()
+        self._build_central_ui()
+        self._apply_widget_styles()
+
+        status = QStatusBar()
+        self.setStatusBar(status)
+        status.showMessage("Open a CBF, HDF5, TIFF, or image file to begin.")
+
+    def _build_actions(self) -> None:
+        """Create QActions backed by IconRegistry icons."""
+        self._act_open = QAction(
+            _registry_icon(
+                IconRegistry.FOLDER_OPENED if _HAS_PICOUI else ""
+            ),
+            "&Open…",
+            self,
+        )
+        self._act_open.setShortcut("Ctrl+O")
+        self._act_open.setStatusTip("Open a diffraction image or HDF5 dataset")
+        self._act_open.triggered.connect(self.open_file)
+
+        self._act_invert = QAction(
+            _registry_icon(
+                IconRegistry.BACKGROUND_TOGGLE if _HAS_PICOUI else ""
+            ),
+            "&Invert",
+            self,
+        )
+        self._act_invert.setStatusTip("Invert the current image")
+        self._act_invert.triggered.connect(self.invert_image)
+
+        self._act_histogram = QAction(
+            _registry_icon(
+                IconRegistry.CHART_SCATTER_PLOT if _HAS_PICOUI else ""
+            ),
+            "&Histogram",
+            self,
+        )
+        self._act_histogram.setStatusTip("Show intensity histogram")
+        self._act_histogram.triggered.connect(self.show_histogram)
+
+        self._act_rings = QAction(
+            _registry_icon(
+                IconRegistry.CLIP_SLICE if _HAS_PICOUI else ""
+            ),
+            "Show &rings",
+            self,
+        )
+        self._act_rings.setCheckable(True)
+        self._act_rings.setChecked(self.show_rings)
+        self._act_rings.setStatusTip("Toggle resolution rings")
+        self._act_rings.toggled.connect(self._on_rings_action_toggled)
+
+        self._act_quit = QAction(
+            _registry_icon(IconRegistry.EXIT if _HAS_PICOUI else ""),
+            "&Quit",
+            self,
+        )
+        self._act_quit.setShortcut("Ctrl+Q")
+        self._act_quit.setStatusTip("Quit qtMosflm")
+        self._act_quit.triggered.connect(self.close)
+
+    def _build_menus(self) -> None:
+        """Build File menu with IconRegistry actions."""
+        file_menu = self.menuBar().addMenu("&File")
+        file_menu.addAction(self._act_open)
+        file_menu.addSeparator()
+        file_menu.addAction(self._act_invert)
+        file_menu.addAction(self._act_histogram)
+        file_menu.addAction(self._act_rings)
+        file_menu.addSeparator()
+        file_menu.addAction(self._act_quit)
+
+    def _build_toolbar(self) -> None:
+        """Build a themed toolbar with IconRegistry actions."""
+        toolbar = QToolBar("Main")
+        toolbar.setObjectName("qtmosflmMainToolBar")
+        toolbar.setMovable(False)
+        toolbar.setIconSize(QSize(20, 20))
+        self.addToolBar(toolbar)
+        toolbar.addAction(self._act_open)
+        toolbar.addSeparator()
+        toolbar.addAction(self._act_invert)
+        toolbar.addAction(self._act_histogram)
+        toolbar.addAction(self._act_rings)
+
+    def _build_central_ui(self) -> None:
+        """Build the central image viewer and controls."""
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         layout = QVBoxLayout(main_widget)
 
-        # Resolution display
+        # Resolution / beam readout
         resolution_layout = QHBoxLayout()
         self.resolution_label = QLabel("Resolution: N/A")
         resolution_layout.addWidget(self.resolution_label)
-
         self.beam_x_label = QLabel("beam_x: N/A")
         resolution_layout.addWidget(self.beam_x_label)
-
         self.beam_y_label = QLabel("beam_y: N/A")
         resolution_layout.addWidget(self.beam_y_label)
-
         self.x_pixel_label = QLabel("x pixel: N/A")
         resolution_layout.addWidget(self.x_pixel_label)
-
         self.y_pixel_label = QLabel("y pixel: N/A")
         resolution_layout.addWidget(self.y_pixel_label)
-
-        self.two_theta_label= QLabel(f"two theta: N/A degrees")
+        self.two_theta_label = QLabel("two theta: N/A degrees")
         resolution_layout.addWidget(self.two_theta_label)
-
         layout.addLayout(resolution_layout)
-
-        # Checkbox for resolution rings
-        self.rings_checkbox = QCheckBox("Show Resolution Rings")
-        self.rings_checkbox.setChecked(True)
-        self.rings_checkbox.stateChanged.connect(self.toggle_rings)
-        layout.addWidget(self.rings_checkbox)
 
         # Dataset selection
         dataset_layout = QHBoxLayout()
         dataset_label = QLabel("Dataset")
+        if _HAS_PICOUI:
+            dataset_icon = QLabel()
+            dataset_icon.setPixmap(
+                _registry_icon(IconRegistry.DATASETS).pixmap(16, 16)
+            )
+            dataset_layout.addWidget(dataset_icon)
         dataset_layout.addWidget(dataset_label)
-        
         self.dataset_combo = QComboBox()
         self.dataset_combo.currentIndexChanged.connect(self.change_dataset)
-        dataset_layout.addWidget(self.dataset_combo)
+        dataset_layout.addWidget(self.dataset_combo, stretch=1)
         layout.addLayout(dataset_layout)
 
         # Image display
         self.image_label = QLabel("No image loaded")
-        self.image_label.setMinimumHeight(700)  # Set minimum height for the image label
+        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.image_label.setMinimumHeight(700)
         self.image_label.setMouseTracking(True)
         self.image_label.mouseMoveEvent = self.mouse_move_event
-        layout.addWidget(self.image_label)
+        layout.addWidget(self.image_label, stretch=1)
 
-        # Frame slider and label
+        # Frame slider
         frame_layout = QHBoxLayout()
-        self.frame_slider = QSlider(Qt.Horizontal)
-        self.frame_slider.setFixedHeight(20)  # Set fixed height for the slider
+        if _HAS_PICOUI:
+            frame_icon = QLabel()
+            frame_icon.setPixmap(
+                _registry_icon(IconRegistry.CAMERA).pixmap(16, 16)
+            )
+            frame_layout.addWidget(frame_icon)
+        self.frame_slider = QSlider(Qt.Orientation.Horizontal)
+        self.frame_slider.setFixedHeight(20)
         self.frame_slider.valueChanged.connect(self.update_frame)
         frame_layout.addWidget(self.frame_slider)
-
         self.frame_label = QLabel("Frame: 0")
         frame_layout.addWidget(self.frame_label)
         layout.addLayout(frame_layout)
 
-        # Buttons
+        # Buttons (icons mirror toolbar actions)
         button_layout = QHBoxLayout()
         layout.addLayout(button_layout)
 
         open_button = QPushButton("Open")
+        open_button.setIcon(_registry_icon(
+            IconRegistry.FOLDER_OPENED if _HAS_PICOUI else ""
+        ))
         open_button.clicked.connect(self.open_file)
         button_layout.addWidget(open_button)
 
         invert_button = QPushButton("Invert")
+        invert_button.setIcon(_registry_icon(
+            IconRegistry.BACKGROUND_TOGGLE if _HAS_PICOUI else ""
+        ))
         invert_button.clicked.connect(self.invert_image)
         button_layout.addWidget(invert_button)
 
         self.rings_checkbox = QCheckBox("Show Rings")
+        self.rings_checkbox.setIcon(_registry_icon(
+            IconRegistry.CLIP_SLICE if _HAS_PICOUI else ""
+        ))
         self.rings_checkbox.setChecked(self.show_rings)
         self.rings_checkbox.stateChanged.connect(self.toggle_rings)
         button_layout.addWidget(self.rings_checkbox)
 
         histogram_button = QPushButton("Histogram")
+        histogram_button.setIcon(_registry_icon(
+            IconRegistry.CHART_SCATTER_PLOT if _HAS_PICOUI else ""
+        ))
         histogram_button.clicked.connect(self.show_histogram)
         button_layout.addWidget(histogram_button)
 
-        # Contrast slider and label
+        # Contrast slider
         contrast_layout = QHBoxLayout()
-        self.contrast_slider = QSlider(Qt.Horizontal)
-        self.contrast_slider.setFixedHeight(20)  # Set fixed height for the slider
+        if _HAS_PICOUI:
+            contrast_icon = QLabel()
+            contrast_icon.setPixmap(
+                _registry_icon(IconRegistry.COLOR).pixmap(16, 16)
+            )
+            contrast_layout.addWidget(contrast_icon)
+        self.contrast_slider = QSlider(Qt.Orientation.Horizontal)
+        self.contrast_slider.setFixedHeight(20)
         self.contrast_slider.setRange(50, 300)
         self.contrast_slider.setValue(100)
         self.contrast_slider.valueChanged.connect(self.update_contrast)
         contrast_layout.addWidget(self.contrast_slider)
-
         self.contrast_label = QLabel("Contrast: 100")
         contrast_layout.addWidget(self.contrast_label)
         layout.addLayout(contrast_layout)
 
-    def toggle_rings(self):
-        """ toggle rings on/off """
-        if self.rings_checkbox.isChecked():
-            self.show_rings = True
-        else:
-            self.show_rings = False
-        self.show_image(self.current_image)
+    def _apply_widget_styles(self) -> None:
+        """Apply ThemeManager-derived colors to key widgets."""
+        colors = _theme_colors()
+        self.image_label.setStyleSheet(
+            f"QLabel {{"
+            f" background-color: {colors['base']};"
+            f" color: {colors['text']};"
+            f" border: 1px solid {colors['mid']};"
+            f" border-radius: 4px;"
+            f" padding: 8px;"
+            f"}}"
+        )
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        """Release HDF5 handles when the window closes."""
+        self._close_hdf5_handles()
+        super().closeEvent(event)
+
+    def _on_rings_action_toggled(self, checked: bool) -> None:
+        """Keep toolbar action and checkbox in sync."""
+        self.show_rings = bool(checked)
+        if self.rings_checkbox.isChecked() != checked:
+            self.rings_checkbox.blockSignals(True)
+            self.rings_checkbox.setChecked(checked)
+            self.rings_checkbox.blockSignals(False)
+        if self.current_image:
+            self.show_image(self.current_image)
 
     def open_file(self):
         """
@@ -343,10 +651,16 @@ class IMosflmApp(QMainWindow):
 
         :return: None
         """
-        file_path, _ = QFileDialog.getOpenFileName(self, "Open Image", "", "Image Files (*.jpg *.png *.gif *.tif *.tiff *.cbf *.h5)")
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open Image",
+            "",
+            "Image Files (*.jpg *.png *.gif *.tif *.tiff *.cbf *.h5)",
+        )
         if file_path:
             self.current_file = file_path
             logging.info(f"file_path: {file_path}")
+            self.statusBar().showMessage(f"Loaded {file_path}", 5000)
             if file_path.lower().endswith('.cbf'):
                 self.display_cbf_image(file_path)
             elif file_path.lower().endswith('.h5'):
@@ -453,60 +767,148 @@ class IMosflmApp(QMainWindow):
         except Exception as e:
             logging.error(f"Failed to load CBF image: {e}")
 
+    def _close_hdf5_handles(self) -> None:
+        """Close any open NeXus master / data file handles."""
+        self.dataset = None
+        for attr in ("_h5_data", "_h5_master"):
+            handle = getattr(self, attr, None)
+            if handle is not None:
+                try:
+                    handle.close()
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+
+    def _open_external_dataset(self, link_name: str) -> h5py.Dataset:
+        """Open one ``/entry/data`` image dataset, following ExternalLinks safely."""
+        if self._h5_master is None:
+            raise ValueError("No master HDF5 file is open.")
+
+        # Prefer a previously resolved absolute data-file path.
+        data_path = self._external_data_paths.get(link_name)
+        if data_path is not None:
+            if self._h5_data is not None:
+                try:
+                    self._h5_data.close()
+                except Exception:
+                    pass
+                self._h5_data = None
+            self._h5_data = h5py.File(data_path, "r")
+            # NeXus data files usually expose the stack at /data
+            for candidate in ("/data", "data", f"/entry/data/{link_name}"):
+                if candidate in self._h5_data:
+                    return self._h5_data[candidate]
+            raise ValueError(f"No image dataset found in {data_path}")
+
+        # Hard-linked dataset inside the master (rare for Eiger masters).
+        path = f"/entry/data/{link_name}"
+        if path not in self._h5_master:
+            raise ValueError(f"Dataset path '{path}' not found.")
+        return self._h5_master[path]
+
     def load_hdf5_image(self, image_path):
-        """Load and display an HDF5 image stack with metadata extraction."""
+        """Load and display an HDF5 / NeXus image stack with metadata extraction."""
+        master_path = Path(image_path).resolve()
         try:
-            with h5py.File(image_path, "r") as f:
-                dataset_path = "/entry/data"
-                if dataset_path not in f:
-                    raise ValueError(f"Dataset '{dataset_path}' not found in {image_path}")
-                group = f[dataset_path]
-                datasets = [name for name in group.keys() if isinstance(group[name], h5py.Dataset)]
-                if not datasets:
-                    raise ValueError("No datasets found under '/entry/data'")
-                # Extract beam center
-                detector_path = "/entry/instrument/detector"
-                if detector_path in f:
-                    detector_group = f[detector_path]
-                    print("Detector attributes:", list(detector_group.attrs.keys()))  # Debugging line
-                    # Print all attributes for debugging
-                    for attr, value in detector_group.attrs.items():
-                        print(f"{attr}: {value}")
-                    beam_centre_x = self.beam_x
-                    beam_centre_y = self.beam_y
-                else:
-                    raise ValueError(f"Detector path '{detector_path}' not found.")
-                if beam_centre_x is None or beam_centre_y is None:
-                    raise ValueError("Beam center coordinates not found.")
+            self._close_hdf5_handles()
+            resolved, missing, incomplete = ensure_nexus_external_links(master_path)
+            self._external_data_paths = resolved
+
+            problems: list[str] = []
+            if missing:
+                problems.append(
+                    "Missing next to the master:\n"
+                    + "\n".join(f"  • {name}" for name in missing)
+                )
+            if incomplete:
+                problems.append(
+                    "Present but incomplete/truncated (download still running?):\n"
+                    + "\n".join(f"  • {name}" for name in incomplete)
+                )
+            if problems:
+                message = (
+                    "This NeXus master file links to external data chunk files.\n\n"
+                    + "\n\n".join(problems)
+                    + f"\n\nMaster: {master_path}\n\n"
+                    "Eiger masters expect files like `…_000001.h5` beside the "
+                    "master. Browser downloads often leave them in "
+                    "`name.h5.download/` until finished — wait for the download "
+                    "to complete, then reopen."
+                )
+                if not resolved:
+                    QMessageBox.critical(self, "HDF5 data files not ready", message)
+                    self.statusBar().showMessage(
+                        "HDF5 data files missing or still downloading.", 8000
+                    )
                     return
-                self.beam_center = (beam_centre_x, beam_centre_y)
+                QMessageBox.warning(
+                    self,
+                    "Some HDF5 data files not ready",
+                    message + "\n\nLoading the complete chunks only.",
+                )
 
-                # Populate the combo box with dataset names
-                self.dataset_combo.clear()
-                self.dataset_combo.addItems(datasets)
+            datasets = [name for name in list_entry_data_names(master_path) if name in resolved]
+            if not datasets:
+                datasets = list(resolved.keys())
+            if not datasets:
+                raise ValueError("No complete image datasets found under '/entry/data'")
 
-                # Select the first dataset
-                self.dataset = group[datasets[0]]
-                self.num_frames = self.dataset.shape[0]
+            self._h5_master = h5py.File(master_path, "r")
 
-                # Configure slider range
-                self.frame_slider.setMinimum(0)
-                self.frame_slider.setMaximum(self.num_frames - 1)
+            if self.beam_x is None or self.beam_y is None:
+                raise ValueError(
+                    "Beam center coordinates not found in instrument metadata."
+                )
+            self.beam_center = (self.beam_x, self.beam_y)
 
-                # Load the first frame
-                self.display_hdf5_image(0)
+            self.dataset_combo.blockSignals(True)
+            self.dataset_combo.clear()
+            self.dataset_combo.addItems(datasets)
+            self.dataset_combo.blockSignals(False)
+
+            self.dataset = self._open_external_dataset(datasets[0])
+            self.num_frames = int(self.dataset.shape[0])
+            self.frame_slider.setMinimum(0)
+            self.frame_slider.setMaximum(max(self.num_frames - 1, 0))
+            self.display_hdf5_image(0)
+            self.statusBar().showMessage(
+                f"Loaded {datasets[0]} ({self.num_frames} frames) from {master_path.name}",
+                6000,
+            )
+            logging.info(
+                "Loaded NeXus master %s with datasets %s",
+                master_path,
+                datasets,
+            )
         except Exception as ex:
-            print(f"Error: {ex} occurred")
+            logging.exception("Failed to load HDF5 image %s", image_path)
+            QMessageBox.critical(
+                self,
+                "HDF5 load failed",
+                f"Could not load {image_path}:\n\n{ex}",
+            )
+            self.statusBar().showMessage(f"HDF5 load failed: {ex}", 8000)
 
     def change_dataset(self, index):
         """Change the dataset based on the combo box selection."""
         dataset_name = self.dataset_combo.itemText(index)
-        with h5py.File(self.current_file, "r") as f:
-            dataset_path = f"/entry/data/{dataset_name}"
-            self.dataset = f[dataset_path]
-            self.num_frames = self.dataset.shape[0]
-            self.frame_slider.setMaximum(self.num_frames - 1)
+        if not dataset_name or self._h5_master is None:
+            return
+        try:
+            self.dataset = self._open_external_dataset(dataset_name)
+            self.num_frames = int(self.dataset.shape[0])
+            self.frame_slider.setMaximum(max(self.num_frames - 1, 0))
             self.display_hdf5_image(0)
+            self.statusBar().showMessage(
+                f"Dataset {dataset_name}: {self.num_frames} frames", 4000
+            )
+        except Exception as ex:
+            logging.exception("Failed to switch dataset to %s", dataset_name)
+            QMessageBox.warning(
+                self,
+                "Dataset switch failed",
+                f"Could not open dataset '{dataset_name}':\n\n{ex}",
+            )
 
     def update_frame(self, start_index):
         """ Update frame and apply current contrast level """
@@ -744,17 +1146,22 @@ class IMosflmApp(QMainWindow):
             self.resolution_label.setText(f"Resolution: {resolution:0.2f} Å")
 
     def toggle_rings(self, state):
-        """ Toggle the visibility of rings on the image """
-        self.show_rings = state == Qt.CheckState.Checked
+        """Toggle the visibility of rings on the image."""
+        checked = state == Qt.CheckState.Checked.value or state == Qt.CheckState.Checked
+        self.show_rings = bool(checked)
         logging.info(f"Toggle rings: {'ON' if self.show_rings else 'OFF'}")
+        if self._act_rings.isChecked() != self.show_rings:
+            self._act_rings.blockSignals(True)
+            self._act_rings.setChecked(self.show_rings)
+            self._act_rings.blockSignals(False)
         if self.current_image:
-            self.show_image(self.current_image)  # Refresh display with/without rings
+            self.show_image(self.current_image)
 
 
 def parse_arguments():
     """ parse_arguments """
     logging.info("parse_arguments")     
-    parser = argparse.ArgumentParser(description='iMosflm Application')
+    parser = argparse.ArgumentParser(description='qtMosflm Application')
     parser.add_argument('--ccp4i2', action='store_true', help='Autosaves an iMosflm session file upon exit')
     parser.add_argument('--debug', '-d', action='store_true', help='Creates a large output file for debugging purposes')
     parser.add_argument('--expert', '-e', action='store_true', help='Permits access to advanced detector settings')
@@ -844,6 +1251,20 @@ def main():
 
     # Initialize and run the application
     app = QApplication(sys.argv)
+    app.setApplicationName("qtMosflm")
+    app.setOrganizationName("PyMosflm")
+
+    if _HAS_PICOUI:
+        try:
+            ThemeManager.initialize(ThemeType.AUTO)
+            logging.info("ThemeManager initialized (AUTO)")
+        except Exception as ex:
+            logging.warning("ThemeManager.initialize failed: %s", ex)
+    else:
+        logging.warning(
+            "picoui not installed — running without ThemeManager / IconRegistry"
+        )
+
     window = IMosflmApp()
     window.show()
     sys.exit(app.exec())
