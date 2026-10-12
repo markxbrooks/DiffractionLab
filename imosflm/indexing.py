@@ -55,6 +55,94 @@ SPACEGROUP_FOR_LATTICE: dict[str, str] = {
     "cI": "I23",
 }
 
+# Full space-group lists per lattice (``::spacegroup($lattice)`` in indexing.tcl).
+SPACEGROUPS_BY_LATTICE: dict[str, tuple[str, ...]] = {
+    "aP": ("P1",),
+    "mP": ("P2", "P21"),
+    "mC": ("C2",),
+    "mI": ("C2",),
+    "oP": (
+        "P222",
+        "P2221",
+        "P2122",
+        "P2212",
+        "P21212",
+        "P22121",
+        "P21221",
+        "P212121",
+    ),
+    "oC": ("C222", "C2221"),
+    "oF": ("F222",),
+    "oI": ("I222", "I212121"),
+    "tP": (
+        "P4",
+        "P41",
+        "P42",
+        "P43",
+        "P422",
+        "P4212",
+        "P4122",
+        "P41212",
+        "P4222",
+        "P42212",
+        "P4322",
+        "P43212",
+    ),
+    "tI": ("I4", "I41", "I422", "I4122"),
+    "hP": (
+        "P3",
+        "P31",
+        "P32",
+        "P312",
+        "P321",
+        "P3112",
+        "P3121",
+        "P3212",
+        "P3221",
+        "P6",
+        "P61",
+        "P65",
+        "P62",
+        "P64",
+        "P63",
+        "P622",
+        "P6122",
+        "P6522",
+        "P6222",
+        "P6422",
+        "P6322",
+    ),
+    "hR": ("h3", "h32"),
+    "cP": ("P23", "P213", "P432", "P4232", "P4332", "P4132"),
+    "cF": ("F23", "F432", "F4132"),
+    "cI": ("I23", "I213", "I432", "I4132"),
+}
+
+KNOWN_SPACEGROUPS: frozenset[str] = frozenset(
+    sg for groups in SPACEGROUPS_BY_LATTICE.values() for sg in groups
+)
+
+
+def spacegroups_for_lattice(lattice: str) -> tuple[str, ...]:
+    """Return candidate space groups for a Bravais lattice code (e.g. ``tP``)."""
+    return SPACEGROUPS_BY_LATTICE.get(lattice, ("P1",))
+
+
+def normalize_spacegroup(name: str) -> str:
+    """Normalise a space-group symbol the way iMosflm does (indexwizard.tcl)."""
+    trimmed = "".join(str(name).split())
+    if not trimmed:
+        return ""
+    if trimmed[0] in ("h", "H"):
+        return "h" + trimmed[1:] if trimmed[0] == "H" else trimmed
+    return trimmed.upper()
+
+
+def default_spacegroup_for_lattice(lattice: str) -> str:
+    """Return the default (first) space group for *lattice*."""
+    groups = spacegroups_for_lattice(lattice)
+    return groups[0] if groups else "P1"
+
 
 @dataclass
 class IndexingGeometry:
@@ -93,6 +181,8 @@ class IndexingSettings:
     max_penalty_to_refine: float = 50.0
     spot_threshold_sigma: float = 5.0
     max_spots_per_frame: int = 400
+    mosaic_block_size: float = 100.0
+    min_spots_to_index: int = 12
 
 
 @dataclass(slots=True)
@@ -124,6 +214,48 @@ class IndexSolution:
 
 
 @dataclass
+class SpotFindingResult:
+    """Spot search on one or more frames (iMosflm §5.1), before DPS indexing."""
+
+    spotfile: Path
+    n_spots: int
+    spotlists: list[SpotList]
+    frame_indices: list[int]
+    geometry: IndexingGeometry | None = None
+    source_geometry: IndexingGeometry | None = None
+
+
+@dataclass
+class MosaicityEstimation:
+    """Result of Mosflm ``mosaic estimate`` (iMosflm §5.6)."""
+
+    mosaicity_deg: float
+    scan_points: list[tuple[float, float]] = field(default_factory=list)
+    message: str = ""
+
+
+@dataclass
+class IntegrationImageRange:
+    """Contiguous Mosflm image numbers chosen for a trial integration run."""
+
+    first_image: int
+    last_image: int
+    selection_method: str = "heuristic"
+    segment_count: int = 0
+
+
+@dataclass
+class IntegrationResult:
+    """Output from a short Mosflm integration (tutorial §9)."""
+
+    mtz_path: Path
+    image_range: IntegrationImageRange
+    n_images: int
+    message: str = ""
+    reflections_measured: int | None = None
+
+
+@dataclass
 class IndexingResult:
     """Combined preselection + refined solutions from one indexing run."""
 
@@ -136,6 +268,9 @@ class IndexingResult:
     spotlists: list[SpotList] = field(default_factory=list)
     frame_indices: list[int] = field(default_factory=list)
     geometry: IndexingGeometry | None = None
+    uses_placeholder_template: bool = False
+    estimated_mosaicity: float | None = None
+    mosaicity_scan: list[tuple[float, float]] = field(default_factory=list)
 
 
 def scattering_vector(
@@ -302,9 +437,14 @@ def parse_preselection_index_response(root: ET.Element) -> tuple[list[IndexSolut
     return solutions, suggested_number, f"{status}: {message}".strip(": ")
 
 
-def parse_refined_index_response(root: ET.Element) -> IndexSolution:
+def parse_refined_index_response(
+    root: ET.Element,
+    *,
+    spacegroup: str | None = None,
+) -> IndexSolution:
     """Parse ``refined_index_response`` XML into one refined solution."""
     lattice = _text(root, "lattice", "aP")
+    sg_from_xml = _text(root, "spacegroup", "")
     # Refined responses often put cell at top level.
     a = _float(root, "a", _float(root, "cell/a"))
     b = _float(root, "b", _float(root, "cell/b"))
@@ -317,12 +457,16 @@ def parse_refined_index_response(root: ET.Element) -> IndexSolution:
         for i in (1, 2, 3)
         for j in (1, 2, 3)
     )
+    resolved_sg = (
+        normalize_spacegroup(spacegroup or sg_from_xml)
+        or default_spacegroup_for_lattice(lattice)
+    )
     return IndexSolution(
         number=_int(root, "solution_number", _int(root, "number")),
         kind="ref",
         penalty=_float(root, "penalty"),
         lattice=lattice or _text(root, "lattice_type", "aP"),
-        spacegroup=SPACEGROUP_FOR_LATTICE.get(lattice, "P1"),
+        spacegroup=resolved_sg,
         a=a,
         b=b,
         c=c,
@@ -491,15 +635,298 @@ def build_index2_commands(
     settings: IndexingSettings,
     *,
     lattice: int = 1,
+    sigma_cutoff: float | None = None,
 ) -> list[str]:
     """Build Mosflm commands equivalent to ``Mosflm::index2``."""
     unfix = "" if settings.fix_distance_indexing else " unfixdist"
+    sigma = settings.sigma_cutoff if sigma_cutoff is None else float(sigma_cutoff)
     return [
         (
             f"autoindex dps solution {solution_number} "
-            f"sdcutoff {settings.sigma_cutoff:g}{unfix} lattice {lattice}"
+            f"sdcutoff {sigma:g}{unfix} lattice {lattice}"
         )
     ]
+
+
+def auto_integration_image_count(
+    mosaicity_deg: float,
+    oscillation_deg: float,
+    total_images: int,
+    *,
+    minimum: int = 4,
+) -> int:
+    """Heuristic image count (``integrationwizard.tcl`` post-refinement formula)."""
+    if total_images <= 0:
+        return 0
+    osc = float(oscillation_deg) if oscillation_deg > 0 else 0.15
+    mosaic = float(mosaicity_deg) if mosaicity_deg > 0 else 0.05
+    count = int(2.5 * mosaic / osc)
+    if count < minimum:
+        count = minimum
+    if count >= 20:
+        count = count // 2
+    return min(count, int(total_images))
+
+
+def parse_segment_setup_response(root: ET.Element) -> list[tuple[int, int]]:
+    """Parse ``segment_setup_response`` into ``(start_image, n_images)`` segments."""
+    segments: list[tuple[int, int]] = []
+    for node in root.findall(".//segment"):
+        start = _int(node, "start")
+        span = _int(node, "range")
+        if start > 0 and span > 0:
+            segments.append((start, span))
+    return segments
+
+
+def integration_range_from_segments(
+    segments: Sequence[tuple[int, int]],
+    *,
+    total_images: int,
+) -> IntegrationImageRange:
+    """Build one contiguous range from Mosflm segment list (first segment)."""
+    if not segments:
+        raise ValueError("No segments returned from Mosflm")
+    start, span = segments[0]
+    last = start + span - 1
+    if last > total_images:
+        last = total_images
+    return IntegrationImageRange(
+        first_image=int(start),
+        last_image=int(last),
+        selection_method="mosflm_segment",
+        segment_count=len(segments),
+    )
+
+
+def heuristic_integration_range(
+    *,
+    total_images: int,
+    mosaicity_deg: float,
+    oscillation_deg: float,
+    first_image: int = 1,
+) -> IntegrationImageRange:
+    """Pick a short integration wedge when Mosflm segment setup is unavailable."""
+    count = auto_integration_image_count(
+        mosaicity_deg,
+        oscillation_deg,
+        total_images,
+    )
+    first = max(1, int(first_image))
+    last = min(first + count - 1, int(total_images))
+    return IntegrationImageRange(
+        first_image=first,
+        last_image=last,
+        selection_method="heuristic",
+        segment_count=0,
+    )
+
+
+def build_matrix_command(matrix: Sequence[float]) -> str:
+    """Format a Mosflm ``matrix`` line from nine A-matrix elements."""
+    if len(matrix) != 9:
+        raise ValueError("A-matrix must have nine elements")
+    return "matrix " + " ".join(f"{float(v):.8g}" for v in matrix)
+
+
+def build_segment_setup_commands(
+    geometry: IndexingGeometry,
+    solution: IndexSolution,
+    *,
+    spacegroup: str,
+    mosaicity_deg: float,
+    settings: IndexingSettings,
+    first_image: int,
+    last_image: int,
+    genfile: str,
+) -> list[str]:
+    """Build Mosflm commands for ``getCellRefinementSegments`` / segment setup."""
+    if len(solution.matrix) != 9:
+        raise ValueError("Solution has no A-matrix for segment setup")
+    beam = (
+        f"beam {geometry.beam_x_mm:.4f} {geometry.beam_y_mm:.4f}"
+        if abs(geometry.two_theta) < 1e-6
+        else f"beam swungout {geometry.beam_x_mm:.4f} {geometry.beam_y_mm:.4f}"
+    )
+    sg = normalize_spacegroup(spacegroup)
+    a, b, c, alpha, beta, gamma = solution.cell_tuple
+    return [
+        beam,
+        f"distance {geometry.distance_mm:.4f}",
+        f"wavelength {geometry.wavelength_a:.6f}",
+        "resolution 50",
+        f"twotheta {geometry.two_theta:.4f}",
+        f"symmetry {sg}",
+        f'genfile "{genfile}"',
+        f"directory {geometry.directory}",
+        f"template {geometry.template}",
+        (
+            f"image {first_image} "
+            f"phi {geometry.phi_start:.4f} {geometry.phi_end:.4f}"
+        ),
+        "load",
+        build_matrix_command(solution.matrix),
+        f"mosaic {mosaicity_deg:g} blocksize {settings.mosaic_block_size:g}",
+        f"segment {first_image} {last_image}",
+    ]
+
+
+def build_integrate_commands(
+    geometry: IndexingGeometry,
+    solution: IndexSolution,
+    *,
+    spacegroup: str,
+    mosaicity_deg: float,
+    settings: IndexingSettings,
+    image_range: IntegrationImageRange,
+    phi_start: float,
+    oscillation_deg: float,
+    mtz_path: Path,
+    genfile: str,
+) -> list[str]:
+    """Build a minimal Mosflm integration script (``Mosflm::integrate``)."""
+    if len(solution.matrix) != 9:
+        raise ValueError("Solution has no A-matrix for integration")
+    beam_x = solution.beam_x if solution.beam_x is not None else geometry.beam_x_mm
+    beam_y = solution.beam_y if solution.beam_y is not None else geometry.beam_y_mm
+    beam = (
+        f"beam {beam_x:.4f} {beam_y:.4f}"
+        if abs(geometry.two_theta) < 1e-6
+        else f"beam swungout {beam_x:.4f} {beam_y:.4f}"
+    )
+    sg = normalize_spacegroup(spacegroup)
+    a, b, c, alpha, beta, gamma = solution.cell_tuple
+    mtz_name = Path(mtz_path).name
+    first = image_range.first_image
+    last = image_range.last_image
+    osc = max(float(oscillation_deg), 1e-4)
+    return [
+        f"directory {geometry.directory}",
+        f"template {geometry.template}",
+        beam,
+        f"distance {geometry.distance_mm:.4f}",
+        f"wavelength {geometry.wavelength_a:.6f}",
+        f"twotheta {geometry.two_theta:.4f}",
+        f"pixel {geometry.pixel_size_mm:.6f}",
+        f"gain {geometry.gain:.4f}",
+        build_matrix_command(solution.matrix),
+        f"cell {a:.4f} {b:.4f} {c:.4f} {alpha:.2f} {beta:.2f} {gamma:.2f}",
+        f"symmetry {sg}",
+        (
+            f"mosaicity {mosaicity_deg:g} "
+            f"blocksize {settings.mosaic_block_size:g}"
+        ),
+        f'mtzdirectory "{Path(mtz_path).parent}"',
+        f"hklout {mtz_name} nomultiple",
+        f'genfile "{genfile}"',
+        "resolution exclude none",
+        f"nullpix {geometry.nullpix:g}",
+        "norefine off",
+        (
+            f"process {first} {last} start {phi_start:.4f} "
+            f"angle {osc:.4f} add 0"
+        ),
+    ]
+
+
+def build_mosaic_estimate_commands(
+    geometry: IndexingGeometry,
+    solution: IndexSolution,
+    *,
+    spacegroup: str,
+    image_number: int,
+    phi_start: float,
+    phi_end: float,
+    phi_scan_end: float,
+    settings: IndexingSettings,
+) -> list[str]:
+    """Build Mosflm lines for ``Mosflm::estimateMosaicity`` (mosaic estimate)."""
+    if len(solution.matrix) != 9:
+        raise ValueError("Selected solution has no A-matrix for mosaicity estimation")
+    beam = (
+        f"beam {geometry.beam_x_mm:.4f} {geometry.beam_y_mm:.4f}"
+        if abs(geometry.two_theta) < 1e-6
+        else f"beam swungout {geometry.beam_x_mm:.4f} {geometry.beam_y_mm:.4f}"
+    )
+    a, b, c, alpha, beta, gamma = solution.cell_tuple
+    sg = normalize_spacegroup(spacegroup)
+    return [
+        f"directory {geometry.directory}",
+        f"template {geometry.template}",
+        beam,
+        f"distance {geometry.distance_mm:.4f}",
+        f"wavelength {geometry.wavelength_a:.6f}",
+        f"twotheta {geometry.two_theta:.4f}",
+        f"pixel {geometry.pixel_size_mm:.6f}",
+        build_matrix_command(solution.matrix),
+        f"cell {a:.4f} {b:.4f} {c:.4f} {alpha:.2f} {beta:.2f} {gamma:.2f}",
+        "misset 0 0 0",
+        f"symmetry {sg}",
+        (
+            f"image {image_number} "
+            f"phi {phi_start:.4f} {phi_end:.4f}"
+        ),
+        (
+            f"mosaicity 0.05 blocksize {settings.mosaic_block_size:g}"
+        ),
+        (
+            f"mosaic estimate {image_number} "
+            f"phi {phi_start:.4f} to {phi_scan_end:.4f}"
+        ),
+    ]
+
+
+def parse_mosaicity_feedback(root: ET.Element) -> tuple[float, float]:
+    """Parse one ``mosaicity_estimation_response`` trial point."""
+    mosaic = _float(root, "mosaicity_trial_value")
+    intensity = _float(root, "total_intensity")
+    return mosaic, intensity
+
+
+def parse_mosaicity_estimation(root: ET.Element) -> MosaicityEstimation:
+    """Parse final ``mosaicity_response`` XML."""
+    status = _text(root, "status/code", "ok")
+    message = _text(root, "status/message", "")
+    if status.lower() == "error":
+        raise RuntimeError(message or "Mosflm mosaicity estimation failed")
+    mosaic = _float(root, "mosaicity_value", _float(root, "mosaicity"))
+    return MosaicityEstimation(mosaicity_deg=mosaic, message=message.strip(": "))
+
+
+def build_cell_symmetry_validate_commands(
+    cell: Sequence[float],
+    spacegroup: str,
+) -> list[str]:
+    """Build ``cell`` / ``symmetry`` / ``validate`` (Session::validateCellAndSpacegroup)."""
+    if len(cell) != 6:
+        raise ValueError("cell must have six elements (a, b, c, alpha, beta, gamma)")
+    a, b, c, alpha, beta, gamma = (float(x) for x in cell)
+    sg = normalize_spacegroup(spacegroup)
+    if not sg:
+        raise ValueError("space group must not be empty")
+    return [
+        f"cell {a:.4f} {b:.4f} {c:.4f} {alpha:.2f} {beta:.2f} {gamma:.2f}",
+        f"symmetry {sg}",
+        "validate",
+    ]
+
+
+def preselection_solution(
+    result: IndexingResult,
+    solution_number: int,
+    *,
+    prefer: str = "reg",
+) -> IndexSolution | None:
+    """Return the raw or regularised preselection row for *solution_number*."""
+    kinds: list[str] = [prefer]
+    for kind in ("reg", "raw"):
+        if kind not in kinds:
+            kinds.append(kind)
+    for kind in kinds:
+        for sol in result.solutions:
+            if sol.number == solution_number and sol.kind == kind:
+                return sol
+    return None
 
 
 def _first_xml(messages: Sequence[MosflmMessage], doctype: str) -> ET.Element:
@@ -572,6 +999,197 @@ class IndexingEngine:
         write_merged_spotfile(spotfile, spot_geom, spotlists)
         logger.info("Wrote spotfile %s (%d spots)", spotfile, total)
         return spotfile, total, spotlists
+
+    def find_spots_step(
+        self,
+        frames: Sequence[np.ndarray],
+        geometry: IndexingGeometry,
+        *,
+        phis: Sequence[tuple[float, float]] | None = None,
+        frame_indices: Sequence[int] | None = None,
+    ) -> SpotFindingResult:
+        """Run spot finding only (tutorial §5.1) and return a spotfile."""
+        spotfile, n_spots, spotlists = self.find_spots_from_frames(
+            frames, geometry, phis=phis
+        )
+        mosflm_geometry, _ = ensure_indexable_template(geometry, self.work_dir)
+        indices = (
+            [int(i) for i in frame_indices]
+            if frame_indices is not None
+            else list(range(len(spotlists)))
+        )
+        return SpotFindingResult(
+            spotfile=spotfile,
+            n_spots=n_spots,
+            spotlists=list(spotlists),
+            frame_indices=indices,
+            geometry=mosflm_geometry,
+            source_geometry=geometry,
+        )
+
+    def index_spotfile(
+        self,
+        spotfinding: SpotFindingResult,
+        *,
+        refine: bool = False,
+    ) -> IndexingResult:
+        """DPS autoindexing from an existing spotfile (after spot finding)."""
+        geometry = spotfinding.geometry or spotfinding.source_geometry
+        if geometry is None:
+            raise ValueError("Spot finding result has no geometry")
+        result = self.autoindex(geometry, spotfinding.spotfile, refine=refine)
+        result.spotlists = list(spotfinding.spotlists)
+        result.n_spots = spotfinding.n_spots
+        result.frame_indices = list(spotfinding.frame_indices)
+        if result.geometry is None:
+            result.geometry = geometry
+        return result
+
+    def estimate_mosaicity(
+        self,
+        geometry: IndexingGeometry,
+        solution: IndexSolution,
+        *,
+        spacegroup: str,
+        image_number: int | None = None,
+        phi_start: float | None = None,
+        phi_end: float | None = None,
+        phi_scan_end: float | None = None,
+    ) -> MosaicityEstimation:
+        """Estimate mosaic spread for *solution* (``mosaic estimate``, tutorial §5.6)."""
+        geometry, used_placeholder = ensure_indexable_template(geometry, self.work_dir)
+        if used_placeholder:
+            raise RuntimeError(
+                "Mosaicity estimation needs Mosflm to read detector images; "
+                "it is not supported with the HDF5 placeholder template in qtMosflm."
+            )
+        img_num = int(image_number if image_number is not None else geometry.image_number)
+        p0 = float(phi_start if phi_start is not None else geometry.phi_start)
+        p1 = float(phi_end if phi_end is not None else geometry.phi_end)
+        if phi_scan_end is not None:
+            p_scan = float(phi_scan_end)
+        else:
+            width = max(p1 - p0, 0.01)
+            p_scan = p1 + width
+
+        with MosflmClient(self.executable, self.work_dir) as client:
+            stamp = time_stamp()
+            client.send(f"GENFILE mosflm_{stamp}.gen")
+            client.wait_for(doctypes=(), also_done=True, timeout_s=10.0)
+            client.send(f"NEWMAT mosflm_{stamp}.mat")
+            client.wait_for(doctypes=(), also_done=True, timeout_s=10.0)
+            client.send_many(
+                build_mosaic_estimate_commands(
+                    geometry,
+                    solution,
+                    spacegroup=spacegroup,
+                    image_number=img_num,
+                    phi_start=p0,
+                    phi_end=p1,
+                    phi_scan_end=p_scan,
+                    settings=self.settings,
+                )
+            )
+            return _wait_for_mosaicity_estimation(client, timeout_s=180.0)
+
+    def auto_select_integration_range(
+        self,
+        geometry: IndexingGeometry,
+        solution: IndexSolution,
+        *,
+        spacegroup: str,
+        mosaicity_deg: float,
+        total_images: int,
+        first_image: int = 1,
+    ) -> IntegrationImageRange:
+        """Ask Mosflm for segments, or fall back to the iMosflm heuristic."""
+        if total_images <= 0:
+            raise ValueError("No images in dataset")
+        if len(solution.matrix) != 9:
+            raise ValueError("Indexing solution has no A-matrix")
+        osc = max(abs(geometry.phi_end - geometry.phi_start), 0.01)
+        try:
+            with MosflmClient(self.executable, self.work_dir) as client:
+                stamp = time_stamp()
+                gen = f"mosflm_{stamp}.gen"
+                client.send(f"GENFILE {gen}")
+                client.wait_for(doctypes=(), also_done=True, timeout_s=10.0)
+                client.send(f"NEWMAT mosflm_{stamp}.mat")
+                client.wait_for(doctypes=(), also_done=True, timeout_s=10.0)
+                setup = build_segment_setup_commands(
+                    geometry,
+                    solution,
+                    spacegroup=spacegroup,
+                    mosaicity_deg=mosaicity_deg,
+                    settings=self.settings,
+                    first_image=1,
+                    last_image=int(total_images),
+                    genfile=gen,
+                )
+                load_idx = setup.index("load") + 1
+                client.send_many(setup[:load_idx])
+                client.go(expect=(), timeout_s=60.0)
+                client.send_many(setup[load_idx:])
+                segments = _wait_for_segment_setup(client, timeout_s=120.0)
+                return integration_range_from_segments(
+                    segments,
+                    total_images=total_images,
+                )
+        except Exception as ex:
+            logger.warning("Mosflm segment setup failed (%s); using heuristic", ex)
+            return heuristic_integration_range(
+                total_images=total_images,
+                mosaicity_deg=mosaicity_deg,
+                oscillation_deg=osc,
+                first_image=first_image,
+            )
+
+    def integrate_images(
+        self,
+        geometry: IndexingGeometry,
+        solution: IndexSolution,
+        image_range: IntegrationImageRange,
+        *,
+        spacegroup: str,
+        mosaicity_deg: float,
+        phi_start: float,
+        oscillation_deg: float,
+        mtz_path: Path | None = None,
+    ) -> IntegrationResult:
+        """Integrate *image_range* and write an MTZ under the work directory."""
+        if len(solution.matrix) != 9:
+            raise ValueError("Indexing solution has no A-matrix")
+        mtz_path = Path(mtz_path or (self.work_dir / "qtmosflm_integrate.mtz"))
+        mtz_path.parent.mkdir(parents=True, exist_ok=True)
+        with MosflmClient(self.executable, self.work_dir) as client:
+            stamp = time_stamp()
+            gen = f"mosflm_{stamp}.gen"
+            client.send(f"GENFILE {gen}")
+            client.wait_for(doctypes=(), also_done=True, timeout_s=10.0)
+            client.send(f"NEWMAT mosflm_{stamp}.mat")
+            client.wait_for(doctypes=(), also_done=True, timeout_s=10.0)
+            client.send_many(
+                build_integrate_commands(
+                    geometry,
+                    solution,
+                    spacegroup=spacegroup,
+                    mosaicity_deg=mosaicity_deg,
+                    settings=self.settings,
+                    image_range=image_range,
+                    phi_start=phi_start,
+                    oscillation_deg=oscillation_deg,
+                    mtz_path=mtz_path,
+                    genfile=gen,
+                )
+            )
+            message = _wait_for_integration(client, timeout_s=600.0)
+        n_images = image_range.last_image - image_range.first_image + 1
+        return IntegrationResult(
+            mtz_path=mtz_path,
+            image_range=image_range,
+            n_images=n_images,
+            message=message,
+        )
 
     def autoindex(
         self,
@@ -680,7 +1298,83 @@ class IndexingEngine:
             refined=refined,
             messages=messages_log,
             geometry=geometry,
+            uses_placeholder_template=used_placeholder,
         )
+
+    def refine_index_solution(
+        self,
+        geometry: IndexingGeometry,
+        spotfile: Path,
+        solution_number: int,
+        cell: Sequence[float],
+        spacegroup: str,
+        *,
+        lattice_number: int = 1,
+        sigma_cutoff: float | None = None,
+        replay_preselection: bool = True,
+    ) -> IndexSolution:
+        """Refine one DPS solution with a chosen cell and space group (``index2``).
+
+        Mirrors ``Latticetab::refine`` plus ``Session::validateCellAndSpacegroup``
+        and the space-group combo in iMosflm's index wizard.  Mosflm must still
+        have indexing context, so by default this replays DPS preselection in the
+        same socket session before sending ``cell``, ``symmetry``, ``validate``,
+        and ``autoindex dps solution …``.
+        """
+        geometry, used_placeholder = ensure_indexable_template(geometry, self.work_dir)
+        if used_placeholder:
+            raise RuntimeError(
+                "Mosflm cannot refine indexing solutions when using the HDF5 "
+                "placeholder image template (refinement re-searches detector "
+                "images). Index from a native Mosflm image template (.img / "
+                ".cbf / etc.) or use iMosflm for HDF5 refinement."
+            )
+        spotfile = Path(spotfile)
+        if spotfile.parent.resolve() != self.work_dir.resolve():
+            target = self.work_dir / spotfile.name
+            if spotfile.resolve() != target.resolve():
+                target.write_bytes(spotfile.read_bytes())
+            spotfile = target
+
+        sg = normalize_spacegroup(spacegroup)
+        if not sg:
+            raise ValueError("space group must not be empty")
+
+        settings = self.settings
+        if sigma_cutoff is not None:
+            settings = replace(self.settings, sigma_cutoff=float(sigma_cutoff))
+
+        with MosflmClient(self.executable, self.work_dir) as client:
+            stamp = time_stamp()
+            client.send(f"GENFILE mosflm_{stamp}.gen")
+            client.wait_for(doctypes=(), also_done=True, timeout_s=10.0)
+            client.send(f"NEWMAT mosflm_{stamp}.mat")
+            client.wait_for(doctypes=(), also_done=True, timeout_s=10.0)
+
+            if replay_preselection:
+                client.send_many(
+                    build_index_commands(geometry, settings, spotfile)
+                )
+                pre_msgs = client.go(
+                    expect=("preselection_index_response",),
+                    timeout_s=180.0,
+                )
+                pre_root = _first_xml(pre_msgs, "preselection_index_response")
+                _, _, status = parse_preselection_index_response(pre_root)
+                if status.lower().startswith("error"):
+                    raise RuntimeError(f"Mosflm indexing failed: {status}")
+
+            client.send_many(build_cell_symmetry_validate_commands(cell, sg))
+            client.send_many(
+                build_index2_commands(
+                    solution_number,
+                    settings,
+                    lattice=lattice_number,
+                    sigma_cutoff=settings.sigma_cutoff,
+                )
+            )
+            ref_root = _wait_for_refined_index_response(client, timeout_s=120.0)
+            return parse_refined_index_response(ref_root, spacegroup=sg)
 
     def index_frames(
         self,
@@ -702,7 +1396,8 @@ class IndexingEngine:
             result.frame_indices = [int(i) for i in frame_indices]
         else:
             result.frame_indices = list(range(len(spotlists)))
-        result.geometry = geometry
+        if result.geometry is None:
+            result.geometry = geometry
         return result
 
 
@@ -734,3 +1429,158 @@ def time_stamp() -> str:
     import time
 
     return time.strftime("%Y%m%d_%H%M%S")
+
+
+def _wait_for_refined_index_response(
+    client: MosflmClient,
+    *,
+    timeout_s: float = 120.0,
+) -> ET.Element:
+    """Send ``go`` and collect XML until ``refined_index_response`` or failure."""
+    import time
+
+    client.send("go")
+    deadline = time.time() + timeout_s
+    saw_spot_search = False
+    validate_error = ""
+    while time.time() < deadline:
+        remaining = max(0.05, deadline - time.time())
+        msg = client.recv_message(timeout_s=remaining)
+        if msg is None:
+            break
+        if msg.kind == "xml" and msg.root is not None:
+            if msg.doctype == "refined_index_response":
+                status = _text(msg.root, "status/code", "ok")
+                message = _text(msg.root, "status/message", "")
+                if status.lower() == "error":
+                    raise RuntimeError(message or "Mosflm refinement failed")
+                return msg.root
+            if msg.doctype == "interface_input_response":
+                status = _text(msg.root, "status/code", "ok")
+                message = _text(msg.root, "status/message", "")
+                if status.lower() == "error" and message:
+                    validate_error = message
+            if msg.doctype == "spot_search_response":
+                saw_spot_search = True
+            if msg.doctype == "fatal_condition_response":
+                raise RuntimeError(
+                    _text(msg.root, "status/message", "Mosflm fatal error")
+                )
+        if msg.kind == "done":
+            continue
+    if validate_error:
+        raise RuntimeError(validate_error)
+    if saw_spot_search:
+        raise RuntimeError(
+            "Mosflm did not return a refined indexing solution (spot search "
+            "completed without refinement). This often happens with HDF5 "
+            "masters when Mosflm cannot read the image template."
+        )
+    raise TimeoutError("Timed out waiting for Mosflm refined_index_response")
+
+
+def _wait_for_mosaicity_estimation(
+    client: MosflmClient,
+    *,
+    timeout_s: float = 180.0,
+) -> MosaicityEstimation:
+    """Send ``go`` and collect mosaicity trial/final XML responses."""
+    import time
+
+    client.send("go")
+    deadline = time.time() + timeout_s
+    scan: list[tuple[float, float]] = []
+    while time.time() < deadline:
+        remaining = max(0.05, deadline - time.time())
+        msg = client.recv_message(timeout_s=remaining)
+        if msg is None:
+            break
+        if msg.kind == "xml" and msg.root is not None:
+            if msg.doctype == "mosaicity_estimation_response":
+                scan.append(parse_mosaicity_feedback(msg.root))
+            elif msg.doctype == "mosaicity_response":
+                final = parse_mosaicity_estimation(msg.root)
+                final.scan_points = scan
+                return final
+            elif msg.doctype == "fatal_condition_response":
+                raise RuntimeError(
+                    _text(msg.root, "status/message", "Mosflm fatal error")
+                )
+        if msg.kind == "done":
+            continue
+    raise TimeoutError(
+        "Timed out waiting for Mosflm mosaicity_response "
+        f"(collected {len(scan)} trial point(s))"
+    )
+
+
+def _wait_for_segment_setup(
+    client: MosflmClient,
+    *,
+    timeout_s: float = 120.0,
+) -> list[tuple[int, int]]:
+    """Collect ``segment_setup_response`` segments."""
+    import time
+
+    client.send("go")
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        remaining = max(0.05, deadline - time.time())
+        msg = client.recv_message(timeout_s=remaining)
+        if msg is None:
+            break
+        if msg.kind == "xml" and msg.root is not None:
+            if msg.doctype == "segment_setup_response":
+                status = _text(msg.root, "status/code", "ok")
+                message = _text(msg.root, "status/message", "")
+                if status.lower() == "error":
+                    raise RuntimeError(message or "Segment setup failed")
+                segments = parse_segment_setup_response(msg.root)
+                if segments:
+                    return segments
+                raise RuntimeError(message or "Segment setup returned no segments")
+        if msg.kind == "done":
+            continue
+    raise TimeoutError("Timed out waiting for Mosflm segment_setup_response")
+
+
+def _wait_for_integration(
+    client: MosflmClient,
+    *,
+    timeout_s: float = 600.0,
+) -> str:
+    """Run ``go`` and wait until Mosflm finishes the integration block."""
+    import time
+
+    client.send("go")
+    deadline = time.time() + timeout_s
+    last_message = ""
+    saw_integration = False
+    while time.time() < deadline:
+        remaining = max(0.05, deadline - time.time())
+        msg = client.recv_message(timeout_s=remaining)
+        if msg is None:
+            break
+        if msg.kind == "xml" and msg.root is not None:
+            if msg.doctype == "integration_response":
+                saw_integration = True
+                status = _text(msg.root, "status/code", "ok")
+                last_message = _text(msg.root, "status/message", "")
+                if status.lower() == "error":
+                    raise RuntimeError(last_message or "Integration failed")
+                # Mosflm expects continue between blocks; send for single wedge.
+                try:
+                    client.send("continue")
+                except OSError:
+                    pass
+            elif msg.doctype == "processing_task_end":
+                return last_message or "Integration finished"
+            elif msg.doctype == "fatal_condition_response":
+                raise RuntimeError(
+                    _text(msg.root, "status/message", "Mosflm fatal error")
+                )
+        if msg.kind == "done":
+            continue
+    if saw_integration:
+        return last_message or "Integration finished (timed out waiting for end)"
+    raise TimeoutError("Timed out waiting for Mosflm integration to finish")
