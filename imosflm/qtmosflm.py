@@ -936,6 +936,13 @@ class IMosflmApp(QMainWindow):
             "Toggle indexing spots: %s",
             "ON" if self.show_indexing_spots else "OFF",
         )
+        dialog = self._indexing_dialog
+        if dialog is not None and hasattr(dialog, "show_spots_checkbox"):
+            box = dialog.show_spots_checkbox
+            if box.isChecked() != self.show_indexing_spots:
+                box.blockSignals(True)
+                box.setChecked(self.show_indexing_spots)
+                box.blockSignals(False)
         if self.current_image is not None:
             self.show_image(self.current_image)
 
