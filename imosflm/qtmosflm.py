@@ -10,6 +10,14 @@ import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+# When this file is run as a script, Python puts ``imosflm/`` on sys.path and
+# ``imosflm.py`` would shadow the ``imosflm`` package. Prefer the repo root.
+_HERE = Path(__file__).resolve().parent
+_ROOT = _HERE.parent
+sys.path[:] = [p for p in sys.path if Path(p).resolve() != _HERE]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
 import h5py
 from PySide6.QtWidgets import (
     QApplication,
@@ -19,6 +27,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
     QSlider,
@@ -28,7 +37,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 from PySide6.QtGui import QAction, QColor, QIcon, QImage, QPainter, QPen, QPixmap
-from PySide6.QtCore import Qt, QSize
+from PySide6.QtCore import Qt, QSettings, QSize
+
+from imosflm.indexing import IndexingGeometry, as_float
+from imosflm.indexing_dialog import IndexingDialog
 
 from PIL import Image, ImageOps
 import fabio  # Import FabIO
@@ -400,9 +412,40 @@ def add_resolution_rings(image, beam_center, detector_distance, x_pixel_size, in
         # Convert back to PIL for displaying or saving
         result_image = Image.fromarray(img_np)
         return result_image  # You can save or display it using result_image.show()
-
     except Exception as ex:
         print(f"Error: {ex} occurred")
+        return image.convert("RGB") if hasattr(image, "convert") else image
+
+
+def add_indexing_spot_markers(
+    image,
+    spots_px: list[tuple[float, float, bool]] | None,
+    *,
+    cross_half: int = 8,
+) -> Image.Image:
+    """Draw indexing spots on *image* (green = matched, gold = unmatched)."""
+    image = image.convert("RGB")
+    if not spots_px:
+        return image
+    img_np = np.array(image)
+    height, width = img_np.shape[:2]
+    for x_px, y_px, matched in spots_px:
+        x = int(round(float(x_px)))
+        y = int(round(float(y_px)))
+        if x < 0 or y < 0 or x >= width or y >= height:
+            continue
+        color = (0, 255, 80) if matched else (255, 200, 0)
+        cv2.drawMarker(
+            img_np,
+            (x, y),
+            color,
+            markerType=cv2.MARKER_CROSS,
+            markerSize=cross_half * 2,
+            thickness=2,
+            line_type=cv2.LINE_AA,
+        )
+    return Image.fromarray(img_np)
+
 
 def traverse_hdf5(group, path, beam_x=None, beam_y=None, detector_distance=None,
                   incident_wavelength=None, x_pixel_size=None, y_pixel_size=None):
@@ -459,6 +502,58 @@ def pil_to_qpixmap(image):
     return QPixmap.fromImage(qimage)
 
 
+class RecentFilesManager:
+    """Persist recently opened image paths in ``QSettings``."""
+
+    MAX_RECENT = 10
+    ORG = "qtMosflm"
+    APP = "preferences"
+    KEY = "recent_files"
+
+    def __init__(self) -> None:
+        self._settings = QSettings(self.ORG, self.APP)
+
+    def _read(self) -> list[str]:
+        raw = self._settings.value(self.KEY)
+        if raw is None or raw == "":
+            return []
+        if isinstance(raw, list):
+            return [str(p) for p in raw if p and str(p).strip()]
+        if isinstance(raw, str):
+            return [raw] if raw.strip() else []
+        try:
+            return [str(p) for p in raw if p and str(p).strip()]
+        except TypeError:
+            return []
+
+    def _write(self, paths: list[str]) -> None:
+        self._settings.setValue(self.KEY, paths)
+        self._settings.sync()
+
+    def add(self, file_path: str | Path) -> None:
+        """Move *file_path* to the front of the recent list."""
+        if not file_path:
+            return
+        resolved = str(Path(file_path).expanduser().resolve())
+        paths = self._read()
+        if resolved in paths:
+            paths.remove(resolved)
+        paths.insert(0, resolved)
+        self._write(paths[: self.MAX_RECENT])
+
+    def get(self) -> list[str]:
+        """Return existing recent paths, pruning missing entries."""
+        paths = self._read()
+        existing = [p for p in paths if Path(p).exists()]
+        if len(existing) != len(paths):
+            self._write(existing)
+        return existing
+
+    def clear(self) -> None:
+        """Clear the recent-files list."""
+        self._write([])
+
+
 class IMosflmApp(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -481,6 +576,11 @@ class IMosflmApp(QMainWindow):
         self.beam_center = None
         self.image_inverted = False
         self.show_rings = True  # Default to showing rings
+        self.show_indexing_spots = True
+        self._recent_files = RecentFilesManager()
+        self._indexing_dialog: IndexingDialog | None = None
+        self._indexing_spot_overlay: list[tuple[float, float, bool]] | None = None
+        self._indexing_solution = None
 
         if _HAS_PICOUI:
             self.setWindowIcon(_registry_icon(IconRegistry.DATASET_PROCESSING))
@@ -540,6 +640,19 @@ class IMosflmApp(QMainWindow):
         self._act_rings.setStatusTip("Toggle resolution rings")
         self._act_rings.toggled.connect(self._on_rings_action_toggled)
 
+        self._act_index = QAction(
+            _registry_icon(
+                IconRegistry.DATASET_PROCESSING if _HAS_PICOUI else ""
+            ),
+            "&Index…",
+            self,
+        )
+        self._act_index.setShortcut("Ctrl+I")
+        self._act_index.setStatusTip(
+            "Find spots and autoindex with Mosflm (DPS)"
+        )
+        self._act_index.triggered.connect(self.open_indexing_dialog)
+
         self._act_quit = QAction(
             _registry_icon(IconRegistry.EXIT if _HAS_PICOUI else ""),
             "&Quit",
@@ -550,15 +663,52 @@ class IMosflmApp(QMainWindow):
         self._act_quit.triggered.connect(self.close)
 
     def _build_menus(self) -> None:
-        """Build File menu with IconRegistry actions."""
+        """Build File / Process menus with IconRegistry actions."""
         file_menu = self.menuBar().addMenu("&File")
         file_menu.addAction(self._act_open)
+        self._recent_menu = QMenu("Open &Recent", self)
+        file_menu.addMenu(self._recent_menu)
+        self._recent_menu.aboutToShow.connect(self._refresh_recent_files_menu)
+        self._refresh_recent_files_menu()
         file_menu.addSeparator()
         file_menu.addAction(self._act_invert)
         file_menu.addAction(self._act_histogram)
         file_menu.addAction(self._act_rings)
         file_menu.addSeparator()
         file_menu.addAction(self._act_quit)
+
+        process_menu = self.menuBar().addMenu("&Process")
+        process_menu.addAction(self._act_index)
+
+    def _refresh_recent_files_menu(self) -> None:
+        """Rebuild the Open Recent submenu from persisted paths."""
+        self._recent_menu.clear()
+        paths = self._recent_files.get()
+        if not paths:
+            empty = QAction("(No recent files)", self)
+            empty.setEnabled(False)
+            self._recent_menu.addAction(empty)
+            return
+        for index, path in enumerate(paths):
+            label = path if len(path) < 80 else f"…{path[-77:]}"
+            if index < 9:
+                label = f"&{index + 1}  {label}"
+            action = QAction(label, self)
+            action.setStatusTip(path)
+            action.triggered.connect(
+                lambda checked=False, p=path: self.open_path(p)
+            )
+            self._recent_menu.addAction(action)
+        self._recent_menu.addSeparator()
+        clear_action = QAction("Clear Recent", self)
+        clear_action.triggered.connect(self._clear_recent_files)
+        self._recent_menu.addAction(clear_action)
+
+    def _clear_recent_files(self) -> None:
+        """Clear persisted recent files and refresh the submenu."""
+        self._recent_files.clear()
+        self._refresh_recent_files_menu()
+        self.statusBar().showMessage("Recent files cleared.", 3000)
 
     def _build_toolbar(self) -> None:
         """Build a themed toolbar with IconRegistry actions."""
@@ -572,6 +722,8 @@ class IMosflmApp(QMainWindow):
         toolbar.addAction(self._act_invert)
         toolbar.addAction(self._act_histogram)
         toolbar.addAction(self._act_rings)
+        toolbar.addSeparator()
+        toolbar.addAction(self._act_index)
 
     def _build_central_ui(self) -> None:
         """Build the central image viewer and controls."""
@@ -660,12 +812,29 @@ class IMosflmApp(QMainWindow):
         self.rings_checkbox.stateChanged.connect(self.toggle_rings)
         button_layout.addWidget(self.rings_checkbox)
 
+        self.indexing_spots_checkbox = QCheckBox("Show indexing spots")
+        self.indexing_spots_checkbox.setChecked(self.show_indexing_spots)
+        self.indexing_spots_checkbox.setStatusTip(
+            "Toggle matched-spot markers from the Index window"
+        )
+        self.indexing_spots_checkbox.stateChanged.connect(
+            self.toggle_indexing_spots
+        )
+        button_layout.addWidget(self.indexing_spots_checkbox)
+
         histogram_button = QPushButton("Histogram")
         histogram_button.setIcon(_registry_icon(
             IconRegistry.CHART_SCATTER_PLOT if _HAS_PICOUI else ""
         ))
         histogram_button.clicked.connect(self.show_histogram)
         button_layout.addWidget(histogram_button)
+
+        index_button = QPushButton("Index")
+        index_button.setIcon(_registry_icon(
+            IconRegistry.DATASET_PROCESSING if _HAS_PICOUI else ""
+        ))
+        index_button.clicked.connect(self.open_indexing_dialog)
+        button_layout.addWidget(index_button)
 
         # Contrast slider
         contrast_layout = QHBoxLayout()
@@ -713,30 +882,207 @@ class IMosflmApp(QMainWindow):
         if self.current_image:
             self.show_image(self.current_image)
 
-    def open_file(self):
-        """
-        open_file
+    def open_indexing_dialog(self) -> None:
+        """Open the Mosflm DPS indexing dialog for the loaded dataset."""
+        if self.dataset is None:
+            QMessageBox.information(
+                self,
+                "Index",
+                "Open an HDF5 / NeXus master file before indexing.",
+            )
+            return
+        if self._indexing_dialog is None:
+            self._indexing_dialog = IndexingDialog(self)
+            self._indexing_dialog.destroyed.connect(self._on_indexing_dialog_destroyed)
+        self._indexing_dialog.show()
+        self._indexing_dialog.raise_()
+        self._indexing_dialog.activateWindow()
 
-        :return: None
+    def _on_indexing_dialog_destroyed(self, *_args) -> None:
+        self._indexing_dialog = None
+
+    def set_indexing_spot_overlay(
+        self,
+        spots_px: list[tuple[float, float, bool]] | None,
+        *,
+        solution=None,
+    ) -> None:
+        """Show or clear indexing spot markers on the current image.
+
+        Each entry is ``(x_px, y_px, matched)``. Only matched spots are drawn
+        (so changing Index solutions updates the visible set).
         """
+        self._indexing_spot_overlay = spots_px
+        self._indexing_solution = solution
+        if self.current_image is not None:
+            self.show_image(self.current_image)
+        if spots_px is not None:
+            n_matched = sum(1 for *_xy, matched in spots_px if matched)
+            n_total = len(spots_px)
+            label = ""
+            if solution is not None:
+                label = f"#{getattr(solution, 'number', '?')} {getattr(solution, 'lattice', '')} "
+            self.statusBar().showMessage(
+                f"Indexing overlay {label}: {n_matched} matched / {n_total} found"
+                + ("" if self.show_indexing_spots else " (hidden)"),
+                5000,
+            )
+
+    def toggle_indexing_spots(self, state) -> None:
+        """Toggle visibility of indexing spot markers."""
+        checked = state == Qt.CheckState.Checked or state is True or state == 2
+        self.show_indexing_spots = bool(checked)
+        logging.info(
+            "Toggle indexing spots: %s",
+            "ON" if self.show_indexing_spots else "OFF",
+        )
+        if self.current_image is not None:
+            self.show_image(self.current_image)
+
+    def build_indexing_geometry(self) -> IndexingGeometry:
+        """Build :class:`IndexingGeometry` from the currently loaded image."""
+        if self.current_file is None:
+            raise ValueError("No file loaded")
+        if self.beam_x is None or self.beam_y is None:
+            raise ValueError("Beam centre not available")
+        if self.incident_wavelength is None:
+            raise ValueError("Wavelength not available")
+
+        pixel_mm = as_float(self.x_pixel_size)
+        beam_x_px = as_float(self.beam_x)
+        beam_y_px = as_float(self.beam_y)
+        distance_mm = as_float(self.detector_distance)
+        wavelength = as_float(self.incident_wavelength)
+
+        if self.dataset is not None:
+            height = int(self.dataset.shape[-2])
+            width = int(self.dataset.shape[-1])
+        elif self.current_image is not None:
+            width, height = self.current_image.size
+        else:
+            raise ValueError("No image dimensions available")
+
+        path = Path(self.current_file)
+        phi0, phi1 = self.phi_range_for_frame(int(self.frame_slider.value()))
+        return IndexingGeometry(
+            directory=path.parent,
+            template=path.name,
+            image_number=max(1, int(self.frame_slider.value()) + 1),
+            beam_x_mm=beam_x_px * pixel_mm,
+            beam_y_mm=beam_y_px * pixel_mm,
+            distance_mm=distance_mm,
+            wavelength_a=wavelength,
+            pixel_size_mm=pixel_mm,
+            image_width=width,
+            image_height=height,
+            phi_start=phi0,
+            phi_end=phi1,
+            is_hdf5_master=path.suffix.lower() == ".h5",
+        )
+
+    def phi_range_for_frame(self, frame_index: int) -> tuple[float, float]:
+        """Return (phi_start, phi_end) in degrees for *frame_index*."""
+        omegas = self._read_omega_array()
+        if omegas is not None and 0 <= frame_index < len(omegas):
+            phi0 = float(omegas[frame_index])
+            if frame_index + 1 < len(omegas):
+                phi1 = float(omegas[frame_index + 1])
+            elif len(omegas) > 1:
+                step = float(omegas[1] - omegas[0])
+                phi1 = phi0 + step
+            else:
+                phi1 = phi0 + 0.5
+            return phi0, phi1
+        # Fallback 0.5° wedges from frame 0.
+        width = 0.5
+        phi0 = frame_index * width
+        return phi0, phi0 + width
+
+    def _read_omega_array(self) -> np.ndarray | None:
+        """Read ``/entry/data/omega`` or ``/entry/sample/transformations/omega``."""
+        handle = self._h5_master
+        if handle is None and self.current_file:
+            try:
+                with h5py.File(self.current_file, "r") as f:
+                    return self._omega_from_handle(f)
+            except Exception:
+                return None
+        if handle is None:
+            return None
+        try:
+            return self._omega_from_handle(handle)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _omega_from_handle(handle: h5py.File) -> np.ndarray | None:
+        for path in (
+            "/entry/data/omega",
+            "/entry/sample/transformations/omega",
+            "/entry/instrument/detector/transformations/omega",
+        ):
+            if path in handle:
+                return np.asarray(handle[path][()], dtype=np.float64)
+        return None
+
+    def load_frames_for_indexing(
+        self, indices: list[int]
+    ) -> tuple[list[np.ndarray], list[tuple[float, float]]]:
+        """Load raw detector frames and phi wedges for indexing."""
+        if self.dataset is None:
+            raise ValueError("No dataset loaded")
+        frames: list[np.ndarray] = []
+        phis: list[tuple[float, float]] = []
+        n = int(self.dataset.shape[0])
+        for idx in indices:
+            if idx < 0 or idx >= n:
+                raise IndexError(f"Frame {idx} out of range (0–{n - 1})")
+            frame = np.asarray(self.dataset[idx], dtype=np.float64)
+            if frame.ndim != 2:
+                raise ValueError(f"Frame {idx} has unexpected shape {frame.shape}")
+            frames.append(frame)
+            phis.append(self.phi_range_for_frame(idx))
+        return frames, phis
+
+    def open_file(self) -> None:
+        """Prompt for an image / HDF5 file and open it."""
+        start_dir = ""
+        recent = self._recent_files.get()
+        if recent:
+            start_dir = str(Path(recent[0]).parent)
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "Open Image",
-            "",
+            start_dir,
             "Image Files (*.jpg *.png *.gif *.tif *.tiff *.cbf *.h5)",
         )
         if file_path:
-            self.current_file = file_path
-            logging.info(f"file_path: {file_path}")
-            self.statusBar().showMessage(f"Loaded {file_path}", 5000)
-            if file_path.lower().endswith('.cbf'):
-                self.display_cbf_image(file_path)
-            elif file_path.lower().endswith('.h5'):
-                # extract_nx_class_and_omega(file_path)
-                self.extract_instrument_metadata(file_path)
-                self.load_hdf5_image(file_path)
-            else:
-                self.display_image(file_path)
+            self.open_path(file_path)
+
+    def open_path(self, file_path: str | Path) -> None:
+        """Open *file_path* and add it to the recent-files list."""
+        path = Path(file_path).expanduser()
+        if not path.is_file():
+            QMessageBox.warning(
+                self,
+                "Open failed",
+                f"File not found:\n{path}",
+            )
+            self._refresh_recent_files_menu()
+            return
+        file_path = str(path.resolve())
+        self.current_file = file_path
+        logging.info("file_path: %s", file_path)
+        self.statusBar().showMessage(f"Loaded {file_path}", 5000)
+        self._recent_files.add(file_path)
+        self._refresh_recent_files_menu()
+        if file_path.lower().endswith(".cbf"):
+            self.display_cbf_image(file_path)
+        elif file_path.lower().endswith(".h5"):
+            self.extract_instrument_metadata(file_path)
+            self.load_hdf5_image(file_path)
+        else:
+            self.display_image(file_path)
 
     def display_image(self, file_path):
         """ display_image """
@@ -991,6 +1337,8 @@ class IMosflmApp(QMainWindow):
             # Update UI
             self.frame_label.setText(f"Frame: {start_index}")
             logging.info(f"Frame {start_index} updated with contrast level {contrast_value}.")
+            if self._indexing_dialog is not None and self._indexing_dialog.isVisible():
+                self._indexing_dialog.refresh_overlay_for_current_frame()
 
     def display_hdf5_image(self, start_index):
         """Display a slice of frames from the HDF5 dataset with improved contrast and no white borders."""
@@ -1049,14 +1397,47 @@ class IMosflmApp(QMainWindow):
             logging.error(f"Error in display_hdf5_image: {ex}")
 
     def show_image(self, image): # png_rings
-        """Display the image with resolution rings."""
+        """Display the image with resolution rings and optional indexing spots."""
         try:
             logging.info(f"show_image received image: mode={image.mode}, size={image.size}")
-            annotated_image = add_resolution_rings(image, self.beam_center, self.detector_distance[0],
-                                                   self.x_pixel_size, self.incident_wavelength, show_rings=self.show_rings)
+            annotated_image = add_resolution_rings(
+                image,
+                self.beam_center,
+                self.detector_distance[0],
+                self.x_pixel_size,
+                self.incident_wavelength,
+                show_rings=self.show_rings,
+            )
             pixmap = pil_to_qpixmap(annotated_image)
-            self.image_label.setPixmap(
-                pixmap.scaled(self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            scaled = pixmap.scaled(
+                self.image_label.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            # Draw matched spots on the *scaled* pixmap so crosses stay visible.
+            overlay = self._indexing_spot_overlay
+            if overlay and self.show_indexing_spots:
+                src_w, src_h = annotated_image.size
+                if src_w > 0 and src_h > 0:
+                    scale_x = scaled.width() / float(src_w)
+                    scale_y = scaled.height() / float(src_h)
+                    painter = QPainter(scaled)
+                    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                    half = 6
+                    drawn = 0
+                    for x_px, y_px, matched in overlay:
+                        if not matched:
+                            continue
+                        x = int(round(float(x_px) * scale_x))
+                        y = int(round(float(y_px) * scale_y))
+                        pen = QPen(QColor(0, 220, 70), 2)
+                        painter.setPen(pen)
+                        painter.drawLine(x - half, y, x + half, y)
+                        painter.drawLine(x, y - half, x, y + half)
+                        drawn += 1
+                    painter.end()
+                    logging.info("Drew %d matched indexing spots on display", drawn)
+            self.image_label.setPixmap(scaled)
 
         except Exception as ex:
             logging.error(f"Error in show_image: {ex}")

@@ -1,14 +1,14 @@
 import argparse
 import os
 import sys
-import tkinter as tk
-from tkinter import messagebox, filedialog
-from PIL import Image, ImageTk, ImageOps, ImageEnhance
+# import tkinter as tk
+# from tkinter import messagebox, filedialog
+from PIL import Image, ImageOps, ImageEnhance
 import fabio  # Import FabIO
 import matplotlib.pyplot as plt
 import cv2
 import numpy as np
-import h5py"} "
+import h5py
 
 # Set environment variables
 os.environ['MAINTAINER'] = 'mosflm@mrc-lmb.cam.ac.uk'
@@ -31,18 +31,27 @@ fastload = os.getenv('FASTLOAD', '0') == '1'
 if fastload:
     print("fastload mode: ON")
 
-# Check Tcl/Tk version
-tcl_tk_version = tk.Tcl().eval('info patchlevel')
+"""# Check Tcl/Tk version
+# tcl_tk_version = tk.Tcl().eval('info patchlevel')
 if tcl_tk_version == "8.4.13":
     print(f"\nYour Tcl/Tk version has been determined to be {tcl_tk_version}")
     print("Unfortunately in this version, the time taken to display images is unacceptably long.")
     sys.exit()
 else:
     print(f"Tcl platform is {sys.platform}")
-    print(f"TclTk version from info patchlevel is {tcl_tk_version}")
+    print(f"TclTk version from info patchlevel is {tcl_tk_version}")"""
 
-# Main application class
-class IMosflmApp(tk.Tk):
+# Legacy Tk UI (optional). Prefer ``imosflm.qtmosflm`` / qtMosflm.
+try:
+    import tkinter as tk
+    from tkinter import messagebox, filedialog
+except ImportError:  # pragma: no cover
+    tk = None  # type: ignore[assignment]
+
+
+if tk is not None:
+
+  class IMosflmApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("iMosflm")
