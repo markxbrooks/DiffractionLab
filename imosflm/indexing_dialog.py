@@ -29,6 +29,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from imosflm.dials_engine import (
+    DialsEngine,
+    DialsImageRange,
+    DialsIndexingResult,
+    DialsIntegrationResult,
+    DialsSettings,
+    DialsSpotFindingResult,
+    auto_dials_image_range,
+    find_dials_prefix,
+)
 from imosflm.indexing import (
     IndexSolution,
     IndexingEngine,
@@ -49,6 +59,26 @@ from imosflm.indexing import (
 from imosflm.mosflm_client import find_ipmosflm
 
 logger = logging.getLogger(__name__)
+
+
+def _dials_to_index_solution(dials: DialsIndexingResult) -> IndexSolution:
+    """Map a DIALS crystal model into the Mosflm-oriented table row type."""
+    sol = dials.solution
+    return IndexSolution(
+        number=1,
+        kind="ref" if dials.refined else "reg",
+        penalty=0.0,
+        lattice=sol.lattice or "aP",
+        spacegroup=sol.spacegroup or "P1",
+        a=sol.a,
+        b=sol.b,
+        c=sol.c,
+        alpha=sol.alpha,
+        beta=sol.beta,
+        gamma=sol.gamma,
+        matrix=(),  # DIALS A-matrix lives in .expt; Mosflm matrix unused here.
+        reflections_used=sol.n_indexed,
+    )
 
 
 class _SpotFindWorker(QObject):
@@ -128,8 +158,115 @@ class _IndexWorker(QObject):
             self.failed.emit(str(ex))
 
 
+class _DialsSpotFindWorker(QObject):
+    """DIALS ``import`` + ``find_spots`` for HDF5 masters."""
+
+    finished = Signal(object)
+    failed = Signal(str)
+    progress = Signal(str)
+
+    def __init__(
+        self,
+        master_path: Path,
+        image_range: DialsImageRange,
+        work_dir: Path,
+        settings: DialsSettings | None = None,
+    ) -> None:
+        super().__init__()
+        self._master_path = master_path
+        self._image_range = image_range
+        self._work_dir = work_dir
+        self._settings = settings or DialsSettings()
+
+    def run(self) -> None:
+        try:
+            engine = DialsEngine(work_dir=self._work_dir, settings=self._settings)
+            self.progress.emit("DIALS: importing images…")
+            imported = engine.import_images(self._master_path)
+            self.progress.emit(
+                f"DIALS: finding spots on images "
+                f"{self._image_range.first_image}–{self._image_range.last_image}…"
+            )
+            result = engine.find_spots(imported, self._image_range)
+            self.finished.emit(result)
+        except Exception as ex:  # noqa: BLE001
+            logger.exception("DIALS spot finding failed")
+            self.failed.emit(str(ex))
+
+
+class _DialsIndexWorker(QObject):
+    """DIALS ``index`` + ``refine`` after spot finding."""
+
+    finished = Signal(object)
+    failed = Signal(str)
+    progress = Signal(str)
+
+    def __init__(
+        self,
+        spots: DialsSpotFindingResult,
+        work_dir: Path,
+        settings: DialsSettings | None = None,
+    ) -> None:
+        super().__init__()
+        self._spots = spots
+        self._work_dir = work_dir
+        self._settings = settings or DialsSettings()
+
+    def run(self) -> None:
+        try:
+            engine = DialsEngine(work_dir=self._work_dir, settings=self._settings)
+            self.progress.emit("DIALS: indexing (fft3d)…")
+            result = engine.index(
+                self._spots.imported_expt,
+                self._spots.strong_refl,
+                refine=True,
+            )
+            self.finished.emit(result)
+        except Exception as ex:  # noqa: BLE001
+            logger.exception("DIALS indexing failed")
+            self.failed.emit(str(ex))
+
+
+class _DialsIntegrateWorker(QObject):
+    """DIALS ``integrate`` + ``export`` MTZ."""
+
+    finished = Signal(object)
+    failed = Signal(str)
+    progress = Signal(str)
+
+    def __init__(
+        self,
+        indexed: DialsIndexingResult,
+        image_range: DialsImageRange,
+        work_dir: Path,
+        settings: DialsSettings | None = None,
+    ) -> None:
+        super().__init__()
+        self._indexed = indexed
+        self._image_range = image_range
+        self._work_dir = work_dir
+        self._settings = settings or DialsSettings()
+
+    def run(self) -> None:
+        try:
+            engine = DialsEngine(work_dir=self._work_dir, settings=self._settings)
+            self.progress.emit(
+                f"DIALS: integrating images "
+                f"{self._image_range.first_image}–{self._image_range.last_image}…"
+            )
+            result = engine.integrate(
+                self._indexed.experiments,
+                self._indexed.reflections,
+                image_range=self._image_range,
+            )
+            self.finished.emit(result)
+        except Exception as ex:  # noqa: BLE001
+            logger.exception("DIALS integration failed")
+            self.failed.emit(str(ex))
+
+
 class _IntegrationWorker(QObject):
-    """Background worker: auto-select images and run trial integration."""
+    """Background worker: auto-select images and run Mosflm trial integration."""
 
     finished = Signal(object)
     failed = Signal(str)
@@ -322,8 +459,12 @@ class IndexingDialog(QDialog):
         self._integrate_thread: QThread | None = None
         self._integrate_worker: _IntegrationWorker | None = None
         self._spotfinding: SpotFindingResult | None = None
+        self._dials_spots: DialsSpotFindingResult | None = None
+        self._dials_index: DialsIndexingResult | None = None
         self._integration_range: IntegrationImageRange | None = None
         self._integration_result: IntegrationResult | None = None
+        self._dials_integration: DialsIntegrationResult | None = None
+        self._use_dials: bool = False
         self._selected_frames: list[int] = []
         self._source_geometry: IndexingGeometry | None = None
         self._build_ui()
@@ -373,7 +514,11 @@ class IndexingDialog(QDialog):
 
         layout.addWidget(form_box)
 
-        spot_box = QGroupBox("1. Spot finding (§5.1)")
+        self.backend_label = QLabel("")
+        self.backend_label.setWordWrap(True)
+        layout.addWidget(self.backend_label)
+
+        spot_box = QGroupBox("1. Spot finding")
         spot_layout = QHBoxLayout(spot_box)
         self.find_spots_button = QPushButton("Find spots")
         self.find_spots_button.clicked.connect(self._on_find_spots)
@@ -385,10 +530,10 @@ class IndexingDialog(QDialog):
         spot_layout.addWidget(self.spot_summary_label, stretch=1)
         layout.addWidget(spot_box)
 
-        self.run_button = QPushButton("2. Run DPS indexing")
+        self.run_button = QPushButton("2. Run indexing")
         self.run_button.setEnabled(False)
         self.run_button.setToolTip(
-            "Requires at least 12 spots from step 1 (iMosflm default)."
+            "Requires spots from step 1 (Mosflm DPS or DIALS)."
         )
         self.run_button.clicked.connect(self._on_run)
         layout.addWidget(self.run_button)
@@ -462,7 +607,7 @@ class IndexingDialog(QDialog):
         mosaic_layout.addStretch(1)
         layout.addWidget(mosaic_box)
 
-        integrate_box = QGroupBox("4. Trial integration (§9)")
+        integrate_box = QGroupBox("4. Trial integration")
         integrate_layout = QVBoxLayout(integrate_box)
         range_row = QHBoxLayout()
         self.integrate_range_label = QLabel(
@@ -524,18 +669,57 @@ class IndexingDialog(QDialog):
             self.frame_end.setValue(current)
             self.frame_step.setValue(1)
 
-        exe = find_ipmosflm()
-        if exe is None:
-            self.status_label.setText(
-                "ipmosflm not found — install CCP4 or set MOSFLM_EXEC."
-            )
-            self.run_button.setEnabled(False)
-            self.find_spots_button.setEnabled(False)
-        else:
-            self.status_label.setText(f"Using {exe}")
-            self.run_button.setEnabled(False)
-
         app = self.parentWidget()
+        geometry = None
+        try:
+            if app is not None and hasattr(app, "build_indexing_geometry"):
+                geometry = app.build_indexing_geometry()
+                self._source_geometry = geometry
+        except Exception:
+            geometry = None
+        self._use_dials = bool(geometry is not None and geometry.is_hdf5_master)
+        dials_ok = find_dials_prefix() is not None
+        mosflm = find_ipmosflm()
+
+        if self._use_dials:
+            self.backend_label.setText(
+                "Backend: DIALS (HDF5 / NeXus — Mosflm cannot PROCESS these masters)."
+            )
+            self.find_spots_button.setText("Find spots (DIALS)")
+            self.run_button.setText("2. Run DIALS indexing")
+            self.integrate_button.setText("Integrate with DIALS")
+            self.mosaicity_estimate_button.setEnabled(False)
+            self.mosaicity_estimate_button.setToolTip(
+                "Mosaicity estimate uses Mosflm; DIALS refines mosaicity during index/refine."
+            )
+            self.refine_button.setEnabled(False)
+            self.refine_button.setToolTip(
+                "Unit-cell refine with space group uses Mosflm index2; "
+                "DIALS refine runs automatically after indexing."
+            )
+            if not dials_ok:
+                self.status_label.setText(
+                    "DIALS not found — install CCP4/DIALS for HDF5 processing."
+                )
+                self.find_spots_button.setEnabled(False)
+            else:
+                self.status_label.setText(f"Using DIALS in {find_dials_prefix()}")
+                self.run_button.setEnabled(False)
+        else:
+            self.backend_label.setText("Backend: Mosflm (native image templates).")
+            self.find_spots_button.setText("Find spots")
+            self.run_button.setText("2. Run DPS indexing")
+            self.integrate_button.setText("Integrate selected wedge")
+            if mosflm is None:
+                self.status_label.setText(
+                    "ipmosflm not found — install CCP4 or set MOSFLM_EXEC."
+                )
+                self.run_button.setEnabled(False)
+                self.find_spots_button.setEnabled(False)
+            else:
+                self.status_label.setText(f"Using {mosflm}")
+                self.run_button.setEnabled(False)
+
         if app is not None and hasattr(app, "show_indexing_spots"):
             self.show_spots_checkbox.blockSignals(True)
             self.show_spots_checkbox.setChecked(bool(app.show_indexing_spots))
@@ -576,13 +760,28 @@ class IndexingDialog(QDialog):
         frames, phis = app.load_frames_for_indexing(indices)
         return frames, geometry, indices, phis
 
+    def _dials_range_from_ui(self) -> DialsImageRange:
+        """Convert 0-based Start/End/Step frames to a contiguous 1-based DIALS range."""
+        indices = self._compute_frame_indices()
+        if not indices:
+            raise ValueError("No frames selected")
+        # DIALS scan_range is contiguous; use min..max of the selection.
+        first = min(indices) + 1
+        last = max(indices) + 1
+        return DialsImageRange(first_image=first, last_image=last)
+
     def _on_find_spots(self) -> None:
+        if self._use_dials:
+            self._on_find_spots_dials()
+            return
         try:
             frames, geometry, indices, phis = self._prepare_frames()
         except Exception as ex:
             QMessageBox.critical(self, "Cannot find spots", str(ex))
             return
         self._spotfinding = None
+        self._dials_spots = None
+        self._dials_index = None
         self._result = None
         self.table.setRowCount(0)
         self._table_solutions = []
@@ -612,6 +811,76 @@ class IndexingDialog(QDialog):
         self._spot_worker.failed.connect(self._spot_thread.quit)
         self._spot_thread.finished.connect(self._cleanup_spot_thread)
         self._spot_thread.start()
+
+    def _on_find_spots_dials(self) -> None:
+        app = self.parent()
+        if app is None or getattr(app, "current_file", None) is None:
+            QMessageBox.warning(
+                self,
+                "No dataset",
+                "Open an HDF5 / NeXus master before DIALS spot finding.",
+            )
+            return
+        try:
+            geometry = app.build_indexing_geometry()
+            self._source_geometry = geometry
+            image_range = self._dials_range_from_ui()
+        except Exception as ex:
+            QMessageBox.critical(self, "Cannot find spots", str(ex))
+            return
+        self._spotfinding = None
+        self._dials_spots = None
+        self._dials_index = None
+        self._result = None
+        self.table.setRowCount(0)
+        self._table_solutions = []
+        self._selected_frames = self._compute_frame_indices()
+        self.log.clear()
+        self.log.append(
+            f"DIALS spot finding on images "
+            f"{image_range.first_image}–{image_range.last_image}"
+        )
+        self.solutionSelected.emit(None)
+        self.find_spots_button.setEnabled(False)
+        self.run_button.setEnabled(False)
+
+        work_dir = Path.home() / ".qtmosflm" / "dials"
+        self._spot_thread = QThread(self)
+        self._spot_worker = _DialsSpotFindWorker(
+            Path(app.current_file),
+            image_range,
+            work_dir,
+            DialsSettings(nproc=4),
+        )
+        self._spot_worker.moveToThread(self._spot_thread)
+        self._spot_thread.started.connect(self._spot_worker.run)
+        self._spot_worker.progress.connect(self.status_label.setText)
+        self._spot_worker.finished.connect(self._on_dials_spots_found)
+        self._spot_worker.failed.connect(self._on_spots_failed)
+        self._spot_worker.finished.connect(self._spot_thread.quit)
+        self._spot_worker.failed.connect(self._spot_thread.quit)
+        self._spot_thread.finished.connect(self._cleanup_spot_thread)
+        self._spot_thread.start()
+
+    def _on_dials_spots_found(self, spots: DialsSpotFindingResult) -> None:
+        self._dials_spots = spots
+        min_spots = max(12, self._settings().min_spots_to_index)
+        self.spot_summary_label.setText(
+            f"DIALS: {spots.n_spots} strong spots on images "
+            f"{spots.image_range.first_image}–{spots.image_range.last_image}."
+        )
+        self.status_label.setText(
+            f"DIALS found {spots.n_spots} spots → {spots.strong_refl.name}"
+        )
+        self.log.append(f"strong.refl: {spots.strong_refl}")
+        self._update_run_button_state()
+        if spots.n_spots < min_spots:
+            QMessageBox.warning(
+                self,
+                "Few spots",
+                f"Only {spots.n_spots} spots were found. "
+                "Widen the frame range or check the images.",
+            )
 
     def _cleanup_spot_thread(self) -> None:
         self._spot_worker = None
@@ -651,10 +920,16 @@ class IndexingDialog(QDialog):
 
     def _update_run_button_state(self) -> None:
         min_spots = self._settings().min_spots_to_index
-        ok = (
-            self._spotfinding is not None
-            and self._spotfinding.n_spots >= min_spots
-        )
+        if self._use_dials:
+            ok = (
+                self._dials_spots is not None
+                and self._dials_spots.n_spots >= min_spots
+            )
+        else:
+            ok = (
+                self._spotfinding is not None
+                and self._spotfinding.n_spots >= min_spots
+            )
         self.run_button.setEnabled(ok)
 
     def _show_found_spots_overlay(self) -> None:
@@ -693,6 +968,9 @@ class IndexingDialog(QDialog):
         app.set_indexing_spot_overlay(overlay, solution=None)
 
     def _on_run(self) -> None:
+        if self._use_dials:
+            self._on_run_dials()
+            return
         if self._spotfinding is None:
             QMessageBox.warning(
                 self,
@@ -720,6 +998,76 @@ class IndexingDialog(QDialog):
         self._worker.failed.connect(self._thread.quit)
         self._thread.finished.connect(self._cleanup_thread)
         self._thread.start()
+
+    def _on_run_dials(self) -> None:
+        if self._dials_spots is None:
+            QMessageBox.warning(
+                self,
+                "Find spots first",
+                "Run DIALS spot finding (step 1) before indexing.",
+            )
+            return
+        self.run_button.setEnabled(False)
+        self.table.setRowCount(0)
+        self._table_solutions = []
+        self.status_label.setText("Running DIALS indexing…")
+        self.solutionSelected.emit(None)
+        work_dir = Path.home() / ".qtmosflm" / "dials"
+        self._thread = QThread(self)
+        self._worker = _DialsIndexWorker(
+            self._dials_spots, work_dir, DialsSettings(nproc=4)
+        )
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.progress.connect(self.status_label.setText)
+        self._worker.finished.connect(self._on_dials_index_finished)
+        self._worker.failed.connect(self._on_failed)
+        self._worker.finished.connect(self._thread.quit)
+        self._worker.failed.connect(self._thread.quit)
+        self._thread.finished.connect(self._cleanup_thread)
+        self._thread.start()
+
+    def _on_dials_index_finished(self, indexed: DialsIndexingResult) -> None:
+        self._dials_index = indexed
+        sol = _dials_to_index_solution(indexed)
+        n_spots = self._dials_spots.n_spots if self._dials_spots else 0
+        result = IndexingResult(
+            spotfile=self._dials_spots.strong_refl if self._dials_spots else Path("."),
+            n_spots=n_spots,
+            suggested_number=1,
+            solutions=[sol],
+            refined=[sol] if indexed.refined else [],
+            messages=[
+                f"DIALS indexed cell {sol.a:.2f} {sol.b:.2f} {sol.c:.2f} "
+                f"{sol.alpha:.1f} {sol.beta:.1f} {sol.gamma:.1f} {sol.spacegroup}"
+            ],
+            geometry=self._source_geometry,
+            uses_placeholder_template=False,
+        )
+        self._result = result
+        self.status_label.setText(
+            f"DIALS indexing done — {sol.spacegroup}; "
+            f"a={sol.a:.2f} b={sol.b:.2f} c={sol.c:.2f}"
+            + (" (refined)" if indexed.refined else "")
+        )
+        self.log.append(f"experiments: {indexed.experiments}")
+        self.log.append(
+            f"Cell: {sol.a:.3f} {sol.b:.3f} {sol.c:.3f} "
+            f"{sol.alpha:.2f} {sol.beta:.2f} {sol.gamma:.2f}  {sol.spacegroup}"
+        )
+        if sol.n_indexed is not None:
+            self.log.append(
+                f"Indexed {sol.n_indexed}"
+                + (
+                    f" / unindexed {sol.n_unindexed}"
+                    if sol.n_unindexed is not None
+                    else ""
+                )
+            )
+        self._fill_table(result)
+        self.refine_button.setEnabled(False)
+        self.mosaicity_estimate_button.setEnabled(False)
+        self._update_integration_button_state()
 
     def _cleanup_thread(self) -> None:
         self._worker = None
@@ -1008,6 +1356,22 @@ class IndexingDialog(QDialog):
         )
 
     def _update_integration_button_state(self) -> None:
+        if self._use_dials:
+            enabled = self._dials_index is not None
+            self.auto_integrate_select_button.setEnabled(enabled)
+            self.integrate_button.setEnabled(enabled)
+            self.auto_integrate_select_button.setToolTip(
+                "Pick a short image wedge from mosaicity / oscillation (DIALS)."
+            )
+            self.integrate_button.setToolTip("Run dials.integrate + dials.export.")
+            if enabled:
+                self._preview_dials_integration_range()
+            else:
+                self.integrate_range_label.setText(
+                    "Run DIALS indexing first, then auto-select images and integrate."
+                )
+            return
+
         solution = self._selected_solution()
         has_matrix = (
             solution is not None
@@ -1023,10 +1387,10 @@ class IndexingDialog(QDialog):
         self.integrate_button.setEnabled(enabled)
         if hdf5:
             self.integrate_range_label.setText(
-                "Integration is not available for HDF5 / NeXus masters in qtMosflm "
-                "(ipmosflm crashes on PROCESS). Use iMosflm, or a .img/.cbf template."
+                "Mosflm cannot integrate HDF5 masters; reopen as DIALS backend "
+                "or use a native .img/.cbf template."
             )
-            tip = "Not supported for HDF5 masters."
+            tip = "Not supported for HDF5 masters via Mosflm."
             self.auto_integrate_select_button.setToolTip(tip)
             self.integrate_button.setToolTip(tip)
         elif enabled:
@@ -1038,7 +1402,49 @@ class IndexingDialog(QDialog):
                 "Select an indexed solution with an A-matrix to enable integration."
             )
 
+    def _preview_dials_integration_range(self) -> None:
+        total = self._dataset_num_images()
+        geom = self._source_geometry
+        if total <= 0 or geom is None:
+            return
+        osc = max(abs(geom.phi_end - geom.phi_start), 0.01)
+        preview = auto_dials_image_range(
+            total,
+            oscillation_deg=osc,
+            mosaicity_deg=float(self.mosaicity_value.value()),
+            first_image=1,
+        )
+        self.integrate_range_label.setText(
+            f"Suggested DIALS wedge: images {preview.first_image}–{preview.last_image} "
+            f"({preview.n_images} frames)"
+        )
+
     def _on_auto_select_integration(self) -> None:
+        if self._use_dials:
+            total = self._dataset_num_images()
+            geom = self._source_geometry
+            if total <= 0 or geom is None:
+                return
+            osc = max(abs(geom.phi_end - geom.phi_start), 0.01)
+            dials_range = auto_dials_image_range(
+                total,
+                oscillation_deg=osc,
+                mosaicity_deg=float(self.mosaicity_value.value()),
+                first_image=1,
+            )
+            self._integration_range = IntegrationImageRange(
+                first_image=dials_range.first_image,
+                last_image=dials_range.last_image,
+                selection_method="dials_heuristic",
+            )
+            self.integrate_range_label.setText(
+                self._format_integration_range(self._integration_range)
+            )
+            self.status_label.setText("DIALS integration image range selected.")
+            self.log.append(self._format_integration_range(self._integration_range))
+            self._update_integration_button_state()
+            return
+
         solution = self._selected_solution()
         geometry = self._integration_geometry()
         total = self._dataset_num_images()
@@ -1102,6 +1508,9 @@ class IndexingDialog(QDialog):
         thread.start()
 
     def _on_integrate(self) -> None:
+        if self._use_dials:
+            self._on_integrate_dials()
+            return
         solution = self._selected_solution()
         geometry = self._integration_geometry()
         total = self._dataset_num_images()
@@ -1117,7 +1526,8 @@ class IndexingDialog(QDialog):
                 self,
                 "Integration not available",
                 "ipmosflm crashes when PROCESS opens an HDF5 master from qtMosflm. "
-                "Integrate this dataset in iMosflm, or use a native image template.",
+                "This dialog should use the DIALS backend for HDF5 — reopen Index "
+                "after loading the master, or use a native image template.",
             )
             return
         spacegroup = normalize_spacegroup(
@@ -1160,6 +1570,75 @@ class IndexingDialog(QDialog):
         self._integrate_worker.failed.connect(self._integrate_thread.quit)
         self._integrate_thread.finished.connect(self._cleanup_integrate_thread)
         self._integrate_thread.start()
+
+    def _on_integrate_dials(self) -> None:
+        if self._dials_index is None:
+            QMessageBox.warning(
+                self,
+                "Integration",
+                "Run DIALS indexing before integration.",
+            )
+            return
+        total = self._dataset_num_images()
+        geom = self._source_geometry
+        if total <= 0 or geom is None:
+            return
+        if self._integration_range is not None:
+            dials_range = DialsImageRange(
+                self._integration_range.first_image,
+                self._integration_range.last_image,
+            )
+        else:
+            osc = max(abs(geom.phi_end - geom.phi_start), 0.01)
+            dials_range = auto_dials_image_range(
+                total,
+                oscillation_deg=osc,
+                mosaicity_deg=float(self.mosaicity_value.value()),
+            )
+            self._integration_range = IntegrationImageRange(
+                first_image=dials_range.first_image,
+                last_image=dials_range.last_image,
+                selection_method="dials_heuristic",
+            )
+
+        self.integrate_button.setEnabled(False)
+        self.auto_integrate_select_button.setEnabled(False)
+        self.find_spots_button.setEnabled(False)
+        self.run_button.setEnabled(False)
+        work_dir = Path.home() / ".qtmosflm" / "dials"
+        self._integrate_thread = QThread(self)
+        self._integrate_worker = _DialsIntegrateWorker(
+            self._dials_index,
+            dials_range,
+            work_dir,
+            DialsSettings(nproc=4),
+        )
+        self._integrate_worker.moveToThread(self._integrate_thread)
+        self._integrate_thread.started.connect(self._integrate_worker.run)
+        self._integrate_worker.progress.connect(self.status_label.setText)
+        self._integrate_worker.finished.connect(self._on_dials_integrate_finished)
+        self._integrate_worker.failed.connect(self._on_integrate_failed)
+        self._integrate_worker.finished.connect(self._integrate_thread.quit)
+        self._integrate_worker.failed.connect(self._integrate_thread.quit)
+        self._integrate_thread.finished.connect(self._cleanup_integrate_thread)
+        self._integrate_thread.start()
+
+    def _on_dials_integrate_finished(self, result: DialsIntegrationResult) -> None:
+        self._dials_integration = result
+        self._integration_range = IntegrationImageRange(
+            first_image=result.image_range.first_image,
+            last_image=result.image_range.last_image,
+            selection_method="dials",
+        )
+        nref = result.n_reflections or "?"
+        self.integrate_range_label.setText(
+            self._format_integration_range(self._integration_range)
+            + f" → {result.mtz_path.name} ({nref} reflections)"
+        )
+        self.status_label.setText(f"DIALS integration complete — {result.mtz_path}")
+        self.log.append(f"DIALS MTZ: {result.mtz_path}")
+        if result.n_reflections is not None:
+            self.log.append(f"Integrated reflections: {result.n_reflections}")
 
     def _cleanup_integrate_thread(self) -> None:
         self._integrate_worker = None
