@@ -1159,6 +1159,13 @@ class IndexingEngine:
         """Integrate *image_range* and write an MTZ under the work directory."""
         if len(solution.matrix) != 9:
             raise ValueError("Indexing solution has no A-matrix")
+        if geometry.is_hdf5_master:
+            raise RuntimeError(
+                "Mosflm cannot integrate HDF5 / NeXus masters from qtMosflm "
+                "(ipmosflm crashes when PROCESS opens the master file). "
+                "Use a native Mosflm image template (.img / .cbf / etc.), "
+                "or run integration in iMosflm on this dataset."
+            )
         mtz_path = Path(mtz_path or (self.work_dir / "qtmosflm_integrate.mtz"))
         mtz_path.parent.mkdir(parents=True, exist_ok=True)
         with MosflmClient(self.executable, self.work_dir) as client:
@@ -1556,11 +1563,22 @@ def _wait_for_integration(
     deadline = time.time() + timeout_s
     last_message = ""
     saw_integration = False
+    seen: list[str] = []
     while time.time() < deadline:
         remaining = max(0.05, deadline - time.time())
         msg = client.recv_message(timeout_s=remaining)
         if msg is None:
-            break
+            exit_code = None
+            if client._proc is not None:
+                exit_code = client._proc.poll()
+            detail = f" (exit code {exit_code})" if exit_code is not None else ""
+            raise RuntimeError(
+                "Mosflm closed the connection during integration"
+                f"{detail}. Seen: {seen or ['(nothing)']}. "
+                "HDF5 masters usually cause this; use a native image template "
+                "or iMosflm for integration."
+            )
+        seen.append(msg.doctype or msg.kind)
         if msg.kind == "xml" and msg.root is not None:
             if msg.doctype == "integration_response":
                 saw_integration = True
@@ -1583,4 +1601,7 @@ def _wait_for_integration(
             continue
     if saw_integration:
         return last_message or "Integration finished (timed out waiting for end)"
-    raise TimeoutError("Timed out waiting for Mosflm integration to finish")
+    raise TimeoutError(
+        f"Timed out waiting for Mosflm integration to finish after {timeout_s:g}s. "
+        f"Seen: {seen or ['(nothing)']}"
+    )

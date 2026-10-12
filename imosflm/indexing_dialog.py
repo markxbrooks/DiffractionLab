@@ -1014,13 +1014,24 @@ class IndexingDialog(QDialog):
             and len(solution.matrix) == 9
             and any(solution.matrix)
         )
-        geom_ok = self._integration_geometry() is not None
+        geom = self._integration_geometry()
+        hdf5 = bool(geom is not None and geom.is_hdf5_master)
         enabled = bool(
-            self._result is not None and has_matrix and geom_ok
+            self._result is not None and has_matrix and geom is not None and not hdf5
         )
         self.auto_integrate_select_button.setEnabled(enabled)
         self.integrate_button.setEnabled(enabled)
-        if enabled:
+        if hdf5:
+            self.integrate_range_label.setText(
+                "Integration is not available for HDF5 / NeXus masters in qtMosflm "
+                "(ipmosflm crashes on PROCESS). Use iMosflm, or a .img/.cbf template."
+            )
+            tip = "Not supported for HDF5 masters."
+            self.auto_integrate_select_button.setToolTip(tip)
+            self.integrate_button.setToolTip(tip)
+        elif enabled:
+            self.auto_integrate_select_button.setToolTip("")
+            self.integrate_button.setToolTip("")
             self._preview_heuristic_integration_range()
         else:
             self.integrate_range_label.setText(
@@ -1099,6 +1110,14 @@ class IndexingDialog(QDialog):
                 self,
                 "Integration",
                 "Load a dataset, index, and select a solution first.",
+            )
+            return
+        if geometry.is_hdf5_master:
+            QMessageBox.warning(
+                self,
+                "Integration not available",
+                "ipmosflm crashes when PROCESS opens an HDF5 master from qtMosflm. "
+                "Integrate this dataset in iMosflm, or use a native image template.",
             )
             return
         spacegroup = normalize_spacegroup(
