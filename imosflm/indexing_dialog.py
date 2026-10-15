@@ -1055,15 +1055,18 @@ class IndexingDialog(QDialog):
             f"Cell: {sol.a:.3f} {sol.b:.3f} {sol.c:.3f} "
             f"{sol.alpha:.2f} {sol.beta:.2f} {sol.gamma:.2f}  {sol.spacegroup}"
         )
-        if sol.n_indexed is not None:
+        dials_sol = indexed.solution
+        if dials_sol.n_indexed is not None:
             self.log.append(
-                f"Indexed {sol.n_indexed}"
+                f"Indexed {dials_sol.n_indexed}"
                 + (
-                    f" / unindexed {sol.n_unindexed}"
-                    if sol.n_unindexed is not None
+                    f" / unindexed {dials_sol.n_unindexed}"
+                    if dials_sol.n_unindexed is not None
                     else ""
                 )
             )
+        elif sol.reflections_used is not None:
+            self.log.append(f"Indexed {sol.reflections_used}")
         self._fill_table(result)
         self.refine_button.setEnabled(False)
         self.mosaicity_estimate_button.setEnabled(False)
