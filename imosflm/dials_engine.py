@@ -135,7 +135,7 @@ class DialsIntegrationResult:
 
 @dataclass
 class DialsSettings:
-    """User-facing DIALS defaults for qtMosflm."""
+    """User-facing DIALS defaults for DiffractionLab."""
 
     nproc: int = 4
     min_spot_size: int = 3
@@ -388,7 +388,7 @@ def export_strong_centroids_npz(
 ) -> Path:
     """Export ``xyzobs.px`` centroids from *strong_refl* to a NumPy ``.npz``.
 
-    qtMosflm cannot import DIALS into its own venv (boost mismatch), so this
+    DiffractionLab cannot import DIALS into its own venv (boost mismatch), so this
     shells out to CCP4's Python. The cache enables fast per-frame overlays.
     """
     strong_refl = Path(strong_refl)

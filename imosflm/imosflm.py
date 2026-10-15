@@ -41,7 +41,7 @@ else:
     print(f"Tcl platform is {sys.platform}")
     print(f"TclTk version from info patchlevel is {tcl_tk_version}")"""
 
-# Legacy Tk UI (optional). Prefer ``imosflm.qtmosflm`` / qtMosflm.
+# Legacy Tk UI (optional). Prefer ``imosflm.qtmosflm`` / DiffractionLab.
 try:
     import tkinter as tk
     from tkinter import messagebox, filedialog

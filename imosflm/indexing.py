@@ -1061,7 +1061,7 @@ class IndexingEngine:
         if used_placeholder:
             raise RuntimeError(
                 "Mosaicity estimation needs Mosflm to read detector images; "
-                "it is not supported with the HDF5 placeholder template in qtMosflm."
+                "it is not supported with the HDF5 placeholder template in DiffractionLab."
             )
         img_num = int(image_number if image_number is not None else geometry.image_number)
         p0 = float(phi_start if phi_start is not None else geometry.phi_start)
@@ -1161,7 +1161,7 @@ class IndexingEngine:
             raise ValueError("Indexing solution has no A-matrix")
         if geometry.is_hdf5_master:
             raise RuntimeError(
-                "Mosflm cannot integrate HDF5 / NeXus masters from qtMosflm "
+                "Mosflm cannot integrate HDF5 / NeXus masters from DiffractionLab "
                 "(ipmosflm crashes when PROCESS opens the master file). "
                 "Use a native Mosflm image template (.img / .cbf / etc.), "
                 "or run integration in iMosflm on this dataset."

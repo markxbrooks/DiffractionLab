@@ -1,4 +1,4 @@
-"""Zoomable diffraction-image canvas for qtMosflm (PicoUI ZoomableCanvas)."""
+"""Zoomable diffraction-image canvas for DiffractionLab (PicoUI ZoomableCanvas)."""
 
 from __future__ import annotations
 

@@ -140,7 +140,7 @@ def find_spots_in_frame(
     """Detect strong peaks in a detector frame and return spots in mm.
 
     This is a lightweight stand-in for Mosflm ``findspots`` when driving
-    indexing from frames already loaded in qtMosflm (e.g. HDF5). When the
+    indexing from frames already loaded in DiffractionLab (e.g. HDF5). When the
     Mosflm binary can read the images directly, prefer its findspots path.
     """
     data = np.asarray(frame, dtype=np.float64)

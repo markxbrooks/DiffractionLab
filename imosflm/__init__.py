@@ -1,3 +1,3 @@
-"""PyMosflm / qtMosflm package."""
+"""PyMosflm / DiffractionLab package."""
 
 __all__ = ["indexing", "indexing_dialog", "mosflm_client", "spotfile"]

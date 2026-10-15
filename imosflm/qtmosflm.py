@@ -530,7 +530,7 @@ class RecentFilesManager:
     """Persist recently opened image paths in ``QSettings``."""
 
     MAX_RECENT = 10
-    ORG = "qtMosflm"
+    ORG = "DiffractionLab"
     APP = "preferences"
     KEY = "recent_files"
 
@@ -587,7 +587,7 @@ class IMosflmApp(QMainWindow):
         self.incident_wavelength = None
         self.x_pixel_size = 0.075
         self.y_pixel_size = 0.075
-        self.setWindowTitle("qtMosflm")
+        self.setWindowTitle("DiffractionLab")
         self.setGeometry(100, 100, 900, 1000)
         self.current_image = None
         self.current_file = None
@@ -724,7 +724,7 @@ class IMosflmApp(QMainWindow):
             self,
         )
         self._act_quit.setShortcut("Ctrl+Q")
-        self._act_quit.setStatusTip("Quit qtMosflm")
+        self._act_quit.setStatusTip("Quit DiffractionLab")
         self._act_quit.triggered.connect(self.close)
 
     def _build_menus(self) -> None:
@@ -1761,7 +1761,7 @@ class IMosflmApp(QMainWindow):
 def parse_arguments():
     """ parse_arguments """
     logging.info("parse_arguments")     
-    parser = argparse.ArgumentParser(description='qtMosflm Application')
+    parser = argparse.ArgumentParser(description='DiffractionLab Application')
     parser.add_argument('--ccp4i2', action='store_true', help='Autosaves an iMosflm session file upon exit')
     parser.add_argument('--debug', '-d', action='store_true', help='Creates a large output file for debugging purposes')
     parser.add_argument('--expert', '-e', action='store_true', help='Permits access to advanced detector settings')
@@ -1851,7 +1851,7 @@ def main():
 
     # Initialize and run the application
     app = QApplication(sys.argv)
-    app.setApplicationName("qtMosflm")
+    app.setApplicationName("DiffractionLab")
     app.setOrganizationName("PyMosflm")
 
     if _HAS_PICOUI:

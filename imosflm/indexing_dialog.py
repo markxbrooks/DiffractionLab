@@ -1,4 +1,4 @@
-"""Indexing dialog for qtMosflm (findspots → DPS → refine)."""
+"""Indexing dialog for DiffractionLab (findspots → DPS → refine)."""
 
 from __future__ import annotations
 
@@ -1293,7 +1293,7 @@ class IndexingDialog(QDialog):
         )
 
     def _viewer(self) -> QWidget | None:
-        """Return the qtMosflm main window that owns this dialog."""
+        """Return the DiffractionLab main window that owns this dialog."""
         widget = self.parentWidget()
         while widget is not None:
             if hasattr(widget, "set_indexing_spot_overlay"):
@@ -1641,7 +1641,7 @@ class IndexingDialog(QDialog):
             QMessageBox.warning(
                 self,
                 "Integration not available",
-                "ipmosflm crashes when PROCESS opens an HDF5 master from qtMosflm. "
+                "ipmosflm crashes when PROCESS opens an HDF5 master from DiffractionLab. "
                 "This dialog should use the DIALS backend for HDF5 — reopen Index "
                 "after loading the master, or use a native image template.",
             )
@@ -1943,7 +1943,7 @@ class IndexingDialog(QDialog):
             QMessageBox.warning(
                 self,
                 "Refine not available",
-                "Unit-cell refinement cannot be run on HDF5 masters in qtMosflm "
+                "Unit-cell refinement cannot be run on HDF5 masters in DiffractionLab "
                 "because Mosflm re-opens detector images during index2. DPS "
                 "preselection still works from the spot file.\n\n"
                 "Use a native Mosflm image template, or refine in iMosflm.",
