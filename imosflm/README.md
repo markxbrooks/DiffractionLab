@@ -58,7 +58,7 @@ When the loaded dataset is an HDF5 / NeXus master, the Index window becomes a **
 | **Run full DIALS pipeline → MTZ** | One-shot `import → find_spots → index → refine → integrate → export` |
 | Integrate first/last | Contiguous wedge passed as `scan_range` to `dials.integrate` |
 | MTZ result | Reveal folder, Copy path, **Open in Reflection Viewer** (ElMo) |
-| Progress / log | Indeterminate bar; Open last `dials.*.log` |
+| Progress / log | Indeterminate bar; **Show terminal** (JDXI-style live tail of `dials.session.log`); Open last `dials.*.log` |
 
 Typical interactive flow:
 
@@ -69,6 +69,8 @@ Typical interactive flow:
 5. **Run DIALS indexing** → inspect cell in the table  
 6. Set integrate first/last → **Integrate with DIALS** (or use **Run full pipeline**)  
 7. **Open in Reflection Viewer** on the exported MTZ  
+
+DIALS stdout streams live into a JDXI Editor-like **Terminal** window (dark monospace viewer with fast/slow refresh). It opens automatically when a DIALS step starts, or via **View → Show Terminal** (`Ctrl+\``) / **Show terminal** in the Index window.
 
 Strong-spot centroids and indexed predictions are cached as `.npz` in the work directory and drawn on the **currently displayed frame** as you move the frame slider.
 
@@ -105,6 +107,7 @@ python imosflm/qtmosflm.py
 | `image_canvas.py` | Zoomable diffraction canvas & overlays |
 | `indexing_dialog.py` | Index UI (Mosflm + DIALS HDF5→MTZ panel) |
 | `dials_engine.py` | DIALS subprocess pipeline + `.npz` caches |
+| `terminal_log_viewer.py` | JDXI-style dark terminal that tails DIALS logs |
 | `reflection_viewer_launch.py` | Launch ElMo Reflection Viewer on an MTZ |
 | `mosflm_client.py` | Mosflm process I/O |
 | `spotfile.py` | Mosflm spotfile I/O / peak find |

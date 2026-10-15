@@ -42,7 +42,7 @@ When an HDF5 / NeXus master is opened, the Index window becomes a DIALS processi
 2. **Index and refine** — `dials.index` (`fft3d`) with automatic refine.
 3. **Integrate and export** — `dials.integrate` (with `scan_range`) and `dials.export` → MTZ.
 
-The panel also exposes work-directory browse/reveal, DIALS settings (`nproc`, `d_min`, gain, min spot size, optional known symmetry), a pipeline checklist, **Run full pipeline → MTZ**, progress/log access, and post-MTZ actions (Reveal, Copy path, **Open in Reflection Viewer** via ElMo).
+The panel also exposes work-directory browse/reveal, DIALS settings (`nproc`, `d_min`, gain, min spot size, optional known symmetry), a pipeline checklist, **Run full pipeline → MTZ**, a JDXI-style live **Terminal** for DIALS output (**View → Show Terminal**), and post-MTZ actions (Reveal, Copy path, **Open in Reflection Viewer** via ElMo).
 
 Working files default to `~/.qtmosflm/dials/<dataset_stem>/`. Spot/prediction overlays update with the frame slider.
 
@@ -130,6 +130,7 @@ The current application code remains under `imosflm/`:
 | `qtmosflm.py` | Main window and image viewer entry point |
 | `image_canvas.py` | Zoomable diffraction canvas and overlays |
 | `indexing_dialog.py` | Indexing UI for MOSFLM and DIALS |
+| `terminal_log_viewer.py` | JDXI-style live terminal for DIALS logs |
 | `dials_engine.py` | DIALS subprocess pipeline and `.npz` caches |
 | `mosflm_client.py` | MOSFLM process I/O |
 | `spotfile.py` | MOSFLM spot-file I/O and peak finding |

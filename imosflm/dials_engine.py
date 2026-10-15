@@ -15,7 +15,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -468,11 +468,13 @@ class DialsEngine:
         work_dir: Path | None = None,
         settings: DialsSettings | None = None,
         dials_bin_dir: Path | None = None,
+        on_chunk: Callable[[str], None] | None = None,
     ) -> None:
         self.settings = settings or DialsSettings()
         self.work_dir = Path(work_dir or (Path.home() / ".qtmosflm" / "dials"))
         self.work_dir.mkdir(parents=True, exist_ok=True)
         self.dials_bin_dir = dials_bin_dir or find_dials_prefix()
+        self.on_chunk = on_chunk
         if self.dials_bin_dir is None:
             raise FileNotFoundError(
                 "DIALS not found. Install CCP4/DIALS or ensure dials.import is on PATH."
@@ -493,19 +495,46 @@ class DialsEngine:
         args: Sequence[str],
         *,
         log_name: str | None = None,
+        on_chunk: Callable[[str], None] | None = None,
     ) -> str:
+        """Run a ``dials.*`` command, streaming stdout/stderr to a log file.
+
+        Chunks are written incrementally so a JDXI-style terminal viewer can
+        tail the logfile in real time. Optional *on_chunk* receives decoded
+        text as it arrives.
+        """
         cmd = [str(self._exe(name)), *args]
         logger.info("Running: %s", " ".join(cmd))
-        proc = subprocess.run(
+        chunk_cb = on_chunk if on_chunk is not None else self.on_chunk
+        header = f"$ {' '.join(cmd)}\n"
+        log_path = self.work_dir / log_name if log_name else None
+        if log_path is not None:
+            log_path.write_text(header, encoding="utf-8")
+        if chunk_cb is not None:
+            chunk_cb(header)
+
+        chunks: list[str] = [header]
+        proc = subprocess.Popen(
             cmd,
             cwd=str(self.work_dir),
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
-            check=False,
+            bufsize=1,
         )
-        combined = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
-        if log_name:
-            (self.work_dir / log_name).write_text(combined, encoding="utf-8")
+        assert proc.stdout is not None
+        try:
+            for line in proc.stdout:
+                chunks.append(line)
+                if log_path is not None:
+                    with open(log_path, "a", encoding="utf-8") as handle:
+                        handle.write(line)
+                        handle.flush()
+                if chunk_cb is not None:
+                    chunk_cb(line)
+        finally:
+            proc.wait()
+        combined = "".join(chunks)
         if proc.returncode != 0:
             tail = "\n".join(combined.strip().splitlines()[-40:])
             raise RuntimeError(

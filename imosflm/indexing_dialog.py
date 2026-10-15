@@ -64,6 +64,7 @@ from imosflm.indexing import (
 )
 from imosflm.mosflm_client import find_ipmosflm
 from imosflm.reflection_viewer_launch import launch_reflection_viewer
+from imosflm.terminal_log_viewer import TerminalLogViewer
 
 logger = logging.getLogger(__name__)
 
@@ -178,16 +179,22 @@ class _DialsSpotFindWorker(QObject):
         image_range: DialsImageRange,
         work_dir: Path,
         settings: DialsSettings | None = None,
+        on_chunk=None,
     ) -> None:
         super().__init__()
         self._master_path = master_path
         self._image_range = image_range
         self._work_dir = work_dir
         self._settings = settings or DialsSettings()
+        self._on_chunk = on_chunk
 
     def run(self) -> None:
         try:
-            engine = DialsEngine(work_dir=self._work_dir, settings=self._settings)
+            engine = DialsEngine(
+                work_dir=self._work_dir,
+                settings=self._settings,
+                on_chunk=self._on_chunk,
+            )
             self.progress.emit("DIALS: importing images…")
             imported = engine.import_images(self._master_path)
             self.progress.emit(
@@ -213,15 +220,21 @@ class _DialsIndexWorker(QObject):
         spots: DialsSpotFindingResult,
         work_dir: Path,
         settings: DialsSettings | None = None,
+        on_chunk=None,
     ) -> None:
         super().__init__()
         self._spots = spots
         self._work_dir = work_dir
         self._settings = settings or DialsSettings()
+        self._on_chunk = on_chunk
 
     def run(self) -> None:
         try:
-            engine = DialsEngine(work_dir=self._work_dir, settings=self._settings)
+            engine = DialsEngine(
+                work_dir=self._work_dir,
+                settings=self._settings,
+                on_chunk=self._on_chunk,
+            )
             self.progress.emit("DIALS: indexing (fft3d)…")
             result = engine.index(
                 self._spots.imported_expt,
@@ -247,16 +260,22 @@ class _DialsIntegrateWorker(QObject):
         image_range: DialsImageRange,
         work_dir: Path,
         settings: DialsSettings | None = None,
+        on_chunk=None,
     ) -> None:
         super().__init__()
         self._indexed = indexed
         self._image_range = image_range
         self._work_dir = work_dir
         self._settings = settings or DialsSettings()
+        self._on_chunk = on_chunk
 
     def run(self) -> None:
         try:
-            engine = DialsEngine(work_dir=self._work_dir, settings=self._settings)
+            engine = DialsEngine(
+                work_dir=self._work_dir,
+                settings=self._settings,
+                on_chunk=self._on_chunk,
+            )
             self.progress.emit(
                 f"DIALS: integrating images "
                 f"{self._image_range.first_image}–{self._image_range.last_image}…"
@@ -285,16 +304,22 @@ class _DialsFullPipelineWorker(QObject):
         image_range: DialsImageRange,
         work_dir: Path,
         settings: DialsSettings | None = None,
+        on_chunk=None,
     ) -> None:
         super().__init__()
         self._master_path = master_path
         self._image_range = image_range
         self._work_dir = work_dir
         self._settings = settings or DialsSettings()
+        self._on_chunk = on_chunk
 
     def run(self) -> None:
         try:
-            engine = DialsEngine(work_dir=self._work_dir, settings=self._settings)
+            engine = DialsEngine(
+                work_dir=self._work_dir,
+                settings=self._settings,
+                on_chunk=self._on_chunk,
+            )
             self.progress.emit("DIALS full pipeline: import…")
             imported = engine.import_images(self._master_path)
             self.progress.emit(
@@ -523,6 +548,7 @@ class IndexingDialog(QDialog):
         self._pipeline_thread: QThread | None = None
         self._pipeline_worker: _DialsFullPipelineWorker | None = None
         self._busy_cancel_requested = False
+        self._terminal_viewer: TerminalLogViewer | None = None
         self._build_ui()
         self._populate_defaults()
 
@@ -842,6 +868,12 @@ class IndexingDialog(QDialog):
         self.open_log_button.setEnabled(False)
         self.open_log_button.clicked.connect(self._on_open_last_dials_log)
         progress_row.addWidget(self.open_log_button)
+        self.show_terminal_button = QPushButton("Show terminal")
+        self.show_terminal_button.setToolTip(
+            "JDXI-style live terminal viewer (tails dials.*.log)"
+        )
+        self.show_terminal_button.clicked.connect(self.show_terminal_viewer)
+        progress_row.addWidget(self.show_terminal_button)
         layout.addLayout(progress_row)
 
         self.log = QTextEdit()
@@ -1102,7 +1134,52 @@ class IndexingDialog(QDialog):
                 QMessageBox.information(self, "Logs", f"No dials.*.log in {work}")
                 return
             log_path = logs[-1]
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(log_path)))
+        self.follow_dials_log(Path(log_path))
+
+    def show_terminal_viewer(self) -> TerminalLogViewer:
+        """Show the JDXI-style terminal log viewer (create if needed)."""
+        if self._terminal_viewer is None:
+            self._terminal_viewer = TerminalLogViewer(
+                self,
+                title="DiffractionLab Terminal — DIALS",
+            )
+            self._terminal_viewer.destroyed.connect(self._on_terminal_destroyed)
+        self._terminal_viewer.show()
+        self._terminal_viewer.raise_()
+        self._terminal_viewer.activateWindow()
+        return self._terminal_viewer
+
+    def _on_terminal_destroyed(self, *_args) -> None:
+        self._terminal_viewer = None
+
+    def follow_dials_log(self, log_path: Path) -> None:
+        """Open the terminal viewer and tail *log_path* in real time."""
+        viewer = self.show_terminal_viewer()
+        viewer.set_log_file(Path(log_path), reload=True)
+        self._last_dials_log = Path(log_path)
+        self.open_log_button.setEnabled(True)
+
+    def _begin_dials_log(self, log_name: str = "dials.session.log") -> Path:
+        """Prepare work-dir log *log_name*, open terminal on it, return path."""
+        work = self._resolve_dials_work_dir()
+        log_path = work / log_name
+        # Truncate session log for a fresh run; touch so the viewer can tail.
+        log_path.write_text("", encoding="utf-8")
+        self.follow_dials_log(log_path)
+        return log_path
+
+    def _session_log_chunker(self, log_path: Path):
+        """Return a thread-safe append callback for streaming DIALS output."""
+
+        def _write(text: str) -> None:
+            try:
+                with open(log_path, "a", encoding="utf-8") as handle:
+                    handle.write(text)
+                    handle.flush()
+            except OSError:
+                pass
+
+        return _write
 
     def _on_cancel_busy(self) -> None:
         self._busy_cancel_requested = True
@@ -1257,12 +1334,14 @@ class IndexingDialog(QDialog):
 
         work_dir = self._resolve_dials_work_dir()
         settings = self._dials_settings_from_ui()
+        session_log = self._begin_dials_log()
         self._spot_thread = QThread(self)
         self._spot_worker = _DialsSpotFindWorker(
             Path(app.current_file),
             image_range,
             work_dir,
             settings,
+            on_chunk=self._session_log_chunker(session_log),
         )
         self._spot_worker.moveToThread(self._spot_thread)
         self._spot_thread.started.connect(self._spot_worker.run)
@@ -1497,9 +1576,13 @@ class IndexingDialog(QDialog):
         self._set_busy(True)
         self.full_pipeline_button.setEnabled(False)
         work_dir = self._resolve_dials_work_dir()
+        session_log = self._begin_dials_log()
         self._thread = QThread(self)
         self._worker = _DialsIndexWorker(
-            self._dials_spots, work_dir, self._dials_settings_from_ui()
+            self._dials_spots,
+            work_dir,
+            self._dials_settings_from_ui(),
+            on_chunk=self._session_log_chunker(session_log),
         )
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
@@ -2156,12 +2239,14 @@ class IndexingDialog(QDialog):
         self.full_pipeline_button.setEnabled(False)
         self._set_busy(True)
         work_dir = self._resolve_dials_work_dir()
+        session_log = self._begin_dials_log()
         self._integrate_thread = QThread(self)
         self._integrate_worker = _DialsIntegrateWorker(
             self._dials_index,
             dials_range,
             work_dir,
             self._dials_settings_from_ui(),
+            on_chunk=self._session_log_chunker(session_log),
         )
         self._integrate_worker.moveToThread(self._integrate_thread)
         self._integrate_thread.started.connect(self._integrate_worker.run)
@@ -2230,12 +2315,14 @@ class IndexingDialog(QDialog):
         self._set_busy(True)
 
         work_dir = self._resolve_dials_work_dir()
+        session_log = self._begin_dials_log()
         self._pipeline_thread = QThread(self)
         self._pipeline_worker = _DialsFullPipelineWorker(
             Path(app.current_file),
             image_range,
             work_dir,
             self._dials_settings_from_ui(),
+            on_chunk=self._session_log_chunker(session_log),
         )
         self._pipeline_worker.moveToThread(self._pipeline_thread)
         self._pipeline_thread.started.connect(self._pipeline_worker.run)

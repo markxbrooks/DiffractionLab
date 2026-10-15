@@ -715,6 +715,17 @@ class IMosflmApp(QMainWindow):
         )
         self._act_index.triggered.connect(self.open_indexing_dialog)
 
+        self._act_terminal = QAction(
+            _registry_icon(_icon_key("TERMINAL_TAB")),
+            "Show &Terminal",
+            self,
+        )
+        self._act_terminal.setShortcut("Ctrl+`")
+        self._act_terminal.setStatusTip(
+            "Open the JDXI-style terminal that tails DIALS log output"
+        )
+        self._act_terminal.triggered.connect(self.show_terminal_viewer)
+
         if _HAS_PICOUI and standard_zoom_actions is not None:
             (
                 self._act_zoom_in,
@@ -784,6 +795,8 @@ class IMosflmApp(QMainWindow):
         view_menu.addSeparator()
         view_menu.addAction(self._act_rings)
         view_menu.addAction(self._act_indexing_spots)
+        view_menu.addSeparator()
+        view_menu.addAction(self._act_terminal)
 
         process_menu = self.menuBar().addMenu("&Process")
         process_menu.addAction(self._act_index)
@@ -1054,6 +1067,14 @@ class IMosflmApp(QMainWindow):
                 box.blockSignals(True)
                 box.setChecked(self.show_indexing_spots)
                 box.blockSignals(False)
+
+    def show_terminal_viewer(self) -> None:
+        """Open the JDXI-style DIALS terminal (via the Index window)."""
+        if self._indexing_dialog is None:
+            self.open_indexing_dialog()
+        dialog = self._indexing_dialog
+        if dialog is not None:
+            dialog.show_terminal_viewer()
 
     def open_indexing_dialog(self) -> None:
         """Open the Mosflm DPS indexing dialog for the loaded dataset."""
