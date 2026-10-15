@@ -68,6 +68,29 @@ def _registry_icon(icon_key: str) -> QIcon:
     return IconRegistry.get_icon_safe(icon_key)
 
 
+def _icon_key(attr: str, fallback: str = "") -> str:
+    """Resolve an IconRegistry attribute name when PicoUI is available."""
+    if not _HAS_PICOUI:
+        return fallback
+    return getattr(IconRegistry, attr, fallback) or fallback
+
+
+def _readout_widget(icon_key: str, text: str) -> tuple[QWidget, QLabel]:
+    """Build a small icon + text readout; return ``(host, text_label)``."""
+    host = QWidget()
+    row = QHBoxLayout(host)
+    row.setContentsMargins(0, 0, 8, 0)
+    row.setSpacing(4)
+    if icon_key:
+        icon = QLabel()
+        icon.setPixmap(_registry_icon(icon_key).pixmap(16, 16))
+        row.addWidget(icon)
+    label = QLabel(text)
+    row.addWidget(label)
+    row.addStretch(0)
+    return host, label
+
+
 def _theme_colors() -> dict[str, str]:
     """Return ThemeManager CSS colors, with dark fallbacks when unavailable."""
     if _HAS_PICOUI:
@@ -630,9 +653,7 @@ class IMosflmApp(QMainWindow):
         self._act_histogram.triggered.connect(self.show_histogram)
 
         self._act_rings = QAction(
-            _registry_icon(
-                IconRegistry.CLIP_SLICE if _HAS_PICOUI else ""
-            ),
+            _registry_icon(_icon_key("CIRCLE_OUTLINE", _icon_key("CLIP_SLICE"))),
             "Show &rings",
             self,
         )
@@ -640,6 +661,20 @@ class IMosflmApp(QMainWindow):
         self._act_rings.setChecked(self.show_rings)
         self._act_rings.setStatusTip("Toggle resolution rings")
         self._act_rings.toggled.connect(self._on_rings_action_toggled)
+
+        self._act_indexing_spots = QAction(
+            _registry_icon(_icon_key("SPOTS", _icon_key("CHART_SCATTER_PLOT"))),
+            "Show indexing &spots",
+            self,
+        )
+        self._act_indexing_spots.setCheckable(True)
+        self._act_indexing_spots.setChecked(self.show_indexing_spots)
+        self._act_indexing_spots.setStatusTip(
+            "Toggle matched-spot markers from the Index window"
+        )
+        self._act_indexing_spots.toggled.connect(
+            self._on_indexing_spots_action_toggled
+        )
 
         self._act_index = QAction(
             _registry_icon(
@@ -654,17 +689,29 @@ class IMosflmApp(QMainWindow):
         )
         self._act_index.triggered.connect(self.open_indexing_dialog)
 
-        self._act_zoom_in = QAction("Zoom &In", self)
+        self._act_zoom_in = QAction(
+            _registry_icon(_icon_key("ZOOM_IN")),
+            "Zoom &In",
+            self,
+        )
         self._act_zoom_in.setShortcut("Ctrl+=")
         self._act_zoom_in.setStatusTip("Zoom in (mouse wheel also works)")
         self._act_zoom_in.triggered.connect(self._zoom_in)
 
-        self._act_zoom_out = QAction("Zoom &Out", self)
+        self._act_zoom_out = QAction(
+            _registry_icon(_icon_key("ZOOM_OUT")),
+            "Zoom &Out",
+            self,
+        )
         self._act_zoom_out.setShortcut("Ctrl+-")
         self._act_zoom_out.setStatusTip("Zoom out (mouse wheel also works)")
         self._act_zoom_out.triggered.connect(self._zoom_out)
 
-        self._act_reset_zoom = QAction("&Reset Zoom", self)
+        self._act_reset_zoom = QAction(
+            _registry_icon(_icon_key("FIT_TO_PAGE", _icon_key("RECENTER_VIEW"))),
+            "&Reset Zoom",
+            self,
+        )
         self._act_reset_zoom.setShortcut("Ctrl+0")
         self._act_reset_zoom.setStatusTip(
             "Fit the diffraction image to the window"
@@ -692,6 +739,7 @@ class IMosflmApp(QMainWindow):
         file_menu.addAction(self._act_invert)
         file_menu.addAction(self._act_histogram)
         file_menu.addAction(self._act_rings)
+        file_menu.addAction(self._act_indexing_spots)
         file_menu.addSeparator()
         file_menu.addAction(self._act_quit)
 
@@ -699,6 +747,9 @@ class IMosflmApp(QMainWindow):
         view_menu.addAction(self._act_zoom_in)
         view_menu.addAction(self._act_zoom_out)
         view_menu.addAction(self._act_reset_zoom)
+        view_menu.addSeparator()
+        view_menu.addAction(self._act_rings)
+        view_menu.addAction(self._act_indexing_spots)
 
         process_menu = self.menuBar().addMenu("&Process")
         process_menu.addAction(self._act_index)
@@ -745,6 +796,7 @@ class IMosflmApp(QMainWindow):
         toolbar.addAction(self._act_invert)
         toolbar.addAction(self._act_histogram)
         toolbar.addAction(self._act_rings)
+        toolbar.addAction(self._act_indexing_spots)
         toolbar.addSeparator()
         toolbar.addAction(self._act_zoom_in)
         toolbar.addAction(self._act_zoom_out)
@@ -758,20 +810,43 @@ class IMosflmApp(QMainWindow):
         self.setCentralWidget(main_widget)
         layout = QVBoxLayout(main_widget)
 
-        # Resolution / beam readout
+        # Resolution / beam readout (icon + label pairs)
         resolution_layout = QHBoxLayout()
-        self.resolution_label = QLabel("Resolution: N/A")
-        resolution_layout.addWidget(self.resolution_label)
-        self.beam_x_label = QLabel("beam_x: N/A")
-        resolution_layout.addWidget(self.beam_x_label)
-        self.beam_y_label = QLabel("beam_y: N/A")
-        resolution_layout.addWidget(self.beam_y_label)
-        self.x_pixel_label = QLabel("x pixel: N/A")
-        resolution_layout.addWidget(self.x_pixel_label)
-        self.y_pixel_label = QLabel("y pixel: N/A")
-        resolution_layout.addWidget(self.y_pixel_label)
-        self.two_theta_label = QLabel("two theta: N/A degrees")
-        resolution_layout.addWidget(self.two_theta_label)
+        resolution_layout.setSpacing(12)
+        res_host, self.resolution_label = _readout_widget(
+            _icon_key("MDI_MAGNIFY", _icon_key("SEARCH")),
+            "Resolution: N/A",
+        )
+        beam_x_host, self.beam_x_label = _readout_widget(
+            _icon_key("CROSSHAIRS_GPS", _icon_key("RECENTER_VIEW")),
+            "beam_x: N/A",
+        )
+        beam_y_host, self.beam_y_label = _readout_widget(
+            _icon_key("IMAGE_FILTER_CENTER", _icon_key("RECENTER_VIEW")),
+            "beam_y: N/A",
+        )
+        x_pix_host, self.x_pixel_label = _readout_widget(
+            _icon_key("AXIS_X_ARROW", _icon_key("ARROW_RIGHT")),
+            "x pixel: N/A",
+        )
+        y_pix_host, self.y_pixel_label = _readout_widget(
+            _icon_key("AXIS_Y_ARROW", _icon_key("ALIGN_LEFT")),
+            "y pixel: N/A",
+        )
+        theta_host, self.two_theta_label = _readout_widget(
+            _icon_key("ANGLE_ACUTE", _icon_key("AUTO_ROTATE")),
+            "two theta: N/A degrees",
+        )
+        for host in (
+            res_host,
+            beam_x_host,
+            beam_y_host,
+            x_pix_host,
+            y_pix_host,
+            theta_host,
+        ):
+            resolution_layout.addWidget(host)
+        resolution_layout.addStretch(1)
         layout.addLayout(resolution_layout)
 
         # Dataset selection
@@ -833,14 +908,17 @@ class IMosflmApp(QMainWindow):
         button_layout.addWidget(invert_button)
 
         self.rings_checkbox = QCheckBox("Show Rings")
-        self.rings_checkbox.setIcon(_registry_icon(
-            IconRegistry.CLIP_SLICE if _HAS_PICOUI else ""
-        ))
+        self.rings_checkbox.setIcon(
+            _registry_icon(_icon_key("CIRCLE_OUTLINE", _icon_key("CLIP_SLICE")))
+        )
         self.rings_checkbox.setChecked(self.show_rings)
         self.rings_checkbox.stateChanged.connect(self.toggle_rings)
         button_layout.addWidget(self.rings_checkbox)
 
         self.indexing_spots_checkbox = QCheckBox("Show indexing spots")
+        self.indexing_spots_checkbox.setIcon(
+            _registry_icon(_icon_key("SPOTS", _icon_key("CHART_SCATTER_PLOT")))
+        )
         self.indexing_spots_checkbox.setChecked(self.show_indexing_spots)
         self.indexing_spots_checkbox.setStatusTip(
             "Toggle matched-spot markers from the Index window"
@@ -849,6 +927,23 @@ class IMosflmApp(QMainWindow):
             self.toggle_indexing_spots
         )
         button_layout.addWidget(self.indexing_spots_checkbox)
+
+        zoom_in_button = QPushButton("Zoom In")
+        zoom_in_button.setIcon(_registry_icon(_icon_key("ZOOM_IN")))
+        zoom_in_button.clicked.connect(self._zoom_in)
+        button_layout.addWidget(zoom_in_button)
+
+        zoom_out_button = QPushButton("Zoom Out")
+        zoom_out_button.setIcon(_registry_icon(_icon_key("ZOOM_OUT")))
+        zoom_out_button.clicked.connect(self._zoom_out)
+        button_layout.addWidget(zoom_out_button)
+
+        reset_zoom_button = QPushButton("Reset Zoom")
+        reset_zoom_button.setIcon(
+            _registry_icon(_icon_key("FIT_TO_PAGE", _icon_key("RECENTER_VIEW")))
+        )
+        reset_zoom_button.clicked.connect(self._reset_zoom)
+        button_layout.addWidget(reset_zoom_button)
 
         histogram_button = QPushButton("Histogram")
         histogram_button.setIcon(_registry_icon(
@@ -909,6 +1004,22 @@ class IMosflmApp(QMainWindow):
             self.rings_checkbox.blockSignals(False)
         self.image_canvas.set_rings_visible(self.show_rings)
 
+    def _on_indexing_spots_action_toggled(self, checked: bool) -> None:
+        """Keep toolbar action and checkbox in sync for indexing spots."""
+        self.show_indexing_spots = bool(checked)
+        if self.indexing_spots_checkbox.isChecked() != checked:
+            self.indexing_spots_checkbox.blockSignals(True)
+            self.indexing_spots_checkbox.setChecked(checked)
+            self.indexing_spots_checkbox.blockSignals(False)
+        self.image_canvas.set_spots_visible(self.show_indexing_spots)
+        dialog = self._indexing_dialog
+        if dialog is not None and hasattr(dialog, "show_spots_checkbox"):
+            box = dialog.show_spots_checkbox
+            if box.isChecked() != self.show_indexing_spots:
+                box.blockSignals(True)
+                box.setChecked(self.show_indexing_spots)
+                box.blockSignals(False)
+
     def open_indexing_dialog(self) -> None:
         """Open the Mosflm DPS indexing dialog for the loaded dataset."""
         if self.dataset is None:
@@ -965,6 +1076,10 @@ class IMosflmApp(QMainWindow):
             "Toggle indexing spots: %s",
             "ON" if self.show_indexing_spots else "OFF",
         )
+        if self._act_indexing_spots.isChecked() != self.show_indexing_spots:
+            self._act_indexing_spots.blockSignals(True)
+            self._act_indexing_spots.setChecked(self.show_indexing_spots)
+            self._act_indexing_spots.blockSignals(False)
         dialog = self._indexing_dialog
         if dialog is not None and hasattr(dialog, "show_spots_checkbox"):
             box = dialog.show_spots_checkbox
