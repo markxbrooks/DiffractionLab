@@ -1,5 +1,7 @@
 # DiffractionLab
 
+![DiffractionLab screenshot](resources/DiffractionLabLogo.png)
+
 **Interactive X-ray diffraction imaging, indexing, and processing with Python and Qt**
 
 DiffractionLab is a PySide6 desktop application for inspecting crystallographic diffraction images and running interactive indexing workflows. It combines the classic **MOSFLM DPS** indexing workflow with **DIALS** processing for HDF5 / NeXus datasets.
