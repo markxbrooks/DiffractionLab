@@ -9,7 +9,7 @@ The repository contains:
 - **DiffractionLab** — a PySide6 diffraction-image viewer and indexer, currently implemented under `imosflm/`.
 - **Legacy iMosflm Tcl sources** — retained under `src/` as reference / legacy UI code.
 
-![DiffractionLab screenshot](resources/screenshot1.png)
+![DiffractionLab screenshot](resources/screenshot2.png)
 
 ## Features
 
