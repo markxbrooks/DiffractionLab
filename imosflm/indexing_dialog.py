@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSpinBox,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -45,6 +46,19 @@ from imosflm.dials_engine import (
     export_strong_centroids_npz,
     find_dials_prefix,
 )
+from imosflm.dials_spec import (
+    dials_settings_fields,
+    dials_settings_to_values,
+    values_to_dials_settings,
+)
+
+try:
+    from picoui.widget.spec_editor import SpecEditor
+
+    _HAS_SPEC_EDITOR = True
+except ImportError:  # pragma: no cover
+    SpecEditor = None  # type: ignore[misc, assignment]
+    _HAS_SPEC_EDITOR = False
 from imosflm.indexing import (
     IndexSolution,
     IndexingEngine,
@@ -513,13 +527,13 @@ class _RefineWorker(QObject):
 
 
 class IndexingDialog(QDialog):
-    """UI for Mosflm-style autoindexing of the currently loaded dataset."""
+    """Processing dialog: find spots → index → integrate → MTZ."""
 
     solutionSelected = Signal(object)  # IndexSolution | None
 
     def __init__(self, parent: QWidget) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Indexing — spots, DPS, mosaicity")
+        self.setWindowTitle("Processing")
         self.setMinimumSize(780, 560)
         self.setModal(False)
         self._result: IndexingResult | None = None
@@ -540,6 +554,7 @@ class IndexingDialog(QDialog):
         self._integration_range: IntegrationImageRange | None = None
         self._integration_result: IntegrationResult | None = None
         self._dials_integration: DialsIntegrationResult | None = None
+        self._mtz_path: Path | None = None
         self._use_dials: bool = False
         self._selected_frames: list[int] = []
         self._source_geometry: IndexingGeometry | None = None
@@ -554,8 +569,13 @@ class IndexingDialog(QDialog):
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
+        self.pipeline_tabs = QTabWidget()
+        layout.addWidget(self.pipeline_tabs, stretch=1)
 
-        # --- Input / work-dir (DIALS panel; toggled in _apply_dials_chrome) ---
+        # ----- Tab: Setup -----
+        setup_page = QWidget()
+        setup_layout = QVBoxLayout(setup_page)
+
         self.dials_input_box = QGroupBox("HDF5 input & work directory")
         dials_input_form = QFormLayout(self.dials_input_box)
         self.dials_master_label = QLabel("(no master loaded)")
@@ -576,46 +596,65 @@ class IndexingDialog(QDialog):
         self.dials_work_reveal_btn.clicked.connect(self._on_reveal_work_dir)
         work_row.addWidget(self.dials_work_reveal_btn)
         dials_input_form.addRow("Work directory", work_row)
-        layout.addWidget(self.dials_input_box)
+        setup_layout.addWidget(self.dials_input_box)
 
-        # --- DIALS settings ---
         self.dials_settings_box = QGroupBox("DIALS settings")
-        dials_form = QFormLayout(self.dials_settings_box)
-        self.dials_nproc = QSpinBox()
-        self.dials_nproc.setRange(1, 64)
-        self.dials_nproc.setValue(4)
-        dials_form.addRow("nproc", self.dials_nproc)
+        dials_settings_layout = QVBoxLayout(self.dials_settings_box)
+        self._dials_spec_editor: SpecEditor | None = None
+        # Fallback widgets when PicoUI SpecEditor is unavailable.
+        self.dials_nproc: QSpinBox | None = None
+        self.dials_d_min: QDoubleSpinBox | None = None
+        self.dials_min_spot_size: QSpinBox | None = None
+        self.dials_gain: QDoubleSpinBox | None = None
+        self.dials_space_group: QLineEdit | None = None
+        self.dials_unit_cell: QLineEdit | None = None
+        if _HAS_SPEC_EDITOR and SpecEditor is not None:
+            self._dials_spec_editor = SpecEditor(
+                fields=dials_settings_fields(),
+                show_argv_preview=True,
+                program="dials",
+            )
+            self._dials_spec_editor.set_values(
+                dials_settings_to_values(DialsSettings())
+            )
+            dials_settings_layout.addWidget(self._dials_spec_editor)
+        else:
+            dials_form = QFormLayout()
+            self.dials_nproc = QSpinBox()
+            self.dials_nproc.setRange(1, 64)
+            self.dials_nproc.setValue(4)
+            dials_form.addRow("nproc", self.dials_nproc)
 
-        self.dials_d_min = QDoubleSpinBox()
-        self.dials_d_min.setRange(0.0, 50.0)
-        self.dials_d_min.setDecimals(2)
-        self.dials_d_min.setSpecialValueText("auto")
-        self.dials_d_min.setValue(0.0)
-        dials_form.addRow("d_min (Å)", self.dials_d_min)
+            self.dials_d_min = QDoubleSpinBox()
+            self.dials_d_min.setRange(0.0, 50.0)
+            self.dials_d_min.setDecimals(2)
+            self.dials_d_min.setSpecialValueText("auto")
+            self.dials_d_min.setValue(0.0)
+            dials_form.addRow("d_min (Å)", self.dials_d_min)
 
-        self.dials_min_spot_size = QSpinBox()
-        self.dials_min_spot_size.setRange(1, 50)
-        self.dials_min_spot_size.setValue(3)
-        dials_form.addRow("min spot size", self.dials_min_spot_size)
+            self.dials_min_spot_size = QSpinBox()
+            self.dials_min_spot_size.setRange(1, 50)
+            self.dials_min_spot_size.setValue(3)
+            dials_form.addRow("min spot size", self.dials_min_spot_size)
 
-        self.dials_gain = QDoubleSpinBox()
-        self.dials_gain.setRange(0.0, 100.0)
-        self.dials_gain.setDecimals(2)
-        self.dials_gain.setSpecialValueText("auto")
-        self.dials_gain.setValue(0.0)
-        dials_form.addRow("gain", self.dials_gain)
+            self.dials_gain = QDoubleSpinBox()
+            self.dials_gain.setRange(0.0, 100.0)
+            self.dials_gain.setDecimals(2)
+            self.dials_gain.setSpecialValueText("auto")
+            self.dials_gain.setValue(0.0)
+            dials_form.addRow("gain", self.dials_gain)
 
-        self.dials_space_group = QLineEdit()
-        self.dials_space_group.setPlaceholderText("optional, e.g. P212121")
-        dials_form.addRow("Known space group", self.dials_space_group)
+            self.dials_space_group = QLineEdit()
+            self.dials_space_group.setPlaceholderText("optional, e.g. P212121")
+            dials_form.addRow("Known space group", self.dials_space_group)
 
-        self.dials_unit_cell = QLineEdit()
-        self.dials_unit_cell.setPlaceholderText("optional a,b,c,α,β,γ")
-        dials_form.addRow("Known unit cell", self.dials_unit_cell)
-        layout.addWidget(self.dials_settings_box)
+            self.dials_unit_cell = QLineEdit()
+            self.dials_unit_cell.setPlaceholderText("optional a,b,c,α,β,γ")
+            dials_form.addRow("Known unit cell", self.dials_unit_cell)
+            dials_settings_layout.addLayout(dials_form)
+        setup_layout.addWidget(self.dials_settings_box)
 
-        # --- Pipeline checklist ---
-        self.dials_pipeline_box = QGroupBox("Pipeline")
+        self.dials_pipeline_box = QGroupBox("Pipeline status")
         pipe_layout = QVBoxLayout(self.dials_pipeline_box)
         self.pipeline_import_label = QLabel("○ Import —")
         self.pipeline_spots_label = QLabel("○ Find spots —")
@@ -631,7 +670,7 @@ class IndexingDialog(QDialog):
         ):
             lab.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             pipe_layout.addWidget(lab)
-        layout.addWidget(self.dials_pipeline_box)
+        setup_layout.addWidget(self.dials_pipeline_box)
 
         form_box = QGroupBox("Frames & settings")
         self.frames_settings_box = form_box
@@ -683,13 +722,18 @@ class IndexingDialog(QDialog):
         self.max_penalty_label = QLabel("Max penalty to refine")
         form.addRow(self.max_penalty_label, self.max_penalty)
 
-        layout.addWidget(form_box)
+        setup_layout.addWidget(form_box)
 
         self.backend_label = QLabel("")
         self.backend_label.setWordWrap(True)
-        layout.addWidget(self.backend_label)
+        setup_layout.addWidget(self.backend_label)
+        setup_layout.addStretch(1)
+        self.pipeline_tabs.addTab(setup_page, "1. Setup")
 
-        spot_box = QGroupBox("1. Spot finding")
+        # ----- Tab: Find spots -----
+        spots_page = QWidget()
+        spots_layout = QVBoxLayout(spots_page)
+        spot_box = QGroupBox("Spot finding")
         spot_layout = QHBoxLayout(spot_box)
         self.find_spots_button = QPushButton("Find spots")
         self.find_spots_button.clicked.connect(self._on_find_spots)
@@ -699,18 +743,25 @@ class IndexingDialog(QDialog):
         )
         self.spot_summary_label.setWordWrap(True)
         spot_layout.addWidget(self.spot_summary_label, stretch=1)
-        layout.addWidget(spot_box)
+        spots_layout.addWidget(spot_box)
 
-        self.run_button = QPushButton("2. Run indexing")
+        self.show_spots_checkbox = QCheckBox("Show indexing spots on image")
+        self.show_spots_checkbox.setChecked(True)
+        self.show_spots_checkbox.toggled.connect(self._on_show_spots_toggled)
+        spots_layout.addWidget(self.show_spots_checkbox)
+        spots_layout.addStretch(1)
+        self.pipeline_tabs.addTab(spots_page, "2. Find spots")
+
+        # ----- Tab: Index -----
+        index_page = QWidget()
+        index_layout = QVBoxLayout(index_page)
+        self.run_button = QPushButton("Run indexing")
         self.run_button.setEnabled(False)
         self.run_button.setToolTip(
-            "Requires spots from step 1 (Mosflm DPS or DIALS)."
+            "Requires spots from Find spots (Mosflm DPS or DIALS)."
         )
         self.run_button.clicked.connect(self._on_run)
-        layout.addWidget(self.run_button)
-
-        self.status_label = QLabel("Ready.")
-        layout.addWidget(self.status_label)
+        index_layout.addWidget(self.run_button)
 
         self.table = QTableWidget(0, 10)
         self.table.setHorizontalHeaderLabels(
@@ -731,9 +782,8 @@ class IndexingDialog(QDialog):
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
-        # currentCellChanged fires reliably when the user clicks another row.
         self.table.currentCellChanged.connect(self._on_current_cell_changed)
-        layout.addWidget(self.table, stretch=1)
+        index_layout.addWidget(self.table, stretch=1)
 
         refine_box = QGroupBox("Refine unit cell")
         refine_layout = QHBoxLayout(refine_box)
@@ -754,9 +804,10 @@ class IndexingDialog(QDialog):
         self.refine_button.clicked.connect(self._on_refine)
         refine_layout.addWidget(self.refine_button)
         refine_layout.addStretch(1)
-        layout.addWidget(refine_box)
+        index_layout.addWidget(refine_box)
 
-        mosaic_box = QGroupBox("3. Mosaicity estimation (§5.6)")
+        mosaic_box = QGroupBox("Mosaicity estimation (§5.6)")
+        self.mosaic_box = mosaic_box
         mosaic_layout = QHBoxLayout(mosaic_box)
         mosaic_layout.addWidget(QLabel("Mosaic spread (°)"))
         self.mosaicity_value = QDoubleSpinBox()
@@ -776,9 +827,13 @@ class IndexingDialog(QDialog):
         self.mosaicity_estimate_button.clicked.connect(self._on_estimate_mosaicity)
         mosaic_layout.addWidget(self.mosaicity_estimate_button)
         mosaic_layout.addStretch(1)
-        layout.addWidget(mosaic_box)
+        index_layout.addWidget(mosaic_box)
+        self.pipeline_tabs.addTab(index_page, "3. Index")
 
-        integrate_box = QGroupBox("4. Trial integration")
+        # ----- Tab: Integrate -----
+        integrate_page = QWidget()
+        integrate_page_layout = QVBoxLayout(integrate_page)
+        integrate_box = QGroupBox("Integration")
         self.integrate_box = integrate_box
         integrate_layout = QVBoxLayout(integrate_box)
         range_row = QHBoxLayout()
@@ -822,38 +877,47 @@ class IndexingDialog(QDialog):
         )
         self.full_pipeline_button.clicked.connect(self._on_run_full_pipeline)
         integrate_layout.addWidget(self.full_pipeline_button)
-        layout.addWidget(integrate_box)
+        integrate_page_layout.addWidget(integrate_box)
+        integrate_page_layout.addStretch(1)
+        self.pipeline_tabs.addTab(integrate_page, "4. Integrate")
 
-        # --- MTZ result strip ---
+        # ----- Tab: MTZ -----
+        mtz_page = QWidget()
+        mtz_page_layout = QVBoxLayout(mtz_page)
         self.mtz_result_box = QGroupBox("MTZ result")
-        mtz_layout = QHBoxLayout(self.mtz_result_box)
+        mtz_layout = QVBoxLayout(self.mtz_result_box)
         self.mtz_path_label = QLabel("No MTZ yet.")
         self.mtz_path_label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
         self.mtz_path_label.setWordWrap(True)
-        mtz_layout.addWidget(self.mtz_path_label, stretch=1)
+        mtz_layout.addWidget(self.mtz_path_label)
+
+        mtz_btn_row = QHBoxLayout()
         self.mtz_reveal_btn = QPushButton("Reveal")
         self.mtz_reveal_btn.setEnabled(False)
         self.mtz_reveal_btn.clicked.connect(self._on_reveal_mtz)
-        mtz_layout.addWidget(self.mtz_reveal_btn)
+        mtz_btn_row.addWidget(self.mtz_reveal_btn)
         self.mtz_copy_btn = QPushButton("Copy path")
         self.mtz_copy_btn.setEnabled(False)
         self.mtz_copy_btn.clicked.connect(self._on_copy_mtz_path)
-        mtz_layout.addWidget(self.mtz_copy_btn)
-        self.mtz_open_viewer_btn = QPushButton("Open in Reflection Viewer")
+        mtz_btn_row.addWidget(self.mtz_copy_btn)
+        self.mtz_open_viewer_btn = QPushButton("Open in Reflection File Viewer")
         self.mtz_open_viewer_btn.setEnabled(False)
+        self.mtz_open_viewer_btn.setToolTip(
+            "Open the MTZ in ElMo Reflection File Viewer"
+        )
         self.mtz_open_viewer_btn.clicked.connect(self._on_open_mtz_in_viewer)
-        mtz_layout.addWidget(self.mtz_open_viewer_btn)
-        layout.addWidget(self.mtz_result_box)
+        mtz_btn_row.addWidget(self.mtz_open_viewer_btn)
+        mtz_btn_row.addStretch(1)
+        mtz_layout.addLayout(mtz_btn_row)
+        mtz_page_layout.addWidget(self.mtz_result_box)
+        mtz_page_layout.addStretch(1)
+        self._mtz_tab_index = self.pipeline_tabs.addTab(mtz_page, "5. MTZ")
 
-        spot_row = QHBoxLayout()
-        self.show_spots_checkbox = QCheckBox("Show indexing spots on image")
-        self.show_spots_checkbox.setChecked(True)
-        self.show_spots_checkbox.toggled.connect(self._on_show_spots_toggled)
-        spot_row.addWidget(self.show_spots_checkbox)
-        spot_row.addStretch(1)
-        layout.addLayout(spot_row)
+        # ----- Shared footer -----
+        self.status_label = QLabel("Ready.")
+        layout.addWidget(self.status_label)
 
         progress_row = QHBoxLayout()
         self.progress_bar = QProgressBar()
@@ -879,7 +943,9 @@ class IndexingDialog(QDialog):
         self.log = QTextEdit()
         self.log.setReadOnly(True)
         self.log.setMaximumHeight(120)
-        self.log.setFont(QFont("Menlo", 11) if QFont("Menlo").exactMatch() else QFont("Courier", 11))
+        self.log.setFont(
+            QFont("Menlo", 11) if QFont("Menlo").exactMatch() else QFont("Courier", 11)
+        )
         layout.addWidget(self.log)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
@@ -926,7 +992,7 @@ class IndexingDialog(QDialog):
                 "Backend: DIALS (HDF5 / NeXus — Mosflm cannot PROCESS these masters)."
             )
             self.find_spots_button.setText("Find spots (DIALS)")
-            self.run_button.setText("2. Run DIALS indexing")
+            self.run_button.setText("Run DIALS indexing")
             self.integrate_button.setText("Integrate with DIALS")
             self.mosaicity_estimate_button.setEnabled(False)
             self.mosaicity_estimate_button.setToolTip(
@@ -964,7 +1030,7 @@ class IndexingDialog(QDialog):
         else:
             self.backend_label.setText("Backend: Mosflm (native image templates).")
             self.find_spots_button.setText("Find spots")
-            self.run_button.setText("2. Run DPS indexing")
+            self.run_button.setText("Run DPS indexing")
             self.integrate_button.setText("Integrate selected wedge")
             if mosflm is None:
                 self.status_label.setText(
@@ -979,6 +1045,8 @@ class IndexingDialog(QDialog):
         self._apply_dials_chrome(self._use_dials)
         self._reset_pipeline_checklist()
         self._update_dials_range_hint()
+        if self._use_dials:
+            self._discover_existing_mtz()
 
         if app is not None and hasattr(app, "show_indexing_spots"):
             self.show_spots_checkbox.blockSignals(True)
@@ -995,7 +1063,15 @@ class IndexingDialog(QDialog):
         )
 
     def _dials_settings_from_ui(self) -> DialsSettings:
-        """Build :class:`DialsSettings` from the DIALS settings group."""
+        """Build :class:`DialsSettings` from the DIALS SpecEditor (or fallback form)."""
+        if self._dials_spec_editor is not None:
+            return values_to_dials_settings(self._dials_spec_editor.values())
+        assert self.dials_nproc is not None
+        assert self.dials_d_min is not None
+        assert self.dials_min_spot_size is not None
+        assert self.dials_gain is not None
+        assert self.dials_space_group is not None
+        assert self.dials_unit_cell is not None
         d_min_val = float(self.dials_d_min.value())
         gain_val = float(self.dials_gain.value())
         sg = self.dials_space_group.text().strip() or None
@@ -1045,11 +1121,13 @@ class IndexingDialog(QDialog):
             self.max_penalty_label,
         ):
             w.setVisible(not use_dials)
+        if hasattr(self, "mosaic_box"):
+            self.mosaic_box.setVisible(not use_dials)
         if use_dials:
-            self.setWindowTitle("Indexing — DIALS (HDF5 → MTZ)")
+            self.setWindowTitle("Processing — DIALS (HDF5 → MTZ)")
             self.setMinimumSize(820, 720)
         else:
-            self.setWindowTitle("Indexing — spots, DPS, mosaicity")
+            self.setWindowTitle("Processing — Mosflm DPS")
 
     def _update_dials_range_hint(self) -> None:
         if not self._use_dials:
@@ -1071,6 +1149,7 @@ class IndexingDialog(QDialog):
         self.pipeline_index_label.setText("○ Index / refine —")
         self.pipeline_integrate_label.setText("○ Integrate —")
         self.pipeline_export_label.setText("○ Export MTZ —")
+        self._mtz_path = None
         self.mtz_path_label.setText("No MTZ yet.")
         self.mtz_reveal_btn.setEnabled(False)
         self.mtz_copy_btn.setEnabled(False)
@@ -1095,34 +1174,75 @@ class IndexingDialog(QDialog):
         if chosen:
             self.dials_work_dir_edit.setText(chosen)
             self._dials_work_dir = Path(chosen)
+            self._discover_existing_mtz()
 
     def _on_reveal_work_dir(self) -> None:
         path = self._resolve_dials_work_dir()
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
     def _on_reveal_mtz(self) -> None:
-        if self._dials_integration is None:
+        if self._mtz_path is None:
             return
         QDesktopServices.openUrl(
-            QUrl.fromLocalFile(str(self._dials_integration.mtz_path.parent))
+            QUrl.fromLocalFile(str(self._mtz_path.parent))
         )
 
     def _on_copy_mtz_path(self) -> None:
-        if self._dials_integration is None:
+        if self._mtz_path is None:
             return
-        QGuiApplication.clipboard().setText(str(self._dials_integration.mtz_path))
+        QGuiApplication.clipboard().setText(str(self._mtz_path))
         self.status_label.setText("MTZ path copied to clipboard.")
 
     def _on_open_mtz_in_viewer(self) -> None:
-        if self._dials_integration is None:
+        if self._mtz_path is None:
+            QMessageBox.information(
+                self,
+                "Reflection File Viewer",
+                "No MTZ is available yet. Run Integrate or the full pipeline first.",
+            )
             return
         try:
-            launch_reflection_viewer(self._dials_integration.mtz_path)
+            launch_reflection_viewer(self._mtz_path)
             self.status_label.setText(
-                f"Launched Reflection Viewer for {self._dials_integration.mtz_path.name}"
+                f"Launched Reflection File Viewer for {self._mtz_path.name}"
             )
         except Exception as ex:
-            QMessageBox.warning(self, "Reflection Viewer", str(ex))
+            QMessageBox.warning(self, "Reflection File Viewer", str(ex))
+
+    def _set_mtz_available(
+        self,
+        mtz_path: Path,
+        *,
+        switch_tab: bool = True,
+    ) -> None:
+        """Enable MTZ actions once *mtz_path* exists on disk."""
+        path = Path(mtz_path).expanduser().resolve()
+        if not path.is_file():
+            return
+        self._mtz_path = path
+        self.mtz_path_label.setText(str(path))
+        self.mtz_reveal_btn.setEnabled(True)
+        self.mtz_copy_btn.setEnabled(True)
+        self.mtz_open_viewer_btn.setEnabled(True)
+        if switch_tab and hasattr(self, "_mtz_tab_index"):
+            self.pipeline_tabs.setCurrentIndex(self._mtz_tab_index)
+
+    def _discover_existing_mtz(self) -> None:
+        """Enable the MTZ tab if ``integrated.mtz`` (or similar) already exists."""
+        try:
+            work = self._resolve_dials_work_dir()
+        except Exception:
+            return
+        for name in ("integrated.mtz", "dials.mtz", "scaled.mtz"):
+            candidate = work / name
+            if candidate.is_file():
+                self._set_mtz_available(candidate, switch_tab=False)
+                self._mark_pipeline_step(
+                    self.pipeline_export_label,
+                    True,
+                    f"Export MTZ — {candidate.name} (on disk)",
+                )
+                return
 
     def _on_open_last_dials_log(self) -> None:
         log_path = self._last_dials_log
@@ -1196,10 +1316,7 @@ class IndexingDialog(QDialog):
 
     def _update_mtz_result_ui(self, result: DialsIntegrationResult) -> None:
         self._dials_integration = result
-        self.mtz_path_label.setText(str(result.mtz_path))
-        self.mtz_reveal_btn.setEnabled(True)
-        self.mtz_copy_btn.setEnabled(True)
-        self.mtz_open_viewer_btn.setEnabled(True)
+        self._set_mtz_available(result.mtz_path, switch_tab=True)
         self._mark_pipeline_step(
             self.pipeline_integrate_label,
             True,
@@ -1378,6 +1495,7 @@ class IndexingDialog(QDialog):
         )
         self._remember_dials_log(spots.work_dir, "dials.find_spots.log")
         self._update_run_button_state()
+        self.pipeline_tabs.setCurrentIndex(2)  # Index tab
         self._show_dials_found_spots_overlay()
         if spots.n_spots < min_spots:
             QMessageBox.warning(
@@ -1651,6 +1769,7 @@ class IndexingDialog(QDialog):
         self.refine_button.setEnabled(False)
         self.mosaicity_estimate_button.setEnabled(False)
         self._update_integration_button_state()
+        self.pipeline_tabs.setCurrentIndex(3)  # Integrate tab
 
     def _cleanup_thread(self) -> None:
         self._worker = None
@@ -2393,6 +2512,7 @@ class IndexingDialog(QDialog):
         self.log.append(f"MTZ: {result.mtz_path}")
         if result.message:
             self.log.append(result.message)
+        self._set_mtz_available(result.mtz_path, switch_tab=True)
 
     def _update_mosaicity_button_state(self) -> None:
         """Enable mosaicity estimation when a solution with an A-matrix is selected."""

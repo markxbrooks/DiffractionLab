@@ -608,6 +608,7 @@ class IMosflmApp(QMainWindow):
         self.setGeometry(100, 100, 900, 1000)
         self.current_image = None
         self.current_file = None
+        self._raw_frame: np.ndarray | None = None
         self.dataset = None
         self._h5_master = None
         self._h5_data = None
@@ -696,7 +697,7 @@ class IMosflmApp(QMainWindow):
         self._act_indexing_spots.setCheckable(True)
         self._act_indexing_spots.setChecked(self.show_indexing_spots)
         self._act_indexing_spots.setStatusTip(
-            "Toggle matched-spot markers from the Index window"
+            "Toggle matched-spot markers from the Processing window"
         )
         self._act_indexing_spots.toggled.connect(
             self._on_indexing_spots_action_toggled
@@ -706,12 +707,12 @@ class IMosflmApp(QMainWindow):
             _registry_icon(
                 IconRegistry.DATASET_PROCESSING if _HAS_PICOUI else ""
             ),
-            "&Index…",
+            "&Process…",
             self,
         )
         self._act_index.setShortcut("Ctrl+I")
         self._act_index.setStatusTip(
-            "Find spots and autoindex with Mosflm (DPS)"
+            "Open Processing (find spots, index, integrate → MTZ)"
         )
         self._act_index.triggered.connect(self.open_indexing_dialog)
 
@@ -969,7 +970,7 @@ class IMosflmApp(QMainWindow):
         )
         self.indexing_spots_checkbox.setChecked(self.show_indexing_spots)
         self.indexing_spots_checkbox.setStatusTip(
-            "Toggle matched-spot markers from the Index window"
+            "Toggle matched-spot markers from the Processing window"
         )
         self.indexing_spots_checkbox.stateChanged.connect(
             self.toggle_indexing_spots
@@ -1000,7 +1001,7 @@ class IMosflmApp(QMainWindow):
         histogram_button.clicked.connect(self.show_histogram)
         button_layout.addWidget(histogram_button)
 
-        index_button = QPushButton("Index")
+        index_button = QPushButton("Process")
         index_button.setIcon(_registry_icon(
             IconRegistry.DATASET_PROCESSING if _HAS_PICOUI else ""
         ))
@@ -1069,7 +1070,7 @@ class IMosflmApp(QMainWindow):
                 box.blockSignals(False)
 
     def show_terminal_viewer(self) -> None:
-        """Open the JDXI-style DIALS terminal (via the Index window)."""
+        """Open the JDXI-style DIALS terminal (via the Processing window)."""
         if self._indexing_dialog is None:
             self.open_indexing_dialog()
         dialog = self._indexing_dialog
@@ -1077,12 +1078,12 @@ class IMosflmApp(QMainWindow):
             dialog.show_terminal_viewer()
 
     def open_indexing_dialog(self) -> None:
-        """Open the Mosflm DPS indexing dialog for the loaded dataset."""
-        if self.dataset is None:
+        """Open the Processing dialog for the loaded image / dataset."""
+        if self.current_image is None and self.dataset is None:
             QMessageBox.information(
                 self,
-                "Index",
-                "Open an HDF5 / NeXus master file before indexing.",
+                "Process",
+                "Open a diffraction image or HDF5 / NeXus master first.",
             )
             return
         if self._indexing_dialog is None:
@@ -1318,8 +1319,16 @@ class IMosflmApp(QMainWindow):
         try:
             image = Image.open(file_path)
             self.current_image = image
+            # Prefer float raster for intensity histogram; fall back to L.
+            try:
+                self._raw_frame = np.asarray(image.convert("F"), dtype=np.float64)
+            except Exception:
+                self._raw_frame = np.asarray(
+                    image.convert("L"), dtype=np.float64
+                )
             self.show_image(image)
         except Exception as ex:
+            self._raw_frame = None
             logging.error(f"Error displaying image: {ex}")
 
     def parse_hdf5(self, group, path):
@@ -1403,15 +1412,18 @@ class IMosflmApp(QMainWindow):
         try:
             cbf_image = fabio.open(file_path)
             data = cbf_image.data
+            self._raw_frame = np.asarray(data, dtype=np.float64)
             image = Image.fromarray(data)
             self.current_image = image.convert("L")
             self.show_image(self.current_image)
         except Exception as e:
+            self._raw_frame = None
             logging.error(f"Failed to load CBF image: {e}")
 
     def _close_hdf5_handles(self) -> None:
         """Close any open NeXus master / data file handles."""
         self.dataset = None
+        self._raw_frame = None
         for attr in ("_h5_data", "_h5_master"):
             handle = getattr(self, attr, None)
             if handle is not None:
@@ -1577,6 +1589,10 @@ class IMosflmApp(QMainWindow):
             # Select frame slice
             end_index = min(start_index + self.slice_size, self.num_frames)
             frame_data = np.array(self.dataset[start_index:end_index, :, :])  # Convert to NumPy array
+            # Keep the slider frame (not the CLAHE average) for intensity histogram.
+            self._raw_frame = np.asarray(
+                self.dataset[start_index], dtype=np.float64
+            )
 
             # Ensure grayscale format
             if frame_data.ndim == 3:
@@ -1622,6 +1638,7 @@ class IMosflmApp(QMainWindow):
             logging.info(f"Frames {start_index} to {end_index} displayed successfully.")
 
         except Exception as ex:
+            self._raw_frame = None
             logging.error(f"Error in display_hdf5_image: {ex}")
 
     def show_image(self, image): # png_rings
@@ -1764,20 +1781,69 @@ class IMosflmApp(QMainWindow):
                 logging.error(f"Error in update_contrast: {ex}")
 
     def show_histogram(self):
-        """ show_histogram """
-        logging.info("show_histogram")
-        if self.current_image:
-            grayscale_image = self.current_image.convert("L")
-            image_array = np.array(grayscale_image) / 255.0
-            histogram, bin_edges = np.histogram(image_array, bins=256, range=(0.0, 1.0))
+        """Show an intensity histogram of the current raw detector frame.
 
-            plt.figure("Histogram")
-            plt.title("Grayscale Histogram")
-            plt.xlabel("Grayscale value")
-            plt.ylabel("Pixel count")
-            plt.xlim([0.0, 1.0])
-            plt.plot(bin_edges[0:-1], histogram)
-            plt.show()
+        Excludes PAD dead/hot sentinels (Eiger ``2**16-1`` / ``2**32-1``) the
+        same way as :func:`imosflm.spotfile.find_spots_in_frame`, so saturated
+        mask pixels do not pin the percentile range near 65535.
+        """
+        logging.info("show_histogram")
+        frame = self._raw_frame
+        if frame is None:
+            QMessageBox.information(
+                self,
+                "Histogram",
+                "No raw detector frame is available to histogram.",
+            )
+            return
+
+        data = np.asarray(frame, dtype=np.float64).ravel()
+        total = int(data.size)
+        finite_positive = data[np.isfinite(data) & (data > 0.0)]
+        # Trusted ADU: skip gaps (≤0) and saturated / mask sentinels.
+        valid = finite_positive[
+            (finite_positive < 60000.0) & (finite_positive < 1.0e8)
+        ]
+        n_sat = int(finite_positive.size - valid.size)
+        if valid.size == 0:
+            QMessageBox.information(
+                self,
+                "Histogram",
+                (
+                    "No trusted pixels to histogram "
+                    f"({total:,} total, {finite_positive.size:,} positive, "
+                    f"{n_sat:,} saturated/mask ≥ 60000)."
+                ),
+            )
+            return
+
+        if valid.size >= 20:
+            vmin, vmax = np.percentile(valid, (1.0, 99.0))
+        else:
+            vmin, vmax = float(np.min(valid)), float(np.max(valid))
+        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+            vmin, vmax = float(np.min(valid)), float(np.max(valid))
+        if vmax <= vmin:
+            vmax = vmin + 1.0
+
+        counts, bin_edges = np.histogram(valid, bins=256, range=(vmin, vmax))
+        centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+        widths = np.diff(bin_edges)
+
+        fig = plt.figure("Histogram")
+        fig.clf()
+        ax = fig.add_subplot(111)
+        ax.bar(centers, counts, width=widths, align="center", color="#4C78A8")
+        sat_note = f", excluded {n_sat:,} sat/mask" if n_sat else ""
+        ax.set_title(
+            f"Intensity histogram  ({valid.size:,} / {total:,} pixels{sat_note})"
+        )
+        ax.set_xlabel("Intensity (ADU)")
+        ax.set_ylabel("Pixel count")
+        ax.set_xlim(vmin, vmax)
+        ax.set_ylim(bottom=0)
+        fig.tight_layout()
+        plt.show()
 
     def resizeEvent(self, event):
         """Keep the zoomable canvas sized with the window."""

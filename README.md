@@ -27,7 +27,7 @@ The repository contains:
 
 ### Indexing with MOSFLM
 
-For CBF and other formats supported by MOSFLM, the Index window provides an iMosflm-style workflow:
+For CBF and other formats supported by MOSFLM, the Processing window provides an iMosflm-style workflow:
 
 1. Find spots over the selected frame range.
 2. Run MOSFLM `autoindex dps`.
@@ -36,13 +36,13 @@ For CBF and other formats supported by MOSFLM, the Index window provides an iMos
 
 ### Indexing and processing with DIALS (HDF5 → MTZ)
 
-When an HDF5 / NeXus master is opened, the Index window becomes a DIALS processing panel:
+When an HDF5 / NeXus master is opened, the Processing window becomes a DIALS panel (tabs: Setup → Find spots → Index → Integrate → MTZ):
 
 1. **Import and find spots** — `dials.import` and `dials.find_spots` on a contiguous image wedge.
 2. **Index and refine** — `dials.index` (`fft3d`) with automatic refine.
 3. **Integrate and export** — `dials.integrate` (with `scan_range`) and `dials.export` → MTZ.
 
-The panel also exposes work-directory browse/reveal, DIALS settings (`nproc`, `d_min`, gain, min spot size, optional known symmetry), a pipeline checklist, **Run full pipeline → MTZ**, a JDXI-style live **Terminal** for DIALS output (**View → Show Terminal**), and post-MTZ actions (Reveal, Copy path, **Open in Reflection Viewer** via ElMo).
+The panel also exposes work-directory browse/reveal, DIALS settings (`nproc`, `d_min`, gain, min spot size, optional known symmetry), a pipeline checklist, **Run full pipeline → MTZ**, a JDXI-style live **Terminal** for DIALS output (**View → Show Terminal**), and post-MTZ actions (Reveal, Copy path, **Open in Reflection File Viewer** via ElMo).
 
 Working files default to `~/.qtmosflm/dials/<dataset_stem>/`. Spot/prediction overlays update with the frame slider.
 
@@ -115,7 +115,7 @@ Optional command-line flags:
 
 1. Open a diffraction image or an HDF5 / NeXus master.
 2. Adjust contrast and zoom; optionally enable resolution rings.
-3. Open **Index…** from the toolbar or Process menu (or press `Ctrl+I`).
+3. Open **Process…** from the toolbar or Process menu (or press `Ctrl+I`).
 4. Run the available indexing workflow:
    - **CBF and other MOSFLM-supported images:** find spots and run MOSFLM DPS autoindexing.
    - **HDF5 / NeXus masters:** find spots with DIALS, index and refine, then optionally integrate and export to MTZ.

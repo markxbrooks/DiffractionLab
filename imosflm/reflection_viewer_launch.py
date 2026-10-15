@@ -1,4 +1,4 @@
-"""Launch ElMo Reflection Viewer on an MTZ produced by DiffractionLab."""
+"""Launch ElMo Reflection File Viewer on an MTZ produced by DiffractionLab."""
 
 from __future__ import annotations
 
@@ -29,11 +29,12 @@ def resolve_elmo_python() -> Path | None:
 
 
 def launch_reflection_viewer(mtz_path: Path | str) -> subprocess.Popen:
-    """Start Reflection Viewer in a detached process and load *mtz_path*.
+    """Start Reflection File Viewer in a detached process and load *mtz_path*.
 
     :param mtz_path: Path to an MTZ (or SF-CIF) file.
     :returns: Started process handle.
     :raises FileNotFoundError: If the MTZ or a suitable ElMo interpreter is missing.
+    :raises RuntimeError: If ElMo cannot be imported with the resolved interpreter.
     """
     mtz = Path(mtz_path).expanduser().resolve()
     if not mtz.is_file():
@@ -44,6 +45,22 @@ def launch_reflection_viewer(mtz_path: Path | str) -> subprocess.Popen:
         raise FileNotFoundError(
             "Could not find ElMo (.venv/bin/python next to DiffractionLab, "
             "or set ELMO_PYTHON / ELMO)."
+        )
+
+    probe = subprocess.run(
+        [
+            str(python),
+            "-c",
+            "from elmo.ui.widgets.reflections.window import ReflectionViewerWindow",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if probe.returncode != 0:
+        detail = (probe.stderr or probe.stdout or "").strip() or "unknown import error"
+        raise RuntimeError(
+            f"ElMo Reflection File Viewer is not importable with {python}:\n{detail}"
         )
 
     code = (

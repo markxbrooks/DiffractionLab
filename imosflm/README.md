@@ -34,9 +34,9 @@ Optional flags:
 - Live readout: resolution, `beam_x` / `beam_y`, pixel coordinates, two-theta
 - **Show indexing spots** — overlay from the Index window on the current frame
 
-## Index window
+## Processing window
 
-Open via **Index…** (toolbar, Process menu, or `Ctrl+I`).
+Open via **Process…** (toolbar, Process menu, or `Ctrl+I`). Pipeline steps are tabs: **Setup → Find spots → Index → Integrate → MTZ**.
 
 ### Mosflm path (CBF and similar)
 
@@ -46,31 +46,31 @@ Open via **Index…** (toolbar, Process menu, or `Ctrl+I`).
 
 ### DIALS path (HDF5 → MTZ)
 
-When the loaded dataset is an HDF5 / NeXus master, the Index window becomes a **DIALS processing panel** (Mosflm-only fields are hidden):
+When the loaded dataset is an HDF5 / NeXus master, Processing becomes a **DIALS panel** (Mosflm-only fields are hidden):
 
 | UI section | Purpose |
 |------------|---------|
 | Master `.h5` + work directory | Browse / Reveal; default `~/.qtmosflm/dials/<dataset_stem>/` |
-| DIALS settings | `nproc`, `d_min`, min spot size, gain, optional known space group / unit cell |
+| DIALS settings | SpecEditor for `nproc`, `d_min`, min spot size, gain, known space group / unit cell (live phil preview) |
 | Frames Start/End | Contiguous 1-based DIALS image range (Step ignored) |
 | Pipeline checklist | Import → Find spots → Index/refine → Integrate → Export MTZ |
 | Step buttons | Find spots → Index → Integrate with DIALS |
 | **Run full DIALS pipeline → MTZ** | One-shot `import → find_spots → index → refine → integrate → export` |
 | Integrate first/last | Contiguous wedge passed as `scan_range` to `dials.integrate` |
-| MTZ result | Reveal folder, Copy path, **Open in Reflection Viewer** (ElMo) |
+| MTZ tab | Reveal folder, Copy path, **Open in Reflection File Viewer** (ElMo) |
 | Progress / log | Indeterminate bar; **Show terminal** (JDXI-style live tail of `dials.session.log`); Open last `dials.*.log` |
 
 Typical interactive flow:
 
 1. Open a master `.h5`  
-2. **Index…** (`Ctrl+I`)  
-3. Adjust work dir / settings / image wedge  
-4. **Find spots (DIALS)** → check overlays on the image  
-5. **Run DIALS indexing** → inspect cell in the table  
-6. Set integrate first/last → **Integrate with DIALS** (or use **Run full pipeline**)  
-7. **Open in Reflection Viewer** on the exported MTZ  
+2. **Process…** (`Ctrl+I`)  
+3. Adjust work dir / settings / image wedge on the **Setup** tab  
+4. **Find spots** → check overlays on the image  
+5. **Index** → inspect cell in the table  
+6. **Integrate** (or **Run full pipeline**)  
+7. **MTZ** tab → **Open in Reflection File Viewer**  
 
-DIALS stdout streams live into a JDXI Editor-like **Terminal** window (dark monospace viewer with fast/slow refresh). It opens automatically when a DIALS step starts, or via **View → Show Terminal** (`Ctrl+\``) / **Show terminal** in the Index window.
+DIALS stdout streams live into a JDXI Editor-like **Terminal** window (dark monospace viewer with fast/slow refresh). It opens automatically when a DIALS step starts, or via **View → Show Terminal** (`Ctrl+\``) / **Show terminal** in Processing.
 
 Strong-spot centroids and indexed predictions are cached as `.npz` in the work directory and drawn on the **currently displayed frame** as you move the frame slider.
 
