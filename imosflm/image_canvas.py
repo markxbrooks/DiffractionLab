@@ -7,7 +7,15 @@ import math
 from dataclasses import dataclass
 
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QMouseEvent, QPainter, QPen, QPixmap
+from PySide6.QtGui import (
+    QColor,
+    QCursor,
+    QFont,
+    QMouseEvent,
+    QPainter,
+    QPen,
+    QPixmap,
+)
 from PySide6.QtWidgets import QWidget
 
 try:
@@ -101,6 +109,9 @@ class DiffractionImageCanvas(ZoomableCanvas if _HAS_ZOOMABLE else QWidget):
 
     cursor_moved = Signal(float, float)  # image x, y in pixels
 
+    #: Max distance (image pixels) to snap status readout to a nearby spot.
+    NEAREST_SPOT_MAX_PX = 40.0
+
     def __init__(self, parent: QWidget | None = None) -> None:
         if _HAS_ZOOMABLE:
             super().__init__(parent, flip_y=False)
@@ -109,16 +120,20 @@ class DiffractionImageCanvas(ZoomableCanvas if _HAS_ZOOMABLE else QWidget):
             self.setMinimumSize(200, 200)
             self.setMouseTracking(True)
         self.setToolTip(
-            "Scroll to zoom · Middle-drag or Shift+Left-drag to pan · "
-            "View → Reset Zoom to fit"
+            "Crosshair shows cursor resolution · Drag to pan (hand) · "
+            "Scroll to zoom · View → Reset Zoom to fit"
         )
         self._pixmap = QPixmap()
         self._spot_overlay: SpotOverlay | None = None
         self._show_spots = True
         self._resolution_rings: list[ResolutionRing] = []
         self._show_rings = True
+        self._show_crosshair = True
+        self._cursor_world: tuple[float, float] | None = None
+        self._nearest_spot: tuple[float, float, float] | None = None  # x, y, dist
         self._placeholder = "No image loaded"
         self._fit_on_next_pixmap = True
+        self._set_idle_cursor()
 
     def set_placeholder(self, text: str) -> None:
         """Text shown when no pixmap is loaded."""
@@ -176,6 +191,23 @@ class DiffractionImageCanvas(ZoomableCanvas if _HAS_ZOOMABLE else QWidget):
         """Show or hide resolution rings without recomputing geometry."""
         self._show_rings = bool(visible)
         self.update()
+
+    def set_crosshair_visible(self, visible: bool) -> None:
+        """Show or hide the cursor crosshair overlay."""
+        self._show_crosshair = bool(visible)
+        self.update()
+
+    def cursor_world(self) -> tuple[float, float] | None:
+        """Return the last cursor position in image pixels, if any."""
+        return self._cursor_world
+
+    def nearest_spot(self) -> tuple[float, float, float] | None:
+        """Return ``(x, y, distance_px)`` for the nearest overlay spot, if any."""
+        return self._nearest_spot
+
+    def _set_idle_cursor(self) -> None:
+        """Crosshair cursor when idle; closed hand while panning (base class)."""
+        self.setCursor(QCursor(Qt.CursorShape.CrossCursor))
 
     def has_image(self) -> bool:
         """True when a non-null pixmap is loaded."""
@@ -244,6 +276,51 @@ class DiffractionImageCanvas(ZoomableCanvas if _HAS_ZOOMABLE else QWidget):
             if drawn:
                 logger.debug("Drew %d indexing spots on zoomable canvas", drawn)
 
+        if self._show_crosshair and self._cursor_world is not None:
+            self._paint_crosshair(painter, transform)
+
+    def _paint_crosshair(
+        self, painter: QPainter, transform: ViewTransform
+    ) -> None:
+        """Draw full-widget crosshair at the cursor, highlighting nearest spot."""
+        cx, cy = transform.world_to_screen(*self._cursor_world)
+        pen = QPen(QColor(0, 220, 255, 200), 1, Qt.PenStyle.DashLine)
+        painter.setPen(pen)
+        painter.drawLine(QPointF(0.0, cy), QPointF(float(self.width()), cy))
+        painter.drawLine(QPointF(cx, 0.0), QPointF(cx, float(self.height())))
+        # Small solid cross at the exact cursor.
+        painter.setPen(QPen(QColor(0, 255, 255, 230), 1))
+        painter.drawLine(QPointF(cx - 8, cy), QPointF(cx + 8, cy))
+        painter.drawLine(QPointF(cx, cy - 8), QPointF(cx, cy + 8))
+
+        if self._nearest_spot is not None:
+            sx, sy, _dist = self._nearest_spot
+            nx, ny = transform.world_to_screen(sx, sy)
+            painter.setPen(QPen(QColor(255, 220, 40, 230), 2))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawEllipse(QPointF(nx, ny), 10.0, 10.0)
+            painter.drawLine(QPointF(cx, cy), QPointF(nx, ny))
+
+    def nearest_spot_at(
+        self, x_px: float, y_px: float
+    ) -> tuple[float, float, float] | None:
+        """Return nearest matched overlay spot within :attr:`NEAREST_SPOT_MAX_PX`."""
+        if not self._spot_overlay:
+            return None
+        best: tuple[float, float, float] | None = None
+        max_d2 = self.NEAREST_SPOT_MAX_PX * self.NEAREST_SPOT_MAX_PX
+        for sx, sy, matched in self._spot_overlay:
+            if not matched:
+                continue
+            dx = float(sx) - x_px
+            dy = float(sy) - y_px
+            d2 = dx * dx + dy * dy
+            if d2 > max_d2:
+                continue
+            if best is None or d2 < best[2] * best[2]:
+                best = (float(sx), float(sy), math.sqrt(d2))
+        return best
+
     def _paint_resolution_rings(
         self, painter: QPainter, transform: ViewTransform
     ) -> None:
@@ -280,16 +357,27 @@ class DiffractionImageCanvas(ZoomableCanvas if _HAS_ZOOMABLE else QWidget):
         text = f"{d:.2f}".rstrip("0").rstrip(".")
         return f"{text} Å"
 
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        self._cursor_world = None
+        self._nearest_spot = None
+        self.update()
+        if _HAS_ZOOMABLE:
+            super().leaveEvent(event)
+        else:
+            QWidget.leaveEvent(self, event)
+
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if _HAS_ZOOMABLE:
             super().mouseMoveEvent(event)
-            if self._drag_origin is not None:
-                return
             if self._pixmap.isNull():
                 return
             wu, wv = self._transform.screen_to_world(
                 event.position().x(), event.position().y()
             )
+            self._cursor_world = (float(wu), float(wv))
+            self._nearest_spot = self.nearest_spot_at(wu, wv)
             self.cursor_moved.emit(float(wu), float(wv))
+            if not self.is_panning():
+                self.update()
         else:
             super().mouseMoveEvent(event)

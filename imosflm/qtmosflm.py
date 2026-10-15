@@ -1592,7 +1592,7 @@ class IMosflmApp(QMainWindow):
         super().resizeEvent(event)
 
     def _on_image_cursor_moved(self, x_dataset: float, y_dataset: float) -> None:
-        """Update pixel / resolution readouts from canvas world coordinates."""
+        """Update pixel / resolution readouts and status bar from the canvas cursor."""
         if self.current_image is None or self.beam_center is None:
             return
         self.x_pixel_label.setText(f"x pixel: {x_dataset:.0f}")
@@ -1613,6 +1613,23 @@ class IMosflmApp(QMainWindow):
         )
         self.two_theta_label.setText(f"two theta: {two_theta:0.2f} °")
         self.resolution_label.setText(f"Resolution: {resolution:0.2f} Å")
+
+        mode = "hand" if self.image_canvas.is_panning() else "crosshair"
+        parts = [
+            mode,
+            f"x={x_dataset:.0f}",
+            f"y={y_dataset:.0f}",
+            f"d={resolution:0.2f} Å",
+            f"2θ={two_theta:0.2f}°",
+        ]
+        nearest = self.image_canvas.nearest_spot()
+        if nearest is not None:
+            sx, sy, dist = nearest
+            _t, spot_res = calculate_two_theta_and_resolution(sx, sy, metadata)
+            parts.append(
+                f"nearest spot {dist:0.1f} px → d={spot_res:0.2f} Å"
+            )
+        self.statusBar().showMessage("  ·  ".join(parts))
 
     def toggle_rings(self, state):
         """Toggle the visibility of rings on the image."""
