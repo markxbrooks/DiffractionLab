@@ -542,7 +542,7 @@ class DialsEngine:
         ]
         if self.settings.gain is not None:
             args.append(f"spotfinder.threshold.dispersion.gain={self.settings.gain:g}")
-        log = self._run("dials.find_spots", args)
+        log = self._run("dials.find_spots", args, log_name="dials.find_spots.log")
         strong = self.work_dir / "strong.refl"
         if not strong.is_file():
             raise RuntimeError("dials.find_spots did not write strong.refl")
@@ -580,7 +580,7 @@ class DialsEngine:
             args.append(f"indexing.known_symmetry.space_group={self.settings.space_group}")
         if self.settings.unit_cell:
             args.append(f"indexing.known_symmetry.unit_cell={self.settings.unit_cell}")
-        log = self._run("dials.index", args)
+        log = self._run("dials.index", args, log_name="dials.index.log")
         indexed_expt = self.work_dir / "indexed.expt"
         indexed_refl = self.work_dir / "indexed.refl"
         if not indexed_expt.is_file():
@@ -642,10 +642,10 @@ class DialsEngine:
         ]
         if self.settings.d_min is not None:
             args.append(f"prediction.d_min={self.settings.d_min:g}")
-        # scan_range for integrate uses prediction; for a trial wedge the
-        # experiments already encode the scan — integrating the refined model
-        # over the indexed range is the usual interactive approach.
-        log = self._run("dials.integrate", args)
+        if image_range is not None:
+            # Limit trial integration to the selected contiguous wedge.
+            args.append(f"scan_range={image_range.as_scan_range()}")
+        log = self._run("dials.integrate", args, log_name="dials.integrate.log")
         integrated_expt = self.work_dir / "integrated.expt"
         integrated_refl = self.work_dir / "integrated.refl"
         if not integrated_expt.is_file() or not integrated_refl.is_file():
@@ -658,6 +658,7 @@ class DialsEngine:
                 "format=mtz",
                 f"mtz.hklout={mtz_name}",
             ],
+            log_name="dials.export.log",
         )
         log = log + "\n" + export_log
         mtz_path = self.work_dir / mtz_name

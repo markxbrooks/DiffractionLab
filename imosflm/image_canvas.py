@@ -30,7 +30,13 @@ except ImportError:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
-# Spot overlay entries: (x_px, y_px, matched)
+# Spot overlay entries: (x_px, y_px, predicted)
+# Mosflm Tcl colours (src/spots.tcl / imagedisplay.tcl):
+#   found / observed  → red
+#   predicted / indexed (fulls) → blue
+#
+# ``predicted`` True  = indexed/predicted marker (blue)
+# ``predicted`` False = found/observed spot (red)
 SpotOverlay = list[tuple[float, float, bool]]
 
 # Default d-spacings (Å) for detector resolution rings.
@@ -263,12 +269,12 @@ class DiffractionImageCanvas(ZoomableCanvas if _HAS_ZOOMABLE else QWidget):
         if self._show_spots and self._spot_overlay:
             half = max(4.0, 6.0 * (transform.scale / max(self.width() / src_w, 1e-6)))
             half = min(half, 14.0)
-            pen = QPen(QColor(0, 220, 70), 2)
-            painter.setPen(pen)
+            # Mosflm: found spots red; predicted/indexed fulls blue.
+            pen_found = QPen(QColor(255, 0, 0), 2)  # #ff0000
+            pen_predicted = QPen(QColor(0, 0, 255), 2)  # #0000ff
             drawn = 0
-            for x_px, y_px, matched in self._spot_overlay:
-                if not matched:
-                    continue
+            for x_px, y_px, predicted in self._spot_overlay:
+                painter.setPen(pen_predicted if predicted else pen_found)
                 sx, sy = transform.world_to_screen(float(x_px), float(y_px))
                 painter.drawLine(int(sx - half), int(sy), int(sx + half), int(sy))
                 painter.drawLine(int(sx), int(sy - half), int(sx), int(sy + half))
@@ -304,14 +310,12 @@ class DiffractionImageCanvas(ZoomableCanvas if _HAS_ZOOMABLE else QWidget):
     def nearest_spot_at(
         self, x_px: float, y_px: float
     ) -> tuple[float, float, float] | None:
-        """Return nearest matched overlay spot within :attr:`NEAREST_SPOT_MAX_PX`."""
+        """Return nearest overlay spot within :attr:`NEAREST_SPOT_MAX_PX`."""
         if not self._spot_overlay:
             return None
         best: tuple[float, float, float] | None = None
         max_d2 = self.NEAREST_SPOT_MAX_PX * self.NEAREST_SPOT_MAX_PX
-        for sx, sy, matched in self._spot_overlay:
-            if not matched:
-                continue
+        for sx, sy, _predicted in self._spot_overlay:
             dx = float(sx) - x_px
             dy = float(sy) - y_px
             d2 = dx * dx + dy * dy

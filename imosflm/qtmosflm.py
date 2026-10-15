@@ -36,7 +36,16 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from PySide6.QtGui import QAction, QColor, QIcon, QImage, QPainter, QPen, QPixmap
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QIcon,
+    QImage,
+    QKeySequence,
+    QPainter,
+    QPen,
+    QPixmap,
+)
 from PySide6.QtCore import Qt, QSettings, QSize
 
 from imosflm.image_canvas import DiffractionImageCanvas, build_resolution_rings
@@ -52,12 +61,15 @@ import numpy as np
 try:
     from picoui.icons import IconRegistry
     from picoui.theme import ThemeManager, ThemeType
+    from picoui.widget.viewer_chrome import icon_label, standard_zoom_actions
 
     _HAS_PICOUI = True
 except ImportError:  # pragma: no cover - optional when run outside ElMo venv
     IconRegistry = None  # type: ignore[assignment, misc]
     ThemeManager = None  # type: ignore[assignment, misc]
     ThemeType = None  # type: ignore[assignment, misc]
+    icon_label = None  # type: ignore[assignment, misc]
+    standard_zoom_actions = None  # type: ignore[assignment, misc]
     _HAS_PICOUI = False
 
 
@@ -77,6 +89,8 @@ def _icon_key(attr: str, fallback: str = "") -> str:
 
 def _readout_widget(icon_key: str, text: str) -> tuple[QWidget, QLabel]:
     """Build a small icon + text readout; return ``(host, text_label)``."""
+    if _HAS_PICOUI and icon_label is not None:
+        return icon_label(icon_key, text, margin_right=8)
     host = QWidget()
     row = QHBoxLayout(host)
     row.setContentsMargins(0, 0, 8, 0)
@@ -87,7 +101,6 @@ def _readout_widget(icon_key: str, text: str) -> tuple[QWidget, QLabel]:
         row.addWidget(icon)
     label = QLabel(text)
     row.addWidget(label)
-    row.addStretch(0)
     return host, label
 
 
@@ -447,18 +460,22 @@ def add_indexing_spot_markers(
     *,
     cross_half: int = 8,
 ) -> Image.Image:
-    """Draw indexing spots on *image* (green = matched, gold = unmatched)."""
+    """Draw indexing spots on *image* (Mosflm colours).
+
+    ``predicted`` True → blue (indexed/predicted fulls); False → red (found).
+    """
     image = image.convert("RGB")
     if not spots_px:
         return image
     img_np = np.array(image)
     height, width = img_np.shape[:2]
-    for x_px, y_px, matched in spots_px:
+    for x_px, y_px, predicted in spots_px:
         x = int(round(float(x_px)))
         y = int(round(float(y_px)))
         if x < 0 or y < 0 or x >= width or y >= height:
             continue
-        color = (0, 255, 80) if matched else (255, 200, 0)
+        # OpenCV BGR: Mosflm found=red, predicted fulls=blue
+        color = (255, 0, 0) if predicted else (0, 0, 255)
         cv2.drawMarker(
             img_np,
             (x, y),
@@ -632,6 +649,15 @@ class IMosflmApp(QMainWindow):
         self._act_open.setStatusTip("Open a diffraction image or HDF5 dataset")
         self._act_open.triggered.connect(self.open_file)
 
+        self._act_reload = QAction(
+            _registry_icon(_icon_key("MDI_REFRESH", _icon_key("REFRESH"))),
+            "&Reload",
+            self,
+        )
+        self._act_reload.setShortcut(QKeySequence.StandardKey.Refresh)
+        self._act_reload.setStatusTip("Reload the current image or HDF5 dataset")
+        self._act_reload.triggered.connect(self.reload_file)
+
         self._act_invert = QAction(
             _registry_icon(
                 IconRegistry.BACKGROUND_TOGGLE if _HAS_PICOUI else ""
@@ -689,34 +715,41 @@ class IMosflmApp(QMainWindow):
         )
         self._act_index.triggered.connect(self.open_indexing_dialog)
 
-        self._act_zoom_in = QAction(
-            _registry_icon(_icon_key("ZOOM_IN")),
-            "Zoom &In",
-            self,
-        )
-        self._act_zoom_in.setShortcut("Ctrl+=")
-        self._act_zoom_in.setStatusTip("Zoom in (mouse wheel also works)")
-        self._act_zoom_in.triggered.connect(self._zoom_in)
+        if _HAS_PICOUI and standard_zoom_actions is not None:
+            (
+                self._act_zoom_in,
+                self._act_zoom_out,
+                self._act_reset_zoom,
+            ) = standard_zoom_actions(
+                self,
+                on_zoom_in=self._zoom_in,
+                on_zoom_out=self._zoom_out,
+                on_reset=self._reset_zoom,
+                zoom_in_tip="Zoom in (scroll to zoom · drag to pan)",
+                zoom_out_tip="Zoom out (scroll to zoom · drag to pan)",
+                reset_tip="Fit the diffraction image to the window",
+            )
+        else:
+            self._act_zoom_in = QAction("Zoom &In", self)
+            self._act_zoom_in.setShortcut("Ctrl+=")
+            self._act_zoom_in.setStatusTip(
+                "Zoom in (scroll to zoom · drag to pan)"
+            )
+            self._act_zoom_in.triggered.connect(self._zoom_in)
 
-        self._act_zoom_out = QAction(
-            _registry_icon(_icon_key("ZOOM_OUT")),
-            "Zoom &Out",
-            self,
-        )
-        self._act_zoom_out.setShortcut("Ctrl+-")
-        self._act_zoom_out.setStatusTip("Zoom out (mouse wheel also works)")
-        self._act_zoom_out.triggered.connect(self._zoom_out)
+            self._act_zoom_out = QAction("Zoom &Out", self)
+            self._act_zoom_out.setShortcut("Ctrl+-")
+            self._act_zoom_out.setStatusTip(
+                "Zoom out (scroll to zoom · drag to pan)"
+            )
+            self._act_zoom_out.triggered.connect(self._zoom_out)
 
-        self._act_reset_zoom = QAction(
-            _registry_icon(_icon_key("FIT_TO_PAGE", _icon_key("RECENTER_VIEW"))),
-            "&Reset Zoom",
-            self,
-        )
-        self._act_reset_zoom.setShortcut("Ctrl+0")
-        self._act_reset_zoom.setStatusTip(
-            "Fit the diffraction image to the window"
-        )
-        self._act_reset_zoom.triggered.connect(self._reset_zoom)
+            self._act_reset_zoom = QAction("&Reset Zoom", self)
+            self._act_reset_zoom.setShortcut("Ctrl+0")
+            self._act_reset_zoom.setStatusTip(
+                "Fit the diffraction image to the window"
+            )
+            self._act_reset_zoom.triggered.connect(self._reset_zoom)
 
         self._act_quit = QAction(
             _registry_icon(IconRegistry.EXIT if _HAS_PICOUI else ""),
@@ -735,6 +768,7 @@ class IMosflmApp(QMainWindow):
         file_menu.addMenu(self._recent_menu)
         self._recent_menu.aboutToShow.connect(self._refresh_recent_files_menu)
         self._refresh_recent_files_menu()
+        file_menu.addAction(self._act_reload)
         file_menu.addSeparator()
         file_menu.addAction(self._act_invert)
         file_menu.addAction(self._act_histogram)
@@ -792,6 +826,7 @@ class IMosflmApp(QMainWindow):
         toolbar.setIconSize(QSize(20, 20))
         self.addToolBar(toolbar)
         toolbar.addAction(self._act_open)
+        toolbar.addAction(self._act_reload)
         toolbar.addSeparator()
         toolbar.addAction(self._act_invert)
         toolbar.addAction(self._act_histogram)
@@ -1047,8 +1082,8 @@ class IMosflmApp(QMainWindow):
     ) -> None:
         """Show or clear indexing spot markers on the current image.
 
-        Each entry is ``(x_px, y_px, matched)``. Only matched spots are drawn
-        (so changing Index solutions updates the visible set).
+        Each entry is ``(x_px, y_px, predicted)`` using Mosflm colours:
+        found/observed (False) are red; predicted/indexed (True) are blue.
         """
         self._indexing_spot_overlay = spots_px
         self._indexing_solution = solution
@@ -1056,13 +1091,16 @@ class IMosflmApp(QMainWindow):
             spots_px, visible=self.show_indexing_spots
         )
         if spots_px is not None:
-            n_matched = sum(1 for *_xy, matched in spots_px if matched)
+            n_pred = sum(1 for *_xy, predicted in spots_px if predicted)
+            n_found = sum(1 for *_xy, predicted in spots_px if not predicted)
             n_total = len(spots_px)
             label = ""
             if solution is not None:
                 label = f"#{getattr(solution, 'number', '?')} {getattr(solution, 'lattice', '')} "
             self.statusBar().showMessage(
-                f"Indexing overlay {label}: {n_matched} matched / {n_total} found"
+                f"Indexing overlay {label}: "
+                f"{n_pred} predicted (blue) / {n_found} found (red) "
+                f"({n_total} markers)"
                 + ("" if self.show_indexing_spots else " (hidden)"),
                 5000,
             )
@@ -1209,6 +1247,24 @@ class IMosflmApp(QMainWindow):
         )
         if file_path:
             self.open_path(file_path)
+
+    def reload_file(self) -> None:
+        """Reload the current file, or prompt to open one if none is loaded."""
+        if not self.current_file:
+            self.open_file()
+            return
+        path = Path(self.current_file)
+        if not path.is_file():
+            QMessageBox.warning(
+                self,
+                "Reload failed",
+                f"File not found:\n{path}",
+            )
+            return
+        frame = int(self.frame_slider.value()) if hasattr(self, "frame_slider") else 0
+        self.open_path(path)
+        if hasattr(self, "frame_slider") and self.num_frames > 0:
+            self.frame_slider.setValue(min(frame, max(0, self.num_frames - 1)))
 
     def open_path(self, file_path: str | Path) -> None:
         """Open *file_path* and add it to the recent-files list."""

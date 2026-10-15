@@ -44,15 +44,35 @@ Open via **Index…** (toolbar, Process menu, or `Ctrl+I`).
 2. **Run indexing** (Mosflm `autoindex dps`)  
 3. Inspect solutions, refine unit cell, estimate mosaicity  
 
-### DIALS path (HDF5 / NeXus)
+### DIALS path (HDF5 → MTZ)
 
-When the loaded dataset is an HDF5 master, the Index UI switches to DIALS:
+When the loaded dataset is an HDF5 / NeXus master, the Index window becomes a **DIALS processing panel** (Mosflm-only fields are hidden):
 
-1. **Find spots (DIALS)** — `dials.import` + `dials.find_spots` on a short wedge  
-2. **Run DIALS indexing** — `dials.index` (fft3d) with automatic refine  
-3. **Integrate with DIALS** — `dials.integrate` + `dials.export` → MTZ  
+| UI section | Purpose |
+|------------|---------|
+| Master `.h5` + work directory | Browse / Reveal; default `~/.qtmosflm/dials/<dataset_stem>/` |
+| DIALS settings | `nproc`, `d_min`, min spot size, gain, optional known space group / unit cell |
+| Frames Start/End | Contiguous 1-based DIALS image range (Step ignored) |
+| Pipeline checklist | Import → Find spots → Index/refine → Integrate → Export MTZ |
+| Step buttons | Find spots → Index → Integrate with DIALS |
+| **Run full DIALS pipeline → MTZ** | One-shot `import → find_spots → index → refine → integrate → export` |
+| Integrate first/last | Contiguous wedge passed as `scan_range` to `dials.integrate` |
+| MTZ result | Reveal folder, Copy path, **Open in Reflection Viewer** (ElMo) |
+| Progress / log | Indeterminate bar; Open last `dials.*.log` |
 
-Strong-spot centroids and indexed predictions are cached as `.npz` under `~/.qtmosflm/dials/` and drawn on the **currently displayed frame** as you move the frame slider.
+Typical interactive flow:
+
+1. Open a master `.h5`  
+2. **Index…** (`Ctrl+I`)  
+3. Adjust work dir / settings / image wedge  
+4. **Find spots (DIALS)** → check overlays on the image  
+5. **Run DIALS indexing** → inspect cell in the table  
+6. Set integrate first/last → **Integrate with DIALS** (or use **Run full pipeline**)  
+7. **Open in Reflection Viewer** on the exported MTZ  
+
+Strong-spot centroids and indexed predictions are cached as `.npz` in the work directory and drawn on the **currently displayed frame** as you move the frame slider.
+
+To open MTZs in ElMo Reflection Viewer, DiffractionLab looks for `../ElMo/.venv/bin/python` (or set `ELMO_PYTHON` / `ELMO`).
 
 Tutorial flow mirrored by the engine:  
 [DIALS processing in detail](https://dials.github.io/documentation/tutorials/processing_in_detail_betalactamase_dui.html).
@@ -83,8 +103,9 @@ python imosflm/qtmosflm.py
 |--------|------|
 | `qtmosflm.py` | Main window / image viewer |
 | `image_canvas.py` | Zoomable diffraction canvas & overlays |
-| `indexing_dialog.py` | Index UI (Mosflm + DIALS) |
+| `indexing_dialog.py` | Index UI (Mosflm + DIALS HDF5→MTZ panel) |
 | `dials_engine.py` | DIALS subprocess pipeline + `.npz` caches |
+| `reflection_viewer_launch.py` | Launch ElMo Reflection Viewer on an MTZ |
 | `mosflm_client.py` | Mosflm process I/O |
 | `spotfile.py` | Mosflm spotfile I/O / peak find |
 | `indexing.py` | Geometry helpers shared by indexing |

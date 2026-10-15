@@ -6,8 +6,8 @@ import logging
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QObject, QThread, Qt, Signal
-from PySide6.QtGui import QFont
+from PySide6.QtCore import QObject, QThread, Qt, QUrl, Signal
+from PySide6.QtGui import QDesktopServices, QFont, QGuiApplication
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -15,11 +15,14 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QSpinBox,
     QTableWidget,
@@ -60,6 +63,7 @@ from imosflm.indexing import (
     spots_for_frame,
 )
 from imosflm.mosflm_client import find_ipmosflm
+from imosflm.reflection_viewer_launch import launch_reflection_viewer
 
 logger = logging.getLogger(__name__)
 
@@ -268,6 +272,50 @@ class _DialsIntegrateWorker(QObject):
             self.failed.emit(str(ex))
 
 
+class _DialsFullPipelineWorker(QObject):
+    """One-shot ``import → find_spots → index → integrate → export``."""
+
+    finished = Signal(object)  # tuple[spots, indexed, integ]
+    failed = Signal(str)
+    progress = Signal(str)
+
+    def __init__(
+        self,
+        master_path: Path,
+        image_range: DialsImageRange,
+        work_dir: Path,
+        settings: DialsSettings | None = None,
+    ) -> None:
+        super().__init__()
+        self._master_path = master_path
+        self._image_range = image_range
+        self._work_dir = work_dir
+        self._settings = settings or DialsSettings()
+
+    def run(self) -> None:
+        try:
+            engine = DialsEngine(work_dir=self._work_dir, settings=self._settings)
+            self.progress.emit("DIALS full pipeline: import…")
+            imported = engine.import_images(self._master_path)
+            self.progress.emit(
+                f"DIALS full pipeline: find spots "
+                f"{self._image_range.first_image}–{self._image_range.last_image}…"
+            )
+            spots = engine.find_spots(imported, self._image_range)
+            self.progress.emit("DIALS full pipeline: index + refine…")
+            indexed = engine.index(imported, spots.strong_refl, refine=True)
+            self.progress.emit("DIALS full pipeline: integrate + export MTZ…")
+            integ = engine.integrate(
+                indexed.experiments,
+                indexed.reflections,
+                image_range=self._image_range,
+            )
+            self.finished.emit((spots, indexed, integ))
+        except Exception as ex:  # noqa: BLE001
+            logger.exception("DIALS full pipeline failed")
+            self.failed.emit(str(ex))
+
+
 class _IntegrationWorker(QObject):
     """Background worker: auto-select images and run Mosflm trial integration."""
 
@@ -470,13 +518,97 @@ class IndexingDialog(QDialog):
         self._use_dials: bool = False
         self._selected_frames: list[int] = []
         self._source_geometry: IndexingGeometry | None = None
+        self._dials_work_dir: Path = Path.home() / ".qtmosflm" / "dials"
+        self._last_dials_log: Path | None = None
+        self._pipeline_thread: QThread | None = None
+        self._pipeline_worker: _DialsFullPipelineWorker | None = None
+        self._busy_cancel_requested = False
         self._build_ui()
         self._populate_defaults()
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
 
+        # --- Input / work-dir (DIALS panel; toggled in _apply_dials_chrome) ---
+        self.dials_input_box = QGroupBox("HDF5 input & work directory")
+        dials_input_form = QFormLayout(self.dials_input_box)
+        self.dials_master_label = QLabel("(no master loaded)")
+        self.dials_master_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.dials_master_label.setWordWrap(True)
+        dials_input_form.addRow("Master .h5", self.dials_master_label)
+
+        work_row = QHBoxLayout()
+        self.dials_work_dir_edit = QLineEdit()
+        self.dials_work_dir_edit.setPlaceholderText("~/.qtmosflm/dials/<dataset>/")
+        work_row.addWidget(self.dials_work_dir_edit, stretch=1)
+        self.dials_work_browse_btn = QPushButton("Browse…")
+        self.dials_work_browse_btn.clicked.connect(self._on_browse_work_dir)
+        work_row.addWidget(self.dials_work_browse_btn)
+        self.dials_work_reveal_btn = QPushButton("Reveal")
+        self.dials_work_reveal_btn.clicked.connect(self._on_reveal_work_dir)
+        work_row.addWidget(self.dials_work_reveal_btn)
+        dials_input_form.addRow("Work directory", work_row)
+        layout.addWidget(self.dials_input_box)
+
+        # --- DIALS settings ---
+        self.dials_settings_box = QGroupBox("DIALS settings")
+        dials_form = QFormLayout(self.dials_settings_box)
+        self.dials_nproc = QSpinBox()
+        self.dials_nproc.setRange(1, 64)
+        self.dials_nproc.setValue(4)
+        dials_form.addRow("nproc", self.dials_nproc)
+
+        self.dials_d_min = QDoubleSpinBox()
+        self.dials_d_min.setRange(0.0, 50.0)
+        self.dials_d_min.setDecimals(2)
+        self.dials_d_min.setSpecialValueText("auto")
+        self.dials_d_min.setValue(0.0)
+        dials_form.addRow("d_min (Å)", self.dials_d_min)
+
+        self.dials_min_spot_size = QSpinBox()
+        self.dials_min_spot_size.setRange(1, 50)
+        self.dials_min_spot_size.setValue(3)
+        dials_form.addRow("min spot size", self.dials_min_spot_size)
+
+        self.dials_gain = QDoubleSpinBox()
+        self.dials_gain.setRange(0.0, 100.0)
+        self.dials_gain.setDecimals(2)
+        self.dials_gain.setSpecialValueText("auto")
+        self.dials_gain.setValue(0.0)
+        dials_form.addRow("gain", self.dials_gain)
+
+        self.dials_space_group = QLineEdit()
+        self.dials_space_group.setPlaceholderText("optional, e.g. P212121")
+        dials_form.addRow("Known space group", self.dials_space_group)
+
+        self.dials_unit_cell = QLineEdit()
+        self.dials_unit_cell.setPlaceholderText("optional a,b,c,α,β,γ")
+        dials_form.addRow("Known unit cell", self.dials_unit_cell)
+        layout.addWidget(self.dials_settings_box)
+
+        # --- Pipeline checklist ---
+        self.dials_pipeline_box = QGroupBox("Pipeline")
+        pipe_layout = QVBoxLayout(self.dials_pipeline_box)
+        self.pipeline_import_label = QLabel("○ Import —")
+        self.pipeline_spots_label = QLabel("○ Find spots —")
+        self.pipeline_index_label = QLabel("○ Index / refine —")
+        self.pipeline_integrate_label = QLabel("○ Integrate —")
+        self.pipeline_export_label = QLabel("○ Export MTZ —")
+        for lab in (
+            self.pipeline_import_label,
+            self.pipeline_spots_label,
+            self.pipeline_index_label,
+            self.pipeline_integrate_label,
+            self.pipeline_export_label,
+        ):
+            lab.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            pipe_layout.addWidget(lab)
+        layout.addWidget(self.dials_pipeline_box)
+
         form_box = QGroupBox("Frames & settings")
+        self.frames_settings_box = form_box
         form = QFormLayout(form_box)
 
         self.frame_start = QSpinBox()
@@ -486,34 +618,44 @@ class IndexingDialog(QDialog):
         self.frame_step = QSpinBox()
         self.frame_step.setRange(1, 9999)
         self.frame_step.setValue(90)
+        self.frame_step_label = QLabel("Step")
 
         frame_row = QHBoxLayout()
         frame_row.addWidget(QLabel("Start"))
         frame_row.addWidget(self.frame_start)
         frame_row.addWidget(QLabel("End"))
         frame_row.addWidget(self.frame_end)
-        frame_row.addWidget(QLabel("Step"))
+        frame_row.addWidget(self.frame_step_label)
         frame_row.addWidget(self.frame_step)
-        form.addRow("Frames", frame_row)
+        form.addRow("Frames (0-based)", frame_row)
+
+        self.dials_range_hint = QLabel("")
+        self.dials_range_hint.setWordWrap(True)
+        form.addRow(self.dials_range_hint)
+        self.frame_start.valueChanged.connect(self._update_dials_range_hint)
+        self.frame_end.valueChanged.connect(self._update_dials_range_hint)
 
         self.spot_sigma = QDoubleSpinBox()
         self.spot_sigma.setRange(1.0, 50.0)
         self.spot_sigma.setDecimals(1)
         self.spot_sigma.setSingleStep(0.5)
         self.spot_sigma.setValue(5.0)
-        form.addRow("Spot σ threshold", self.spot_sigma)
+        self.spot_sigma_label = QLabel("Spot σ threshold")
+        form.addRow(self.spot_sigma_label, self.spot_sigma)
 
         self.i_sig_i = QDoubleSpinBox()
         self.i_sig_i.setRange(1.0, 200.0)
         self.i_sig_i.setDecimals(1)
         self.i_sig_i.setValue(5.0)
-        form.addRow("DPS I/σI", self.i_sig_i)
+        self.i_sig_i_label = QLabel("DPS I/σI")
+        form.addRow(self.i_sig_i_label, self.i_sig_i)
 
         self.max_penalty = QDoubleSpinBox()
         self.max_penalty.setRange(0.0, 500.0)
         self.max_penalty.setDecimals(1)
         self.max_penalty.setValue(50.0)
-        form.addRow("Max penalty to refine", self.max_penalty)
+        self.max_penalty_label = QLabel("Max penalty to refine")
+        form.addRow(self.max_penalty_label, self.max_penalty)
 
         layout.addWidget(form_box)
 
@@ -611,6 +753,7 @@ class IndexingDialog(QDialog):
         layout.addWidget(mosaic_box)
 
         integrate_box = QGroupBox("4. Trial integration")
+        self.integrate_box = integrate_box
         integrate_layout = QVBoxLayout(integrate_box)
         range_row = QHBoxLayout()
         self.integrate_range_label = QLabel(
@@ -625,11 +768,58 @@ class IndexingDialog(QDialog):
         )
         range_row.addWidget(self.auto_integrate_select_button)
         integrate_layout.addLayout(range_row)
+
+        dials_integ_row = QHBoxLayout()
+        dials_integ_row.addWidget(QLabel("Integrate first (1-based)"))
+        self.integrate_first = QSpinBox()
+        self.integrate_first.setRange(1, 999999)
+        self.integrate_first.setValue(1)
+        dials_integ_row.addWidget(self.integrate_first)
+        dials_integ_row.addWidget(QLabel("Last"))
+        self.integrate_last = QSpinBox()
+        self.integrate_last.setRange(1, 999999)
+        self.integrate_last.setValue(40)
+        dials_integ_row.addWidget(self.integrate_last)
+        dials_integ_row.addStretch(1)
+        self.dials_integrate_range_row = QWidget()
+        self.dials_integrate_range_row.setLayout(dials_integ_row)
+        integrate_layout.addWidget(self.dials_integrate_range_row)
+
         self.integrate_button = QPushButton("Integrate selected wedge")
         self.integrate_button.setEnabled(False)
         self.integrate_button.clicked.connect(self._on_integrate)
         integrate_layout.addWidget(self.integrate_button)
+
+        self.full_pipeline_button = QPushButton("Run full DIALS pipeline → MTZ")
+        self.full_pipeline_button.setToolTip(
+            "import → find_spots → index → refine → integrate → export"
+        )
+        self.full_pipeline_button.clicked.connect(self._on_run_full_pipeline)
+        integrate_layout.addWidget(self.full_pipeline_button)
         layout.addWidget(integrate_box)
+
+        # --- MTZ result strip ---
+        self.mtz_result_box = QGroupBox("MTZ result")
+        mtz_layout = QHBoxLayout(self.mtz_result_box)
+        self.mtz_path_label = QLabel("No MTZ yet.")
+        self.mtz_path_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.mtz_path_label.setWordWrap(True)
+        mtz_layout.addWidget(self.mtz_path_label, stretch=1)
+        self.mtz_reveal_btn = QPushButton("Reveal")
+        self.mtz_reveal_btn.setEnabled(False)
+        self.mtz_reveal_btn.clicked.connect(self._on_reveal_mtz)
+        mtz_layout.addWidget(self.mtz_reveal_btn)
+        self.mtz_copy_btn = QPushButton("Copy path")
+        self.mtz_copy_btn.setEnabled(False)
+        self.mtz_copy_btn.clicked.connect(self._on_copy_mtz_path)
+        mtz_layout.addWidget(self.mtz_copy_btn)
+        self.mtz_open_viewer_btn = QPushButton("Open in Reflection Viewer")
+        self.mtz_open_viewer_btn.setEnabled(False)
+        self.mtz_open_viewer_btn.clicked.connect(self._on_open_mtz_in_viewer)
+        mtz_layout.addWidget(self.mtz_open_viewer_btn)
+        layout.addWidget(self.mtz_result_box)
 
         spot_row = QHBoxLayout()
         self.show_spots_checkbox = QCheckBox("Show indexing spots on image")
@@ -638,6 +828,21 @@ class IndexingDialog(QDialog):
         spot_row.addWidget(self.show_spots_checkbox)
         spot_row.addStretch(1)
         layout.addLayout(spot_row)
+
+        progress_row = QHBoxLayout()
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setVisible(False)
+        progress_row.addWidget(self.progress_bar, stretch=1)
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.setEnabled(False)
+        self.cancel_button.clicked.connect(self._on_cancel_busy)
+        progress_row.addWidget(self.cancel_button)
+        self.open_log_button = QPushButton("Open last DIALS log")
+        self.open_log_button.setEnabled(False)
+        self.open_log_button.clicked.connect(self._on_open_last_dials_log)
+        progress_row.addWidget(self.open_log_button)
+        layout.addLayout(progress_row)
 
         self.log = QTextEdit()
         self.log.setReadOnly(True)
@@ -700,14 +905,30 @@ class IndexingDialog(QDialog):
                 "Unit-cell refine with space group uses Mosflm index2; "
                 "DIALS refine runs automatically after indexing."
             )
+            master = Path(getattr(app, "current_file", "") or "")
+            self.dials_master_label.setText(str(master) if master else "(no master)")
+            stem = master.stem if master.name else "dataset"
+            self._dials_work_dir = Path.home() / ".qtmosflm" / "dials" / stem
+            self.dials_work_dir_edit.setText(str(self._dials_work_dir))
+            # Contiguous DIALS range: hide Step; seed integrate spinboxes.
+            first_1 = int(self.frame_start.value()) + 1
+            last_1 = int(self.frame_end.value()) + 1
+            if last_1 < first_1:
+                first_1, last_1 = last_1, first_1
+            self.integrate_first.setMaximum(max(n_frames, 1))
+            self.integrate_last.setMaximum(max(n_frames, 1))
+            self.integrate_first.setValue(first_1)
+            self.integrate_last.setValue(min(max(n_frames, 1), first_1 + 39))
             if not dials_ok:
                 self.status_label.setText(
                     "DIALS not found — install CCP4/DIALS for HDF5 processing."
                 )
                 self.find_spots_button.setEnabled(False)
+                self.full_pipeline_button.setEnabled(False)
             else:
                 self.status_label.setText(f"Using DIALS in {find_dials_prefix()}")
                 self.run_button.setEnabled(False)
+                self.full_pipeline_button.setEnabled(True)
         else:
             self.backend_label.setText("Backend: Mosflm (native image templates).")
             self.find_spots_button.setText("Find spots")
@@ -723,6 +944,10 @@ class IndexingDialog(QDialog):
                 self.status_label.setText(f"Using {mosflm}")
                 self.run_button.setEnabled(False)
 
+        self._apply_dials_chrome(self._use_dials)
+        self._reset_pipeline_checklist()
+        self._update_dials_range_hint()
+
         if app is not None and hasattr(app, "show_indexing_spots"):
             self.show_spots_checkbox.blockSignals(True)
             self.show_spots_checkbox.setChecked(bool(app.show_indexing_spots))
@@ -736,6 +961,186 @@ class IndexingDialog(QDialog):
             sigma_cutoff=float(self.refine_sigma.value()),
             mosaic_block_size=float(self.mosaic_block.value()),
         )
+
+    def _dials_settings_from_ui(self) -> DialsSettings:
+        """Build :class:`DialsSettings` from the DIALS settings group."""
+        d_min_val = float(self.dials_d_min.value())
+        gain_val = float(self.dials_gain.value())
+        sg = self.dials_space_group.text().strip() or None
+        cell = self.dials_unit_cell.text().strip() or None
+        return DialsSettings(
+            nproc=int(self.dials_nproc.value()),
+            min_spot_size=int(self.dials_min_spot_size.value()),
+            gain=gain_val if gain_val > 0 else None,
+            d_min=d_min_val if d_min_val > 0 else None,
+            space_group=sg,
+            unit_cell=cell,
+        )
+
+    def _resolve_dials_work_dir(self) -> Path:
+        """Return the work directory from the UI, creating it if needed."""
+        text = self.dials_work_dir_edit.text().strip()
+        if text:
+            path = Path(text).expanduser()
+        else:
+            path = self._dials_work_dir
+        path.mkdir(parents=True, exist_ok=True)
+        self._dials_work_dir = path
+        self.dials_work_dir_edit.setText(str(path))
+        return path
+
+    def _apply_dials_chrome(self, use_dials: bool) -> None:
+        """Show DIALS panels and hide Mosflm-only fields when on HDF5."""
+        for w in (
+            self.dials_input_box,
+            self.dials_settings_box,
+            self.dials_pipeline_box,
+            self.mtz_result_box,
+            self.dials_integrate_range_row,
+            self.full_pipeline_button,
+            self.dials_range_hint,
+            self.open_log_button,
+        ):
+            w.setVisible(use_dials)
+        self.frame_step.setVisible(not use_dials)
+        self.frame_step_label.setVisible(not use_dials)
+        for w in (
+            self.spot_sigma,
+            self.spot_sigma_label,
+            self.i_sig_i,
+            self.i_sig_i_label,
+            self.max_penalty,
+            self.max_penalty_label,
+        ):
+            w.setVisible(not use_dials)
+        if use_dials:
+            self.setWindowTitle("Indexing — DIALS (HDF5 → MTZ)")
+            self.setMinimumSize(820, 720)
+        else:
+            self.setWindowTitle("Indexing — spots, DPS, mosaicity")
+
+    def _update_dials_range_hint(self) -> None:
+        if not self._use_dials:
+            self.dials_range_hint.setText("")
+            return
+        try:
+            rng = self._dials_range_from_ui()
+            self.dials_range_hint.setText(
+                f"DIALS contiguous images (1-based): "
+                f"{rng.first_image}–{rng.last_image} "
+                f"({rng.n_images} images; Step is ignored)."
+            )
+        except Exception:
+            self.dials_range_hint.setText("Select a valid Start/End frame range.")
+
+    def _reset_pipeline_checklist(self) -> None:
+        self.pipeline_import_label.setText("○ Import —")
+        self.pipeline_spots_label.setText("○ Find spots —")
+        self.pipeline_index_label.setText("○ Index / refine —")
+        self.pipeline_integrate_label.setText("○ Integrate —")
+        self.pipeline_export_label.setText("○ Export MTZ —")
+        self.mtz_path_label.setText("No MTZ yet.")
+        self.mtz_reveal_btn.setEnabled(False)
+        self.mtz_copy_btn.setEnabled(False)
+        self.mtz_open_viewer_btn.setEnabled(False)
+
+    def _mark_pipeline_step(self, label: QLabel, done: bool, detail: str) -> None:
+        mark = "●" if done else "○"
+        label.setText(f"{mark} {detail}")
+
+    def _set_busy(self, busy: bool) -> None:
+        self.progress_bar.setVisible(busy)
+        self.cancel_button.setEnabled(busy)
+        self._busy_cancel_requested = False
+        if busy:
+            self.progress_bar.setRange(0, 0)
+
+    def _on_browse_work_dir(self) -> None:
+        start = self.dials_work_dir_edit.text().strip() or str(self._dials_work_dir)
+        chosen = QFileDialog.getExistingDirectory(
+            self, "DIALS work directory", start
+        )
+        if chosen:
+            self.dials_work_dir_edit.setText(chosen)
+            self._dials_work_dir = Path(chosen)
+
+    def _on_reveal_work_dir(self) -> None:
+        path = self._resolve_dials_work_dir()
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
+    def _on_reveal_mtz(self) -> None:
+        if self._dials_integration is None:
+            return
+        QDesktopServices.openUrl(
+            QUrl.fromLocalFile(str(self._dials_integration.mtz_path.parent))
+        )
+
+    def _on_copy_mtz_path(self) -> None:
+        if self._dials_integration is None:
+            return
+        QGuiApplication.clipboard().setText(str(self._dials_integration.mtz_path))
+        self.status_label.setText("MTZ path copied to clipboard.")
+
+    def _on_open_mtz_in_viewer(self) -> None:
+        if self._dials_integration is None:
+            return
+        try:
+            launch_reflection_viewer(self._dials_integration.mtz_path)
+            self.status_label.setText(
+                f"Launched Reflection Viewer for {self._dials_integration.mtz_path.name}"
+            )
+        except Exception as ex:
+            QMessageBox.warning(self, "Reflection Viewer", str(ex))
+
+    def _on_open_last_dials_log(self) -> None:
+        log_path = self._last_dials_log
+        if log_path is None or not Path(log_path).is_file():
+            # Prefer newest dials.*.log in work dir.
+            work = self._resolve_dials_work_dir()
+            logs = sorted(work.glob("dials.*.log"), key=lambda p: p.stat().st_mtime)
+            if not logs:
+                QMessageBox.information(self, "Logs", f"No dials.*.log in {work}")
+                return
+            log_path = logs[-1]
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(log_path)))
+
+    def _on_cancel_busy(self) -> None:
+        self._busy_cancel_requested = True
+        self.status_label.setText(
+            "Cancel requested — wait for the current DIALS step to finish "
+            "(CLI steps are not interruptible mid-command)."
+        )
+
+    def _remember_dials_log(self, work_dir: Path, name: str) -> None:
+        path = Path(work_dir) / name
+        if path.is_file():
+            self._last_dials_log = path
+            self.open_log_button.setEnabled(True)
+
+    def _update_mtz_result_ui(self, result: DialsIntegrationResult) -> None:
+        self._dials_integration = result
+        self.mtz_path_label.setText(str(result.mtz_path))
+        self.mtz_reveal_btn.setEnabled(True)
+        self.mtz_copy_btn.setEnabled(True)
+        self.mtz_open_viewer_btn.setEnabled(True)
+        self._mark_pipeline_step(
+            self.pipeline_integrate_label,
+            True,
+            f"Integrate — {result.experiments.name}",
+        )
+        self._mark_pipeline_step(
+            self.pipeline_export_label,
+            True,
+            f"Export MTZ — {result.mtz_path.name}",
+        )
+        self._remember_dials_log(result.work_dir, "dials.integrate.log")
+
+    def _dials_integrate_range_from_ui(self) -> DialsImageRange:
+        first = int(self.integrate_first.value())
+        last = int(self.integrate_last.value())
+        if last < first:
+            first, last = last, first
+        return DialsImageRange(first_image=first, last_image=last)
 
     def _compute_frame_indices(self) -> list[int]:
         """Return the frame index list from the Start/End/Step spin boxes."""
@@ -846,14 +1251,18 @@ class IndexingDialog(QDialog):
         self.solutionSelected.emit(None)
         self.find_spots_button.setEnabled(False)
         self.run_button.setEnabled(False)
+        self.full_pipeline_button.setEnabled(False)
+        self._set_busy(True)
+        self._reset_pipeline_checklist()
 
-        work_dir = Path.home() / ".qtmosflm" / "dials"
+        work_dir = self._resolve_dials_work_dir()
+        settings = self._dials_settings_from_ui()
         self._spot_thread = QThread(self)
         self._spot_worker = _DialsSpotFindWorker(
             Path(app.current_file),
             image_range,
             work_dir,
-            DialsSettings(nproc=4),
+            settings,
         )
         self._spot_worker.moveToThread(self._spot_thread)
         self._spot_thread.started.connect(self._spot_worker.run)
@@ -878,6 +1287,17 @@ class IndexingDialog(QDialog):
         self.log.append(f"strong.refl: {spots.strong_refl}")
         if spots.centroids_npz is not None:
             self.log.append(f"centroids cache: {spots.centroids_npz}")
+        self._mark_pipeline_step(
+            self.pipeline_import_label,
+            True,
+            f"Import — {spots.imported_expt.name}",
+        )
+        self._mark_pipeline_step(
+            self.pipeline_spots_label,
+            True,
+            f"Find spots — {spots.strong_refl.name} ({spots.n_spots})",
+        )
+        self._remember_dials_log(spots.work_dir, "dials.find_spots.log")
         self._update_run_button_state()
         self._show_dials_found_spots_overlay()
         if spots.n_spots < min_spots:
@@ -926,11 +1346,12 @@ class IndexingDialog(QDialog):
             logger.exception("Failed to load DIALS centroids for frame %s", frame_index)
             self.log.append(f"Spot overlay error: {ex}")
             return
-        overlay = [(x, y, True) for x, y in centroids]
+        # Mosflm: found/observed spots are red (predicted=False).
+        overlay = [(x, y, False) for x, y in centroids]
         app.set_indexing_spot_overlay(overlay, solution=None)
         if overlay:
             self.status_label.setText(
-                f"Showing {len(overlay)} DIALS spots on frame {frame_index}"
+                f"Showing {len(overlay)} found spots (red) on frame {frame_index}"
             )
         else:
             self.status_label.setText(
@@ -946,6 +1367,8 @@ class IndexingDialog(QDialog):
             self._spot_thread.deleteLater()
             self._spot_thread = None
         self.find_spots_button.setEnabled(True)
+        self.full_pipeline_button.setEnabled(self._use_dials)
+        self._set_busy(False)
         self._update_run_button_state()
 
     def _on_spots_failed(self, message: str) -> None:
@@ -1019,8 +1442,9 @@ class IndexingDialog(QDialog):
         if geometry is None:
             return
         pixel_size = float(geometry.pixel_size_mm) or 1.0
+        # Mosflm: found/observed spots are red (predicted=False).
         overlay = [
-            (float(spot.x_mm) / pixel_size, float(spot.y_mm) / pixel_size, True)
+            (float(spot.x_mm) / pixel_size, float(spot.y_mm) / pixel_size, False)
             for spot in spots
         ]
         app.set_indexing_spot_overlay(overlay, solution=None)
@@ -1070,10 +1494,12 @@ class IndexingDialog(QDialog):
         self._table_solutions = []
         self.status_label.setText("Running DIALS indexing…")
         self.solutionSelected.emit(None)
-        work_dir = Path.home() / ".qtmosflm" / "dials"
+        self._set_busy(True)
+        self.full_pipeline_button.setEnabled(False)
+        work_dir = self._resolve_dials_work_dir()
         self._thread = QThread(self)
         self._worker = _DialsIndexWorker(
-            self._dials_spots, work_dir, DialsSettings(nproc=4)
+            self._dials_spots, work_dir, self._dials_settings_from_ui()
         )
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
@@ -1113,6 +1539,17 @@ class IndexingDialog(QDialog):
             f"Cell: {sol.a:.3f} {sol.b:.3f} {sol.c:.3f} "
             f"{sol.alpha:.2f} {sol.beta:.2f} {sol.gamma:.2f}  {sol.spacegroup}"
         )
+        self._mark_pipeline_step(
+            self.pipeline_index_label,
+            True,
+            f"Index / refine — {indexed.experiments.name}"
+            + (" (refined)" if indexed.refined else ""),
+        )
+        self._remember_dials_log(indexed.work_dir, "dials.index.log")
+        # Seed integrate range from spot-finding wedge if still default-ish.
+        if self._dials_spots is not None:
+            self.integrate_first.setValue(self._dials_spots.image_range.first_image)
+            self.integrate_last.setValue(self._dials_spots.image_range.last_image)
         dials_sol = indexed.solution
         if dials_sol.n_indexed is not None:
             self.log.append(
@@ -1137,7 +1574,10 @@ class IndexingDialog(QDialog):
         if self._thread is not None:
             self._thread.deleteLater()
             self._thread = None
+        self.full_pipeline_button.setEnabled(self._use_dials)
+        self._set_busy(False)
         self._update_run_button_state()
+        self._update_integration_button_state()
 
     def _cleanup_refine_thread(self) -> None:
         self._refine_worker = None
@@ -1341,6 +1781,7 @@ class IndexingDialog(QDialog):
             logger.exception("Failed to load DIALS predictions for frame %s", frame_index)
             self.log.append(f"Prediction overlay error: {ex}")
             return None
+        # Mosflm: predicted/indexed fulls are blue (predicted=True).
         overlay = [(x, y, True) for x, y in predictions]
         app.set_indexing_spot_overlay(overlay, solution=solution)
         return len(overlay)
@@ -1401,7 +1842,7 @@ class IndexingDialog(QDialog):
             solution,
             hkldev=float(self._settings().hkldev_max),
         )
-        # Always draw observed spots; matched ones are coloured green.
+        # Mosflm colours: found (unmatched) red; predicted/matched blue.
         pixel_size = float(geometry.pixel_size_mm) or 1.0
         overlay = [
             (
@@ -1412,11 +1853,13 @@ class IndexingDialog(QDialog):
             for spot, is_matched in zip(spots, matched)
         ]
         logger.info(
-            "Overlay solution #%s on frame %s: %d spots (%d matched)",
+            "Overlay solution #%s on frame %s: %d spots "
+            "(%d predicted/blue, %d found/red)",
             solution.number,
             frame_index,
             len(overlay),
             sum(matched),
+            len(matched) - sum(matched),
         )
         app.set_indexing_spot_overlay(overlay, solution=solution)
         return int(sum(matched))
@@ -1695,39 +2138,30 @@ class IndexingDialog(QDialog):
                 "Run DIALS indexing before integration.",
             )
             return
-        total = self._dataset_num_images()
-        geom = self._source_geometry
-        if total <= 0 or geom is None:
+        try:
+            dials_range = self._dials_integrate_range_from_ui()
+        except Exception as ex:
+            QMessageBox.critical(self, "Integration", str(ex))
             return
-        if self._integration_range is not None:
-            dials_range = DialsImageRange(
-                self._integration_range.first_image,
-                self._integration_range.last_image,
-            )
-        else:
-            osc = max(abs(geom.phi_end - geom.phi_start), 0.01)
-            dials_range = auto_dials_image_range(
-                total,
-                oscillation_deg=osc,
-                mosaicity_deg=float(self.mosaicity_value.value()),
-            )
-            self._integration_range = IntegrationImageRange(
-                first_image=dials_range.first_image,
-                last_image=dials_range.last_image,
-                selection_method="dials_heuristic",
-            )
+        self._integration_range = IntegrationImageRange(
+            first_image=dials_range.first_image,
+            last_image=dials_range.last_image,
+            selection_method="dials_ui",
+        )
 
         self.integrate_button.setEnabled(False)
         self.auto_integrate_select_button.setEnabled(False)
         self.find_spots_button.setEnabled(False)
         self.run_button.setEnabled(False)
-        work_dir = Path.home() / ".qtmosflm" / "dials"
+        self.full_pipeline_button.setEnabled(False)
+        self._set_busy(True)
+        work_dir = self._resolve_dials_work_dir()
         self._integrate_thread = QThread(self)
         self._integrate_worker = _DialsIntegrateWorker(
             self._dials_index,
             dials_range,
             work_dir,
-            DialsSettings(nproc=4),
+            self._dials_settings_from_ui(),
         )
         self._integrate_worker.moveToThread(self._integrate_thread)
         self._integrate_thread.started.connect(self._integrate_worker.run)
@@ -1740,7 +2174,6 @@ class IndexingDialog(QDialog):
         self._integrate_thread.start()
 
     def _on_dials_integrate_finished(self, result: DialsIntegrationResult) -> None:
-        self._dials_integration = result
         self._integration_range = IntegrationImageRange(
             first_image=result.image_range.first_image,
             last_image=result.image_range.last_image,
@@ -1755,6 +2188,90 @@ class IndexingDialog(QDialog):
         self.log.append(f"DIALS MTZ: {result.mtz_path}")
         if result.n_reflections is not None:
             self.log.append(f"Integrated reflections: {result.n_reflections}")
+        self._update_mtz_result_ui(result)
+
+    def _on_run_full_pipeline(self) -> None:
+        """One-shot import → find spots → index → integrate → MTZ."""
+        app = self.parent()
+        if app is None or getattr(app, "current_file", None) is None:
+            QMessageBox.warning(
+                self,
+                "No dataset",
+                "Open an HDF5 / NeXus master before running the DIALS pipeline.",
+            )
+            return
+        try:
+            geometry = app.build_indexing_geometry()
+            self._source_geometry = geometry
+            image_range = self._dials_range_from_ui()
+        except Exception as ex:
+            QMessageBox.critical(self, "DIALS pipeline", str(ex))
+            return
+
+        self._spotfinding = None
+        self._dials_spots = None
+        self._dials_index = None
+        self._dials_integration = None
+        self._result = None
+        self.table.setRowCount(0)
+        self._table_solutions = []
+        self._reset_pipeline_checklist()
+        self.log.clear()
+        self.log.append(
+            f"Full DIALS pipeline on images "
+            f"{image_range.first_image}–{image_range.last_image}"
+        )
+        self.solutionSelected.emit(None)
+
+        self.find_spots_button.setEnabled(False)
+        self.run_button.setEnabled(False)
+        self.integrate_button.setEnabled(False)
+        self.full_pipeline_button.setEnabled(False)
+        self._set_busy(True)
+
+        work_dir = self._resolve_dials_work_dir()
+        self._pipeline_thread = QThread(self)
+        self._pipeline_worker = _DialsFullPipelineWorker(
+            Path(app.current_file),
+            image_range,
+            work_dir,
+            self._dials_settings_from_ui(),
+        )
+        self._pipeline_worker.moveToThread(self._pipeline_thread)
+        self._pipeline_thread.started.connect(self._pipeline_worker.run)
+        self._pipeline_worker.progress.connect(self.status_label.setText)
+        self._pipeline_worker.finished.connect(self._on_full_pipeline_finished)
+        self._pipeline_worker.failed.connect(self._on_full_pipeline_failed)
+        self._pipeline_worker.finished.connect(self._pipeline_thread.quit)
+        self._pipeline_worker.failed.connect(self._pipeline_thread.quit)
+        self._pipeline_thread.finished.connect(self._cleanup_pipeline_thread)
+        self._pipeline_thread.start()
+
+    def _on_full_pipeline_finished(self, payload: object) -> None:
+        spots, indexed, integ = payload  # type: ignore[misc]
+        self._on_dials_spots_found(spots)
+        self._on_dials_index_finished(indexed)
+        if integ is not None:
+            self._on_dials_integrate_finished(integ)
+        self.status_label.setText(
+            f"Full DIALS pipeline complete — {integ.mtz_path if integ else 'no MTZ'}"
+        )
+
+    def _on_full_pipeline_failed(self, message: str) -> None:
+        self.status_label.setText("DIALS full pipeline failed.")
+        self.log.append(f"PIPELINE ERROR: {message}")
+        QMessageBox.critical(self, "DIALS pipeline failed", message)
+
+    def _cleanup_pipeline_thread(self) -> None:
+        self._pipeline_worker = None
+        if self._pipeline_thread is not None:
+            self._pipeline_thread.deleteLater()
+            self._pipeline_thread = None
+        self.find_spots_button.setEnabled(True)
+        self.full_pipeline_button.setEnabled(self._use_dials)
+        self._set_busy(False)
+        self._update_run_button_state()
+        self._update_integration_button_state()
 
     def _cleanup_integrate_thread(self) -> None:
         self._integrate_worker = None
@@ -1762,6 +2279,8 @@ class IndexingDialog(QDialog):
             self._integrate_thread.deleteLater()
             self._integrate_thread = None
         self.find_spots_button.setEnabled(True)
+        self.full_pipeline_button.setEnabled(self._use_dials)
+        self._set_busy(False)
         self._update_run_button_state()
         self._update_integration_button_state()
 

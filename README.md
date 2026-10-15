@@ -34,17 +34,19 @@ For CBF and other formats supported by MOSFLM, the Index window provides an iMos
 3. Inspect indexing solutions.
 4. Refine the unit cell and estimate mosaicity.
 
-### Indexing and processing with DIALS
+### Indexing and processing with DIALS (HDF5 → MTZ)
 
-When an HDF5 / NeXus master is opened, the Index window uses DIALS for the processing workflow:
+When an HDF5 / NeXus master is opened, the Index window becomes a DIALS processing panel:
 
-1. **Import and find spots** — `dials.import` and `dials.find_spots` on a short image wedge.
-2. **Index and refine** — `dials.index` using `fft3d`, followed by automatic refinement.
-3. **Integrate and export** — `dials.integrate` and `dials.export` to produce an MTZ file.
+1. **Import and find spots** — `dials.import` and `dials.find_spots` on a contiguous image wedge.
+2. **Index and refine** — `dials.index` (`fft3d`) with automatic refine.
+3. **Integrate and export** — `dials.integrate` (with `scan_range`) and `dials.export` → MTZ.
 
-DIALS strong-spot centroids and indexed predictions are cached as NumPy `.npz` files and overlaid on the currently displayed frame as the frame slider changes. Working files are stored under `~/.qtmosflm/dials/`.
+The panel also exposes work-directory browse/reveal, DIALS settings (`nproc`, `d_min`, gain, min spot size, optional known symmetry), a pipeline checklist, **Run full pipeline → MTZ**, progress/log access, and post-MTZ actions (Reveal, Copy path, **Open in Reflection Viewer** via ElMo).
 
-For background on the processing workflow, see the [DIALS processing-in-detail tutorial](https://dials.github.io/documentation/tutorials/processing_in_detail_betalactamase_dui.html).
+Working files default to `~/.qtmosflm/dials/<dataset_stem>/`. Spot/prediction overlays update with the frame slider.
+
+See [imosflm/README.md](imosflm/README.md) for the full Index UI reference, and the [DIALS processing-in-detail tutorial](https://dials.github.io/documentation/tutorials/processing_in_detail_betalactamase_dui.html).
 
 ## Requirements
 
