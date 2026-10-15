@@ -102,6 +102,8 @@ class DialsSpotFindingResult:
     n_spots: int
     image_range: DialsImageRange
     log: str = ""
+    #: Optional ``.npz`` with arrays ``x``, ``y``, ``z`` (pixel centroids).
+    centroids_npz: Path | None = None
 
 
 @dataclass
@@ -114,6 +116,8 @@ class DialsIndexingResult:
     solution: DialsCrystalSolution
     refined: bool = False
     log: str = ""
+    #: Optional ``.npz`` with predicted ``x``, ``y``, ``z`` (``xyzcal.px``).
+    predictions_npz: Path | None = None
 
 
 @dataclass
@@ -270,6 +274,191 @@ def count_strong_spots(refl_path: Path) -> int:
     return 0
 
 
+def find_ccp4_python() -> Path | None:
+    """Locate the CCP4/DIALS ``python3`` that can import ``dials``."""
+    prefix = find_dials_prefix()
+    roots: list[Path] = []
+    if prefix is not None:
+        roots.append(prefix.parent)
+    for key in ("CCP4", "DIALS_DIR"):
+        root = os.environ.get(key)
+        if root:
+            roots.append(Path(root))
+    roots.extend(
+        (
+            Path("/Applications/ccp4-9"),
+            Path("/Applications/ccp4-8"),
+        )
+    )
+    seen: set[Path] = set()
+    for root in roots:
+        try:
+            root = root.resolve()
+        except OSError:
+            continue
+        if root in seen:
+            continue
+        seen.add(root)
+        for candidate in (
+            root / "Frameworks/Python.framework/Versions/3.9/bin/python3.9",
+            root / "Frameworks/Python.framework/Versions/3.10/bin/python3.10",
+            root / "bin/python3",
+            root / "bin/python",
+        ):
+            try:
+                if candidate.is_file() and os.access(candidate, os.X_OK):
+                    return candidate.resolve()
+            except OSError:
+                continue
+    return None
+
+
+_EXPORT_CENTROIDS_SCRIPT = r"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import numpy as np
+from dials.array_family import flex
+
+refl_path = Path(sys.argv[1])
+out_path = Path(sys.argv[2])
+refl = flex.reflection_table.from_file(str(refl_path))
+xs, ys, zs = refl["xyzobs.px.value"].parts()
+np.savez_compressed(
+    out_path,
+    x=np.asarray(xs, dtype=np.float64),
+    y=np.asarray(ys, dtype=np.float64),
+    z=np.asarray(zs, dtype=np.float64),
+)
+print(len(xs))
+"""
+
+
+_EXPORT_PREDICTIONS_SCRIPT = r"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import numpy as np
+from dials.array_family import flex
+
+refl_path = Path(sys.argv[1])
+out_path = Path(sys.argv[2])
+refl = flex.reflection_table.from_file(str(refl_path))
+if "xyzcal.px" not in refl:
+    raise SystemExit("reflection table has no xyzcal.px column")
+indexed = refl.get_flags(refl.flags.indexed)
+sel = refl.select(indexed)
+xs, ys, zs = sel["xyzcal.px"].parts()
+np.savez_compressed(
+    out_path,
+    x=np.asarray(xs, dtype=np.float64),
+    y=np.asarray(ys, dtype=np.float64),
+    z=np.asarray(zs, dtype=np.float64),
+)
+print(len(xs))
+"""
+
+
+def _run_ccp4_python_script(script: str, *args: str) -> str:
+    """Run *script* with CCP4 Python; return stdout. Raises on failure."""
+    python = find_ccp4_python()
+    if python is None:
+        raise FileNotFoundError(
+            "CCP4/DIALS Python not found; cannot export reflection tables."
+        )
+    proc = subprocess.run(
+        [str(python), "-c", script, *args],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-20:]
+        raise RuntimeError("CCP4 Python script failed:\n" + "\n".join(tail))
+    return proc.stdout or ""
+
+
+def export_strong_centroids_npz(
+    strong_refl: Path,
+    out_path: Path | None = None,
+) -> Path:
+    """Export ``xyzobs.px`` centroids from *strong_refl* to a NumPy ``.npz``.
+
+    qtMosflm cannot import DIALS into its own venv (boost mismatch), so this
+    shells out to CCP4's Python. The cache enables fast per-frame overlays.
+    """
+    strong_refl = Path(strong_refl)
+    if not strong_refl.is_file():
+        raise FileNotFoundError(strong_refl)
+    out_path = Path(out_path) if out_path is not None else strong_refl.with_name(
+        "strong_centroids.npz"
+    )
+    _run_ccp4_python_script(
+        _EXPORT_CENTROIDS_SCRIPT, str(strong_refl), str(out_path)
+    )
+    if not out_path.is_file():
+        raise RuntimeError(f"Failed to write centroids cache: {out_path}")
+    return out_path
+
+
+def export_indexed_predictions_npz(
+    indexed_refl: Path,
+    out_path: Path | None = None,
+) -> Path:
+    """Export indexed ``xyzcal.px`` predictions to a NumPy ``.npz``.
+
+    Only reflections with ``flags.indexed`` are written. Frame filtering uses
+    the same half-open z window as :func:`centroids_px_for_image`.
+    """
+    indexed_refl = Path(indexed_refl)
+    if not indexed_refl.is_file():
+        raise FileNotFoundError(indexed_refl)
+    out_path = Path(out_path) if out_path is not None else indexed_refl.with_name(
+        "indexed_predictions.npz"
+    )
+    _run_ccp4_python_script(
+        _EXPORT_PREDICTIONS_SCRIPT, str(indexed_refl), str(out_path)
+    )
+    if not out_path.is_file():
+        raise RuntimeError(f"Failed to write predictions cache: {out_path}")
+    return out_path
+
+
+def centroids_px_for_image(
+    centroids_npz: Path,
+    image_index_0based: int,
+) -> list[tuple[float, float]]:
+    """Return ``(x_px, y_px)`` centroids for one 0-based image index.
+
+    DIALS stores the slow/fast pixel centroid in ``xyzobs.px.value``; the z
+    coordinate uses half-integer frame indices (``image + 0.5``), so a frame
+    matches when ``image_index <= z < image_index + 1``.
+    """
+    import numpy as np
+
+    path = Path(centroids_npz)
+    if not path.is_file():
+        return []
+    data = np.load(path)
+    try:
+        x = data["x"]
+        y = data["y"]
+        z = data["z"]
+    finally:
+        data.close()
+    index = int(image_index_0based)
+    mask = (z >= index) & (z < index + 1)
+    if not np.any(mask):
+        return []
+    xs = x[mask]
+    ys = y[mask]
+    return [(float(px), float(py)) for px, py in zip(xs, ys)]
+
+
 class DialsEngine:
     """Orchestrate DIALS CLI steps in a working directory."""
 
@@ -358,6 +547,11 @@ class DialsEngine:
         if not strong.is_file():
             raise RuntimeError("dials.find_spots did not write strong.refl")
         n_spots = count_strong_spots(strong)
+        centroids_npz: Path | None = None
+        try:
+            centroids_npz = export_strong_centroids_npz(strong)
+        except Exception as ex:  # noqa: BLE001
+            logger.warning("Could not export DIALS centroids for overlay: %s", ex)
         return DialsSpotFindingResult(
             work_dir=self.work_dir,
             imported_expt=Path(imported_expt),
@@ -365,6 +559,7 @@ class DialsEngine:
             n_spots=n_spots,
             image_range=image_range,
             log=log,
+            centroids_npz=centroids_npz,
         )
 
     def index(
@@ -416,6 +611,11 @@ class DialsEngine:
                         solution.n_unindexed = int(parts[2])
                     except ValueError:
                         pass
+        predictions_npz: Path | None = None
+        try:
+            predictions_npz = export_indexed_predictions_npz(reflections)
+        except Exception as ex:  # noqa: BLE001
+            logger.warning("Could not export DIALS predictions for overlay: %s", ex)
         return DialsIndexingResult(
             work_dir=self.work_dir,
             experiments=experiments,
@@ -423,6 +623,7 @@ class DialsEngine:
             solution=solution,
             refined=did_refine,
             log=log,
+            predictions_npz=predictions_npz,
         )
 
     def integrate(

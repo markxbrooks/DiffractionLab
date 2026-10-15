@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import QAction, QColor, QIcon, QImage, QPainter, QPen, QPixmap
 from PySide6.QtCore import Qt, QSettings, QSize
 
+from imosflm.image_canvas import DiffractionImageCanvas, build_resolution_rings
 from imosflm.indexing import IndexingGeometry, as_float
 from imosflm.indexing_dialog import IndexingDialog
 
@@ -653,6 +654,23 @@ class IMosflmApp(QMainWindow):
         )
         self._act_index.triggered.connect(self.open_indexing_dialog)
 
+        self._act_zoom_in = QAction("Zoom &In", self)
+        self._act_zoom_in.setShortcut("Ctrl+=")
+        self._act_zoom_in.setStatusTip("Zoom in (mouse wheel also works)")
+        self._act_zoom_in.triggered.connect(self._zoom_in)
+
+        self._act_zoom_out = QAction("Zoom &Out", self)
+        self._act_zoom_out.setShortcut("Ctrl+-")
+        self._act_zoom_out.setStatusTip("Zoom out (mouse wheel also works)")
+        self._act_zoom_out.triggered.connect(self._zoom_out)
+
+        self._act_reset_zoom = QAction("&Reset Zoom", self)
+        self._act_reset_zoom.setShortcut("Ctrl+0")
+        self._act_reset_zoom.setStatusTip(
+            "Fit the diffraction image to the window"
+        )
+        self._act_reset_zoom.triggered.connect(self._reset_zoom)
+
         self._act_quit = QAction(
             _registry_icon(IconRegistry.EXIT if _HAS_PICOUI else ""),
             "&Quit",
@@ -676,6 +694,11 @@ class IMosflmApp(QMainWindow):
         file_menu.addAction(self._act_rings)
         file_menu.addSeparator()
         file_menu.addAction(self._act_quit)
+
+        view_menu = self.menuBar().addMenu("&View")
+        view_menu.addAction(self._act_zoom_in)
+        view_menu.addAction(self._act_zoom_out)
+        view_menu.addAction(self._act_reset_zoom)
 
         process_menu = self.menuBar().addMenu("&Process")
         process_menu.addAction(self._act_index)
@@ -723,6 +746,10 @@ class IMosflmApp(QMainWindow):
         toolbar.addAction(self._act_histogram)
         toolbar.addAction(self._act_rings)
         toolbar.addSeparator()
+        toolbar.addAction(self._act_zoom_in)
+        toolbar.addAction(self._act_zoom_out)
+        toolbar.addAction(self._act_reset_zoom)
+        toolbar.addSeparator()
         toolbar.addAction(self._act_index)
 
     def _build_central_ui(self) -> None:
@@ -762,13 +789,14 @@ class IMosflmApp(QMainWindow):
         dataset_layout.addWidget(self.dataset_combo, stretch=1)
         layout.addLayout(dataset_layout)
 
-        # Image display
-        self.image_label = QLabel("No image loaded")
-        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.image_label.setMinimumHeight(700)
-        self.image_label.setMouseTracking(True)
-        self.image_label.mouseMoveEvent = self.mouse_move_event
-        layout.addWidget(self.image_label, stretch=1)
+        # Image display (shared ZoomableCanvas look-and-feel with Reflection Viewer)
+        self.image_canvas = DiffractionImageCanvas()
+        self.image_canvas.setMinimumHeight(700)
+        self.image_canvas.set_placeholder("No image loaded")
+        self.image_canvas.cursor_moved.connect(self._on_image_cursor_moved)
+        layout.addWidget(self.image_canvas, stretch=1)
+        # Keep attribute for older call sites / styles that still say image_label.
+        self.image_label = self.image_canvas
 
         # Frame slider
         frame_layout = QHBoxLayout()
@@ -857,15 +885,15 @@ class IMosflmApp(QMainWindow):
     def _apply_widget_styles(self) -> None:
         """Apply ThemeManager-derived colors to key widgets."""
         colors = _theme_colors()
-        self.image_label.setStyleSheet(
-            f"QLabel {{"
+        self.image_canvas.setStyleSheet(
+            f"DiffractionImageCanvas {{"
             f" background-color: {colors['base']};"
             f" color: {colors['text']};"
             f" border: 1px solid {colors['mid']};"
             f" border-radius: 4px;"
-            f" padding: 8px;"
             f"}}"
         )
+        self.image_canvas.set_background(colors["base"])
 
     def closeEvent(self, event) -> None:  # noqa: N802
         """Release HDF5 handles when the window closes."""
@@ -879,8 +907,7 @@ class IMosflmApp(QMainWindow):
             self.rings_checkbox.blockSignals(True)
             self.rings_checkbox.setChecked(checked)
             self.rings_checkbox.blockSignals(False)
-        if self.current_image:
-            self.show_image(self.current_image)
+        self.image_canvas.set_rings_visible(self.show_rings)
 
     def open_indexing_dialog(self) -> None:
         """Open the Mosflm DPS indexing dialog for the loaded dataset."""
@@ -914,8 +941,9 @@ class IMosflmApp(QMainWindow):
         """
         self._indexing_spot_overlay = spots_px
         self._indexing_solution = solution
-        if self.current_image is not None:
-            self.show_image(self.current_image)
+        self.image_canvas.set_spot_overlay(
+            spots_px, visible=self.show_indexing_spots
+        )
         if spots_px is not None:
             n_matched = sum(1 for *_xy, matched in spots_px if matched)
             n_total = len(spots_px)
@@ -932,6 +960,7 @@ class IMosflmApp(QMainWindow):
         """Toggle visibility of indexing spot markers."""
         checked = state == Qt.CheckState.Checked or state is True or state == 2
         self.show_indexing_spots = bool(checked)
+        self.image_canvas.set_spots_visible(self.show_indexing_spots)
         logging.info(
             "Toggle indexing spots: %s",
             "ON" if self.show_indexing_spots else "OFF",
@@ -1404,50 +1433,54 @@ class IMosflmApp(QMainWindow):
             logging.error(f"Error in display_hdf5_image: {ex}")
 
     def show_image(self, image): # png_rings
-        """Display the image with resolution rings and optional indexing spots."""
+        """Display the image; rings and spots are painted by the zoomable canvas."""
         try:
             logging.info(f"show_image received image: mode={image.mode}, size={image.size}")
-            annotated_image = add_resolution_rings(
-                image,
-                self.beam_center,
-                self.detector_distance[0],
-                self.x_pixel_size,
-                self.incident_wavelength,
-                show_rings=self.show_rings,
+            pixmap = pil_to_qpixmap(image.convert("RGB"))
+            self.image_canvas.set_spot_overlay(
+                self._indexing_spot_overlay,
+                visible=self.show_indexing_spots,
             )
-            pixmap = pil_to_qpixmap(annotated_image)
-            scaled = pixmap.scaled(
-                self.image_label.size(),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-            # Draw matched spots on the *scaled* pixmap so crosses stay visible.
-            overlay = self._indexing_spot_overlay
-            if overlay and self.show_indexing_spots:
-                src_w, src_h = annotated_image.size
-                if src_w > 0 and src_h > 0:
-                    scale_x = scaled.width() / float(src_w)
-                    scale_y = scaled.height() / float(src_h)
-                    painter = QPainter(scaled)
-                    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-                    half = 6
-                    drawn = 0
-                    for x_px, y_px, matched in overlay:
-                        if not matched:
-                            continue
-                        x = int(round(float(x_px) * scale_x))
-                        y = int(round(float(y_px) * scale_y))
-                        pen = QPen(QColor(0, 220, 70), 2)
-                        painter.setPen(pen)
-                        painter.drawLine(x - half, y, x + half, y)
-                        painter.drawLine(x, y - half, x, y + half)
-                        drawn += 1
-                    painter.end()
-                    logging.info("Drew %d matched indexing spots on display", drawn)
-            self.image_label.setPixmap(scaled)
+            self._sync_resolution_rings_to_canvas()
+            # Keep zoom when refreshing the same-sized frame; reset on new size.
+            self.image_canvas.set_image_pixmap(pixmap, reset_view=None)
 
         except Exception as ex:
             logging.error(f"Error in show_image: {ex}")
+
+    def _sync_resolution_rings_to_canvas(self) -> None:
+        """Push current beam/geometry rings onto the zoomable canvas overlay."""
+        rings = []
+        try:
+            if (
+                self.beam_center is not None
+                and self.incident_wavelength is not None
+                and self.detector_distance is not None
+                and self.x_pixel_size is not None
+            ):
+                distance = self.detector_distance
+                if isinstance(distance, (list, tuple)):
+                    distance = distance[0]
+                rings = build_resolution_rings(
+                    beam_x=float(self.beam_center[0]),
+                    beam_y=float(self.beam_center[1]),
+                    wavelength_a=float(self.incident_wavelength),
+                    distance_mm=float(distance),
+                    pixel_size_mm=float(self.x_pixel_size),
+                )
+        except Exception as ex:
+            logging.warning("Could not build resolution rings: %s", ex)
+            rings = []
+        self.image_canvas.set_resolution_rings(rings, visible=self.show_rings)
+
+    def _zoom_in(self) -> None:
+        self.image_canvas.zoom_in()
+
+    def _zoom_out(self) -> None:
+        self.image_canvas.zoom_out()
+
+    def _reset_zoom(self) -> None:
+        self.image_canvas.reset_view()
 
     def draw_resolution_rings(self, image):  # qt_rings
         """Display the image with resolution rings."""
@@ -1482,7 +1515,7 @@ class IMosflmApp(QMainWindow):
 
                 painter.end()
 
-            self.image_label.setPixmap(pixmap.scaled(self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            self.image_canvas.set_image_pixmap(pixmap, reset_view=None)
         except Exception as ex:
             logging.error(f"Error: {ex} occurred")
 
@@ -1555,51 +1588,31 @@ class IMosflmApp(QMainWindow):
             plt.show()
 
     def resizeEvent(self, event):
-        """ resizeEvent """
-        logging.info("resizeEvent")
-        try:
-            if self.current_image:
-                self.show_image(self.current_image)
-            super().resizeEvent(event)
-        except Exception as ex:
-            logging.error(f"Error: {ex} occurred")
+        """Keep the zoomable canvas sized with the window."""
+        super().resizeEvent(event)
 
-    def mouse_move_event(self, event):
-        if self.current_image and self.beam_center:
-            # Get display coordinates
-            x_display = event.position().x()
-            y_display = event.position().y()
-
-            # Calculate scaling factors
-            image_width = self.image_label.pixmap().width()
-            image_height = self.image_label.pixmap().height()
-            dataset_width = self.dataset.shape[2]  # Assuming dataset shape is (frames, height, width)
-            dataset_height = self.dataset.shape[1]
-
-            scale_x = dataset_width / image_width
-            scale_y = dataset_height / image_height
-
-            # Convert to dataset coordinates
-            x_dataset = x_display * scale_x
-            y_dataset = y_display * scale_y
-
-            # Update labels
-            self.x_pixel_label.setText(f"x pixel: {x_dataset:.0f}")
-            self.y_pixel_label.setText(f"y pixel: {y_dataset:.0f}")
+    def _on_image_cursor_moved(self, x_dataset: float, y_dataset: float) -> None:
+        """Update pixel / resolution readouts from canvas world coordinates."""
+        if self.current_image is None or self.beam_center is None:
+            return
+        self.x_pixel_label.setText(f"x pixel: {x_dataset:.0f}")
+        self.y_pixel_label.setText(f"y pixel: {y_dataset:.0f}")
+        if self.beam_x is not None:
             self.beam_x_label.setText(f"beam_x: {self.beam_x:.0f}")
+        if self.beam_y is not None:
             self.beam_y_label.setText(f"beam_y: {self.beam_y:.0f}")
-
-            # Compute resolution
-            metadata = {
-                "beam_centre_x": self.beam_center[0],
-                "beam_centre_y": self.beam_center[1],
-                "detector_distance": self.detector_distance[0],  # Ensure this is a single value
-                "incident_wavelength": self.incident_wavelength,
-                "x_pixel_size": self.x_pixel_size
-            }
-            two_theta, resolution = calculate_two_theta_and_resolution(x_dataset, y_dataset, metadata)
-            self.two_theta_label.setText(f"two theta: {two_theta:0.2f} °")
-            self.resolution_label.setText(f"Resolution: {resolution:0.2f} Å")
+        metadata = {
+            "beam_centre_x": self.beam_center[0],
+            "beam_centre_y": self.beam_center[1],
+            "detector_distance": self.detector_distance[0],
+            "incident_wavelength": self.incident_wavelength,
+            "x_pixel_size": self.x_pixel_size,
+        }
+        two_theta, resolution = calculate_two_theta_and_resolution(
+            x_dataset, y_dataset, metadata
+        )
+        self.two_theta_label.setText(f"two theta: {two_theta:0.2f} °")
+        self.resolution_label.setText(f"Resolution: {resolution:0.2f} Å")
 
     def toggle_rings(self, state):
         """Toggle the visibility of rings on the image."""
@@ -1610,8 +1623,7 @@ class IMosflmApp(QMainWindow):
             self._act_rings.blockSignals(True)
             self._act_rings.setChecked(self.show_rings)
             self._act_rings.blockSignals(False)
-        if self.current_image:
-            self.show_image(self.current_image)
+        self.image_canvas.set_rings_visible(self.show_rings)
 
 
 def parse_arguments():

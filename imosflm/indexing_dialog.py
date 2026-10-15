@@ -37,6 +37,9 @@ from imosflm.dials_engine import (
     DialsSettings,
     DialsSpotFindingResult,
     auto_dials_image_range,
+    centroids_px_for_image,
+    export_indexed_predictions_npz,
+    export_strong_centroids_npz,
     find_dials_prefix,
 )
 from imosflm.indexing import (
@@ -873,13 +876,68 @@ class IndexingDialog(QDialog):
             f"DIALS found {spots.n_spots} spots → {spots.strong_refl.name}"
         )
         self.log.append(f"strong.refl: {spots.strong_refl}")
+        if spots.centroids_npz is not None:
+            self.log.append(f"centroids cache: {spots.centroids_npz}")
         self._update_run_button_state()
+        self._show_dials_found_spots_overlay()
         if spots.n_spots < min_spots:
             QMessageBox.warning(
                 self,
                 "Few spots",
                 f"Only {spots.n_spots} spots were found. "
                 "Widen the frame range or check the images.",
+            )
+
+    def _ensure_dials_centroids_cache(self) -> Path | None:
+        """Return the centroids ``.npz`` path, exporting from ``strong.refl`` if needed."""
+        spots = self._dials_spots
+        if spots is None:
+            return None
+        cache = spots.centroids_npz
+        if cache is not None and Path(cache).is_file():
+            return Path(cache)
+        strong = Path(spots.strong_refl)
+        if not strong.is_file():
+            return None
+        try:
+            cache = export_strong_centroids_npz(strong)
+        except Exception as ex:  # noqa: BLE001
+            logger.exception("Failed to export DIALS centroids")
+            self.log.append(f"Could not export spot centroids: {ex}")
+            return None
+        spots.centroids_npz = cache
+        return cache
+
+    def _show_dials_found_spots_overlay(self) -> None:
+        """Draw DIALS strong spots for the currently displayed HDF5 frame."""
+        cache = self._ensure_dials_centroids_cache()
+        if cache is None:
+            return
+        app = self._viewer()
+        if app is None:
+            return
+        frame_index = 0
+        slider = getattr(app, "frame_slider", None)
+        if slider is not None:
+            frame_index = int(slider.value())
+        try:
+            centroids = centroids_px_for_image(cache, frame_index)
+        except Exception as ex:  # noqa: BLE001
+            logger.exception("Failed to load DIALS centroids for frame %s", frame_index)
+            self.log.append(f"Spot overlay error: {ex}")
+            return
+        overlay = [(x, y, True) for x, y in centroids]
+        app.set_indexing_spot_overlay(overlay, solution=None)
+        if overlay:
+            self.status_label.setText(
+                f"Showing {len(overlay)} DIALS spots on frame {frame_index}"
+            )
+        else:
+            self.status_label.setText(
+                f"No DIALS spots on frame {frame_index} "
+                f"(spot-finding range "
+                f"{self._dials_spots.image_range.first_image}–"
+                f"{self._dials_spots.image_range.last_image})"
             )
 
     def _cleanup_spot_thread(self) -> None:
@@ -1067,6 +1125,8 @@ class IndexingDialog(QDialog):
             )
         elif sol.reflections_used is not None:
             self.log.append(f"Indexed {sol.reflections_used}")
+        if indexed.predictions_npz is not None:
+            self.log.append(f"predictions cache: {indexed.predictions_npz}")
         self._fill_table(result)
         self.refine_button.setEnabled(False)
         self.mosaicity_estimate_button.setEnabled(False)
@@ -1212,6 +1272,14 @@ class IndexingDialog(QDialog):
         self._update_integration_button_state()
         self.solutionSelected.emit(solution)
         n_matched = self._update_parent_overlay(solution)
+        if n_matched is None:
+            return
+        if self._use_dials and self._dials_index is not None:
+            self.status_label.setText(
+                f"Solution #{solution.number} ({solution.spacegroup}) — "
+                f"{n_matched} predicted spots on this image"
+            )
+            return
         n_found = 0
         if self._result is not None:
             app = self._viewer()
@@ -1219,11 +1287,10 @@ class IndexingDialog(QDialog):
             if app is not None and getattr(app, "frame_slider", None) is not None:
                 frame_index = int(app.frame_slider.value())
             n_found = len(spots_for_frame(self._result, frame_index))
-        if n_matched is not None:
-            self.status_label.setText(
-                f"Solution #{solution.number} ({solution.kind} {solution.lattice} "
-                f"{solution.spacegroup}) — {n_matched} matched / {n_found} found"
-            )
+        self.status_label.setText(
+            f"Solution #{solution.number} ({solution.kind} {solution.lattice} "
+            f"{solution.spacegroup}) — {n_matched} matched / {n_found} found"
+        )
 
     def _viewer(self) -> QWidget | None:
         """Return the qtMosflm main window that owns this dialog."""
@@ -1234,6 +1301,50 @@ class IndexingDialog(QDialog):
             widget = widget.parentWidget()
         return None
 
+    def _ensure_dials_predictions_cache(self) -> Path | None:
+        """Return the predictions ``.npz`` path, exporting from indexed/refined.refl if needed."""
+        indexed = self._dials_index
+        if indexed is None:
+            return None
+        cache = indexed.predictions_npz
+        if cache is not None and Path(cache).is_file():
+            return Path(cache)
+        reflections = Path(indexed.reflections)
+        if not reflections.is_file():
+            return None
+        try:
+            cache = export_indexed_predictions_npz(reflections)
+        except Exception as ex:  # noqa: BLE001
+            logger.exception("Failed to export DIALS predictions")
+            self.log.append(f"Could not export index predictions: {ex}")
+            return None
+        indexed.predictions_npz = cache
+        return cache
+
+    def _show_dials_predictions_overlay(
+        self, solution: IndexSolution | None = None
+    ) -> int | None:
+        """Draw DIALS ``xyzcal.px`` predictions for the currently displayed frame."""
+        cache = self._ensure_dials_predictions_cache()
+        if cache is None:
+            return None
+        app = self._viewer()
+        if app is None:
+            return None
+        frame_index = 0
+        slider = getattr(app, "frame_slider", None)
+        if slider is not None:
+            frame_index = int(slider.value())
+        try:
+            predictions = centroids_px_for_image(cache, frame_index)
+        except Exception as ex:  # noqa: BLE001
+            logger.exception("Failed to load DIALS predictions for frame %s", frame_index)
+            self.log.append(f"Prediction overlay error: {ex}")
+            return None
+        overlay = [(x, y, True) for x, y in predictions]
+        app.set_indexing_spot_overlay(overlay, solution=solution)
+        return len(overlay)
+
     def _update_parent_overlay(self, solution: IndexSolution | None) -> int | None:
         """Ask the parent viewer to overlay matched spots for *solution*."""
         app = self._viewer()
@@ -1243,6 +1354,8 @@ class IndexingDialog(QDialog):
         if solution is None or self._result is None:
             app.set_indexing_spot_overlay(None)
             return None
+        if self._use_dials and self._dials_index is not None:
+            return self._show_dials_predictions_overlay(solution)
         frame_index = 0
         slider = getattr(app, "frame_slider", None)
         if slider is not None:
@@ -1923,11 +2036,16 @@ class IndexingDialog(QDialog):
 
     def refresh_overlay_for_current_frame(self) -> None:
         """Recompute the spot overlay after the main window changes frame."""
-        if not self._table_solutions:
+        if self._table_solutions:
+            row = int(self.table.currentRow())
+            if 0 <= row < len(self._table_solutions):
+                self._apply_solution_row(row)
+                return
+        if self._dials_spots is not None and self._dials_spots.centroids_npz is not None:
+            self._show_dials_found_spots_overlay()
             return
-        row = int(self.table.currentRow())
-        if 0 <= row < len(self._table_solutions):
-            self._apply_solution_row(row)
+        if self._spotfinding is not None:
+            self._show_found_spots_overlay()
 
     @property
     def indexing_result(self) -> IndexingResult | None:
