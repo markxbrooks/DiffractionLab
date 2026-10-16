@@ -33,7 +33,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from imosflm.dials_engine import (
+from diffraction_lab.dials_engine import (
     DialsEngine,
     DialsImageRange,
     DialsIndexingResult,
@@ -49,7 +49,7 @@ from imosflm.dials_engine import (
     find_dials_prefix,
     latest_dials_run_dir,
 )
-from imosflm.dials_spec import (
+from diffraction_lab.dials_spec import (
     dials_settings_fields,
     dials_settings_to_values,
     values_to_dials_settings,
@@ -62,7 +62,7 @@ try:
 except ImportError:  # pragma: no cover
     SpecEditor = None  # type: ignore[misc, assignment]
     _HAS_SPEC_EDITOR = False
-from imosflm.indexing import (
+from diffraction_lab.indexing import (
     IndexSolution,
     IndexingEngine,
     IndexingGeometry,
@@ -79,10 +79,10 @@ from imosflm.indexing import (
     spacegroups_for_lattice,
     spots_for_frame,
 )
-from imosflm.mosflm_client import find_ipmosflm
-from imosflm.reflection_viewer_launch import launch_reflection_viewer
-from imosflm.summary_vs_resolution import open_summary_vs_resolution_from_work_dir
-from imosflm.terminal_log_viewer import TerminalLogViewer
+from diffraction_lab.mosflm_client import find_ipmosflm
+from diffraction_lab.reflection_viewer_launch import launch_reflection_viewer
+from diffraction_lab.summary_vs_resolution import open_summary_vs_resolution_from_work_dir
+from diffraction_lab.terminal_log_viewer import TerminalLogViewer
 
 logger = logging.getLogger(__name__)
 

@@ -46,7 +46,7 @@ The panel also exposes work-directory browse/reveal (default `<master_dir>/<stem
 
 Working files default to `~/.qtmosflm/dials/<dataset_stem>/`. Spot/prediction overlays update with the frame slider.
 
-See [imosflm/README.md](imosflm/README.md) for the full Index UI reference, and the [DIALS processing-in-detail tutorial](https://dials.github.io/documentation/tutorials/processing_in_detail_betalactamase_dui.html).
+See [imosflm/README.md](diffraction_lab/README.md) for the full Index UI reference, and the [DIALS processing-in-detail tutorial](https://dials.github.io/documentation/tutorials/processing_in_detail_betalactamase_dui.html).
 
 ## Requirements
 

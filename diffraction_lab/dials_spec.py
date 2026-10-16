@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from imosflm.dials_engine import DialsSettings
+from diffraction_lab.dials_engine import DialsSettings
 
 try:
     from picoui.specs.cli import SpecField, SpecFieldKind, SpecValueType, emit_argv

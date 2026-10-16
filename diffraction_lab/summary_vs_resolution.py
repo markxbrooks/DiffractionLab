@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from imosflm.dials_summary import (
+from diffraction_lab.dials_summary import (
     ResolutionBinSummary,
     find_integrate_log,
     parse_summary_vs_resolution_log,

@@ -1,7 +1,8 @@
 """DiffractionLab entry point (alias for ``qtmosflm``).
 
-ElMo and other launchers look for ``imosflm/diffraction_lab.py``.
-This module runs the same ``main()`` as :mod:`qtmosflm`.
+ElMo and other launchers look for ``diffraction_lab/diffraction_lab.py``
+(or legacy ``imosflm/…``). This module runs the same ``main()`` as
+:mod:`qtmosflm`.
 """
 
 from __future__ import annotations

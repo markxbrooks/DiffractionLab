@@ -15,8 +15,8 @@ from typing import Sequence
 
 import numpy as np
 
-from imosflm.mosflm_client import MosflmClient, MosflmMessage, find_ipmosflm
-from imosflm.spotfile import (
+from diffraction_lab.mosflm_client import MosflmClient, MosflmMessage, find_ipmosflm
+from diffraction_lab.spotfile import (
     Spot,
     SpotFileGeometry,
     SpotList,

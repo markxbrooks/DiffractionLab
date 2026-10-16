@@ -48,9 +48,9 @@ from PySide6.QtGui import (
 )
 from PySide6.QtCore import Qt, QSettings, QSize
 
-from imosflm.image_canvas import DiffractionImageCanvas, build_resolution_rings
-from imosflm.indexing import IndexingGeometry, as_float
-from imosflm.indexing_dialog import IndexingDialog
+from diffraction_lab.image_canvas import DiffractionImageCanvas, build_resolution_rings
+from diffraction_lab.indexing import IndexingGeometry, as_float
+from diffraction_lab.indexing_dialog import IndexingDialog
 
 from PIL import Image, ImageOps
 import fabio  # Import FabIO
