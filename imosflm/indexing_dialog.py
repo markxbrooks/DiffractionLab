@@ -42,9 +42,12 @@ from imosflm.dials_engine import (
     DialsSpotFindingResult,
     auto_dials_image_range,
     centroids_px_for_image,
+    default_dials_work_dir,
+    dials_run_root_for_master,
     export_indexed_predictions_npz,
     export_strong_centroids_npz,
     find_dials_prefix,
+    latest_dials_run_dir,
 )
 from imosflm.dials_spec import (
     dials_settings_fields,
@@ -78,6 +81,7 @@ from imosflm.indexing import (
 )
 from imosflm.mosflm_client import find_ipmosflm
 from imosflm.reflection_viewer_launch import launch_reflection_viewer
+from imosflm.summary_vs_resolution import open_summary_vs_resolution_from_work_dir
 from imosflm.terminal_log_viewer import TerminalLogViewer
 
 logger = logging.getLogger(__name__)
@@ -559,6 +563,7 @@ class IndexingDialog(QDialog):
         self._selected_frames: list[int] = []
         self._source_geometry: IndexingGeometry | None = None
         self._dials_work_dir: Path = Path.home() / ".qtmosflm" / "dials"
+        self._dials_master_path: Path | None = None
         self._last_dials_log: Path | None = None
         self._pipeline_thread: QThread | None = None
         self._pipeline_worker: _DialsFullPipelineWorker | None = None
@@ -587,7 +592,9 @@ class IndexingDialog(QDialog):
 
         work_row = QHBoxLayout()
         self.dials_work_dir_edit = QLineEdit()
-        self.dials_work_dir_edit.setPlaceholderText("~/.qtmosflm/dials/<dataset>/")
+        self.dials_work_dir_edit.setPlaceholderText(
+            "<master_dir>/<master_stem>/YYYY-MM-DD-HH-MM-SS-dials/"
+        )
         work_row.addWidget(self.dials_work_dir_edit, stretch=1)
         self.dials_work_browse_btn = QPushButton("Browse…")
         self.dials_work_browse_btn.clicked.connect(self._on_browse_work_dir)
@@ -909,11 +916,19 @@ class IndexingDialog(QDialog):
         )
         self.mtz_open_viewer_btn.clicked.connect(self._on_open_mtz_in_viewer)
         mtz_btn_row.addWidget(self.mtz_open_viewer_btn)
+        self.mtz_summary_btn = QPushButton("Summary vs resolution")
+        self.mtz_summary_btn.setEnabled(False)
+        self.mtz_summary_btn.setToolTip(
+            "Plot DIALS integrate Summary vs resolution (I/σI, CC, RMSD, counts)"
+        )
+        self.mtz_summary_btn.clicked.connect(self._on_show_summary_vs_resolution)
+        mtz_btn_row.addWidget(self.mtz_summary_btn)
         mtz_btn_row.addStretch(1)
         mtz_layout.addLayout(mtz_btn_row)
         mtz_page_layout.addWidget(self.mtz_result_box)
         mtz_page_layout.addStretch(1)
         self._mtz_tab_index = self.pipeline_tabs.addTab(mtz_page, "5. MTZ")
+        self._summary_dialog = None
 
         # ----- Shared footer -----
         self.status_label = QLabel("Ready.")
@@ -1005,8 +1020,19 @@ class IndexingDialog(QDialog):
             )
             master = Path(getattr(app, "current_file", "") or "")
             self.dials_master_label.setText(str(master) if master else "(no master)")
-            stem = master.stem if master.name else "dataset"
-            self._dials_work_dir = Path.home() / ".qtmosflm" / "dials" / stem
+            if master.is_file():
+                self._dials_master_path = master.resolve()
+                # Prefer the newest existing run beside the master; else a fresh stamp.
+                existing = latest_dials_run_dir(self._dials_master_path)
+                self._dials_work_dir = (
+                    existing
+                    if existing is not None
+                    else default_dials_work_dir(self._dials_master_path)
+                )
+            else:
+                self._dials_master_path = None
+                stem = master.stem if master.name else "dataset"
+                self._dials_work_dir = Path.home() / ".qtmosflm" / "dials" / stem
             self.dials_work_dir_edit.setText(str(self._dials_work_dir))
             # Contiguous DIALS range: hide Step; seed integrate spinboxes.
             first_1 = int(self.frame_start.value()) + 1
@@ -1047,6 +1073,7 @@ class IndexingDialog(QDialog):
         self._update_dials_range_hint()
         if self._use_dials:
             self._discover_existing_mtz()
+            self._update_summary_button_state()
 
         if app is not None and hasattr(app, "show_indexing_spots"):
             self.show_spots_checkbox.blockSignals(True)
@@ -1154,6 +1181,7 @@ class IndexingDialog(QDialog):
         self.mtz_reveal_btn.setEnabled(False)
         self.mtz_copy_btn.setEnabled(False)
         self.mtz_open_viewer_btn.setEnabled(False)
+        self.mtz_summary_btn.setEnabled(False)
 
     def _mark_pipeline_step(self, label: QLabel, done: bool, detail: str) -> None:
         mark = "●" if done else "○"
@@ -1224,25 +1252,71 @@ class IndexingDialog(QDialog):
         self.mtz_reveal_btn.setEnabled(True)
         self.mtz_copy_btn.setEnabled(True)
         self.mtz_open_viewer_btn.setEnabled(True)
+        self._update_summary_button_state()
         if switch_tab and hasattr(self, "_mtz_tab_index"):
             self.pipeline_tabs.setCurrentIndex(self._mtz_tab_index)
 
-    def _discover_existing_mtz(self) -> None:
-        """Enable the MTZ tab if ``integrated.mtz`` (or similar) already exists."""
+    def _update_summary_button_state(self) -> None:
+        """Enable Summary vs resolution when dials.integrate.log is available."""
         try:
             work = self._resolve_dials_work_dir()
         except Exception:
+            self.mtz_summary_btn.setEnabled(False)
             return
-        for name in ("integrated.mtz", "dials.mtz", "scaled.mtz"):
-            candidate = work / name
-            if candidate.is_file():
-                self._set_mtz_available(candidate, switch_tab=False)
-                self._mark_pipeline_step(
-                    self.pipeline_export_label,
-                    True,
-                    f"Export MTZ — {candidate.name} (on disk)",
-                )
-                return
+        log = work / "dials.integrate.log"
+        self.mtz_summary_btn.setEnabled(log.is_file())
+
+    def _on_show_summary_vs_resolution(self) -> None:
+        """Open the matplotlib Summary vs resolution dialog from the integrate log."""
+        try:
+            work = self._resolve_dials_work_dir()
+            dialog = open_summary_vs_resolution_from_work_dir(work, parent=self)
+            self._summary_dialog = dialog
+        except Exception as ex:
+            QMessageBox.warning(self, "Summary vs resolution", str(ex))
+
+    def _maybe_show_summary_vs_resolution(self, work_dir: Path) -> None:
+        """Auto-open Summary vs resolution after a successful integrate."""
+        try:
+            dialog = open_summary_vs_resolution_from_work_dir(work_dir, parent=self)
+            self._summary_dialog = dialog
+            self.mtz_summary_btn.setEnabled(True)
+        except Exception as ex:
+            logger.info("Summary vs resolution not shown: %s", ex)
+            self._update_summary_button_state()
+
+    def _discover_existing_mtz(self) -> None:
+        """Enable the MTZ tab if ``integrated.mtz`` (or similar) already exists."""
+        search_dirs: list[Path] = []
+        try:
+            work = self._resolve_dials_work_dir()
+            search_dirs.append(work)
+        except Exception:
+            pass
+        if self._dials_master_path is not None:
+            latest = latest_dials_run_dir(self._dials_master_path)
+            if latest is not None and latest not in search_dirs:
+                search_dirs.insert(0, latest)
+            root = dials_run_root_for_master(self._dials_master_path)
+            if root.is_dir():
+                for run in sorted(
+                    (p for p in root.glob("*-dials") if p.is_dir()),
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                ):
+                    if run not in search_dirs:
+                        search_dirs.append(run)
+        for work in search_dirs:
+            for name in ("integrated.mtz", "dials.mtz", "scaled.mtz"):
+                candidate = work / name
+                if candidate.is_file():
+                    self._set_mtz_available(candidate, switch_tab=False)
+                    self._mark_pipeline_step(
+                        self.pipeline_export_label,
+                        True,
+                        f"Export MTZ — {candidate.name} (on disk)",
+                    )
+                    return
 
     def _on_open_last_dials_log(self) -> None:
         log_path = self._last_dials_log
@@ -2393,6 +2467,7 @@ class IndexingDialog(QDialog):
         if result.n_reflections is not None:
             self.log.append(f"Integrated reflections: {result.n_reflections}")
         self._update_mtz_result_ui(result)
+        self._maybe_show_summary_vs_resolution(result.work_dir)
 
     def _on_run_full_pipeline(self) -> None:
         """One-shot import → find spots → index → integrate → MTZ."""

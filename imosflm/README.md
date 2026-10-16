@@ -50,14 +50,14 @@ When the loaded dataset is an HDF5 / NeXus master, Processing becomes a **DIALS 
 
 | UI section | Purpose |
 |------------|---------|
-| Master `.h5` + work directory | Browse / Reveal; default `~/.qtmosflm/dials/<dataset_stem>/` |
+| Master `.h5` + work directory | Browse / Reveal; default `<master_dir>/<stem>/YYYY-MM-DD-HH-MM-SS-dials/` beside the master |
 | DIALS settings | SpecEditor for `nproc`, `d_min`, min spot size, gain, known space group / unit cell (live phil preview) |
 | Frames Start/End | Contiguous 1-based DIALS image range (Step ignored) |
 | Pipeline checklist | Import → Find spots → Index/refine → Integrate → Export MTZ |
 | Step buttons | Find spots → Index → Integrate with DIALS |
 | **Run full DIALS pipeline → MTZ** | One-shot `import → find_spots → index → refine → integrate → export` |
 | Integrate first/last | Contiguous wedge passed as `scan_range` to `dials.integrate` |
-| MTZ tab | Reveal folder, Copy path, **Open in Reflection File Viewer** (ElMo) |
+| MTZ tab | Reveal / Copy / **Open in Reflection File Viewer**; **Summary vs resolution** plot from `dials.integrate.log` |
 | Progress / log | Indeterminate bar; **Show terminal** (JDXI-style live tail of `dials.session.log`); Open last `dials.*.log` |
 
 Typical interactive flow:

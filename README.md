@@ -42,7 +42,7 @@ When an HDF5 / NeXus master is opened, the Processing window becomes a DIALS pan
 2. **Index and refine** — `dials.index` (`fft3d`) with automatic refine.
 3. **Integrate and export** — `dials.integrate` (with `scan_range`) and `dials.export` → MTZ.
 
-The panel also exposes work-directory browse/reveal, DIALS settings (`nproc`, `d_min`, gain, min spot size, optional known symmetry), a pipeline checklist, **Run full pipeline → MTZ**, a JDXI-style live **Terminal** for DIALS output (**View → Show Terminal**), and post-MTZ actions (Reveal, Copy path, **Open in Reflection File Viewer** via ElMo).
+The panel also exposes work-directory browse/reveal (default `<master_dir>/<stem>/YYYY-MM-DD-HH-MM-SS-dials/` beside the HDF5 master), DIALS settings (`nproc`, `d_min`, gain, min spot size, optional known symmetry), a pipeline checklist, **Run full pipeline → MTZ**, a JDXI-style live **Terminal** for DIALS output (**View → Show Terminal**), and post-MTZ actions (Reveal, Copy path, **Open in Reflection File Viewer**, **Summary vs resolution**).
 
 Working files default to `~/.qtmosflm/dials/<dataset_stem>/`. Spot/prediction overlays update with the frame slider.
 

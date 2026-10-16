@@ -14,10 +14,47 @@ import os
 import shutil
 import subprocess
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Sequence
 
 logger = logging.getLogger(__name__)
+
+
+def dials_run_root_for_master(master_path: Path | str) -> Path:
+    """Return ``<master_dir>/<master_stem>/`` beside an HDF5 / NeXus master.
+
+    Example: ``…/Downloads/thaumatin_9_1_master.h5`` →
+    ``…/Downloads/thaumatin_9_1_master/``.
+    """
+    master = Path(master_path).expanduser().resolve()
+    return master.parent / master.stem
+
+
+def default_dials_work_dir(
+    master_path: Path | str,
+    *,
+    when: datetime | None = None,
+) -> Path:
+    """Timestamped DIALS run directory beside the master file.
+
+    Example: ``…/thaumatin_9_1_master.h5`` →
+    ``…/thaumatin_9_1_master/2026-10-15-20-30-00-dials/``.
+    """
+    stamp = (when or datetime.now()).strftime("%Y-%m-%d-%H-%M-%S")
+    return dials_run_root_for_master(master_path) / f"{stamp}-dials"
+
+
+def latest_dials_run_dir(master_path: Path | str) -> Path | None:
+    """Newest ``*-dials`` run folder under the master stem directory, if any."""
+    root = dials_run_root_for_master(master_path)
+    if not root.is_dir():
+        return None
+    runs = sorted(
+        (p for p in root.glob("*-dials") if p.is_dir()),
+        key=lambda p: p.stat().st_mtime,
+    )
+    return runs[-1] if runs else None
 
 
 def find_dials_bin(name: str = "dials.import") -> Path | None:
