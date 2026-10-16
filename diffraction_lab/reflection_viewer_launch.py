@@ -51,26 +51,29 @@ def _env_with_repo(base: dict[str, str] | None = None) -> dict[str, str]:
 
 
 def resolve_viewer_python() -> Path | None:
-    """Return an interpreter that can import the Reflection File Viewer."""
+    """Return an interpreter that can import the Reflection File Viewer.
+
+    Prefer the unresolved venv ``python`` path (not ``Path.resolve()``), because
+    resolving a venv shim to the Homebrew/framework binary drops site-packages.
+    """
     env = _env_with_repo()
-    seen: set[Path] = set()
+    seen: set[str] = set()
     for python in _python_candidates():
-        try:
-            resolved = python.resolve()
-        except OSError:
+        if not python.is_file():
             continue
-        if resolved in seen or not resolved.is_file():
+        key = str(python)
+        if key in seen:
             continue
-        seen.add(resolved)
+        seen.add(key)
         probe = subprocess.run(
-            [str(resolved), "-c", _IMPORT],
+            [key, "-c", _IMPORT],
             capture_output=True,
             text=True,
             check=False,
             env=env,
         )
         if probe.returncode == 0:
-            return resolved
+            return python
     return None
 
 

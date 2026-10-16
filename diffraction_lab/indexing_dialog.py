@@ -912,7 +912,7 @@ class IndexingDialog(QDialog):
         self.mtz_open_viewer_btn = QPushButton("Open in Reflection File Viewer")
         self.mtz_open_viewer_btn.setEnabled(False)
         self.mtz_open_viewer_btn.setToolTip(
-            "Open the MTZ in ElMo Reflection File Viewer"
+            "Open the MTZ in DiffractionLab Reflection File Viewer"
         )
         self.mtz_open_viewer_btn.clicked.connect(self._on_open_mtz_in_viewer)
         mtz_btn_row.addWidget(self.mtz_open_viewer_btn)
