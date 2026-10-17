@@ -63,6 +63,7 @@ Optional dependencies:
 
 - `pycbf` for enhanced CBF handling.
 - [PicoUI](https://github.com/markxbrooks) (`picoui`) for themed toolbar icons.
+- [SchedArray](https://github.com/markxbrooks) — SQLite job scheduler for run / log / store / retrieve of DIALS and Pointless steps (Processing **Jobs** tab). Also needs `sqlalchemy>=2` and [decologr](https://github.com/markxbrooks).
 
 ### External crystallography tools
 
@@ -70,10 +71,34 @@ Optional dependencies:
 |---|---|---|
 | MOSFLM DPS indexing | **MOSFLM** (CCP4) | Used for supported non-HDF5 datasets |
 | HDF5 / NeXus spot finding, indexing, and integration | **DIALS** (CCP4 or standalone) | Used for Eiger and other compatible HDF5 / NeXus datasets |
+| Job history / local queue | **SchedArray** (optional) | Persists CLI jobs; live logs still tailed by the Terminal viewer |
 
 DiffractionLab searches for DIALS commands on `PATH`, under `$DIALS_DIR` or `$CCP4`, and in common CCP4 installation prefixes (for example, `/Applications/ccp4-9`). Spot / prediction overlay export may use CCP4's Python when DIALS cannot be imported in the active virtual environment.
 
 Ensure that CCP4 or a standalone DIALS installation is available in your shell when using indexing or HDF5 processing.
+
+### SchedArray job backend (optional)
+
+When SchedArray is installed, DIALS and Pointless CLI steps are submitted through a **per-master** SQLite scheduler beside the HDF5 stem directory:
+
+`…/<master_stem>/schedarray_scheduler.db`
+
+Example: `thaumatin_9_1_master.h5` → `…/thaumatin_9_1_master/schedarray_scheduler.db`.
+
+Stdout is written live to the usual work-dir log files so the Terminal viewer can tail them. The Processing dialog **Jobs** tab lists, filters, cancels, and reopens those jobs (MxPanDDA Tracked Jobs UI pattern).
+
+Local monorepo install:
+
+```sh
+pip install -e ../decologr
+pip install -e ../SchedArray
+```
+
+Disable SchedArray and fall back to in-process `Popen` with:
+
+```sh
+export USE_SCHEDARRAY=false
+```
 
 ## Installation
 

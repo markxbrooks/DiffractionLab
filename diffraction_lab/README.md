@@ -51,7 +51,7 @@ Schema (`format`: `diffractionlab.session`, `version`: `1`):
 - **viewer** — `image_path`, NeXus `dataset_name`, `frame_index`, rings/spots/invert, `contrast`
 - **processing** — `backend` (`dials` / `mosflm`), `master_path`, `work_dir`, DIALS SpecEditor values, Mosflm frame/spot settings, integrate first/last, Pointless options, `mtz_path` / Pointless HKLIN·HKLOUT / last log pointers, `pipeline_tab`
 
-Paths under the Session file’s directory are stored relatively when possible. Opening a Session does **not** re-run integrate or Pointless.
+Paths under the Session file’s directory are stored relatively when possible. Opening a Session does **not** re-run DIALS or Pointless. Instead, when `work_dir` points at an existing DIALS run folder, Processing **rehydrates** Find spots / Index / Integrate / MTZ / Symmetry / Scale UI state from artifacts already on disk (`strong.refl`, `indexed.expt`, `integrated.mtz`, Pointless logs, `scaled.mtz`, …).
 
 ## Processing window
 
@@ -107,6 +107,7 @@ Tutorial flow mirrored by the engine:
 - Python 3.9+
 - `PySide6`, `numpy`, `h5py`, `fabio`, `matplotlib`, `Pillow`, OpenCV (`cv2`)
 - Optional: `pycbf`; optional [PicoUI](https://github.com/markxbrooks) for toolbar icons
+- Optional: [SchedArray](https://github.com/markxbrooks) (+ `sqlalchemy>=2`, [decologr](https://github.com/markxbrooks)) for job run / log / store / retrieve
 
 ### External tools
 
@@ -115,6 +116,9 @@ Tutorial flow mirrored by the engine:
 | Mosflm DPS | **Mosflm** (CCP4) |
 | HDF5 find-spots / index / integrate | **DIALS** (`dials.import`, …) via CCP4 or PATH |
 | Symmetry check | **Pointless** (CCP4); optional **MxLib** (subprocess fallback) |
+| Job history | **SchedArray** (optional) — Processing **Jobs** tab |
+
+When SchedArray is installed, DIALS/Pointless CLI steps are submitted to a **per-master** SQLite DB at `<master_stem>/schedarray_scheduler.db` (e.g. `…/thaumatin_9_1_master/schedarray_scheduler.db`). Logs still stream into work-dir files for the Terminal viewer. Disable with `USE_SCHEDARRAY=false`.
 
 Discovery order for DIALS: `$DIALS_DIR`, `$CCP4`, `PATH`, then common install prefixes (e.g. `/Applications/ccp4-9`). Source CCP4 in your shell before launching if tools are not on `PATH`:
 
@@ -135,6 +139,7 @@ python imosflm/qtmosflm.py
 | `pointless_runner.py` | MxLib PointlessCommand wrapper + log parse |
 | `pointless_spec.py` | SpecEditor fields for Pointless keywords |
 | `terminal_log_viewer.py` | JDXI-style dark terminal that tails DIALS logs |
+| `jobs/` | SchedArray JobService, poller, and MxPanDDA-style Jobs tab |
 | `reflection_viewer_launch.py` | Launch ElMo Reflection Viewer on an MTZ |
 | `mosflm_client.py` | Mosflm process I/O |
 | `spotfile.py` | Mosflm spotfile I/O / peak find |

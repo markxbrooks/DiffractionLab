@@ -2,7 +2,8 @@
 
 A Session is the native JSON document for Save/Open — viewer image prefs plus
 Processing pipeline paths and settings. Artifact binaries stay on disk; only
-path pointers are stored.
+path pointers are stored. On Open, Processing rehydrates Find spots through
+Scale from files under ``work_dir`` when present.
 """
 
 from __future__ import annotations

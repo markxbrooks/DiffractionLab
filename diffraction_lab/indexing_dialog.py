@@ -51,8 +51,14 @@ from diffraction_lab.dials_engine import (
     export_indexed_predictions_npz,
     export_strong_centroids_npz,
     find_dials_prefix,
+    find_pointless_artifacts,
     latest_dials_run_dir,
+    load_index_result_from_work_dir,
+    load_integration_result_from_work_dir,
+    load_scale_result_from_work_dir,
+    load_spot_result_from_work_dir,
     pick_recommended_bravais,
+    work_dir_has_report_inputs,
 )
 from diffraction_lab.dials_spec import (
     dials_settings_fields,
@@ -63,6 +69,7 @@ from diffraction_lab.pointless_runner import (
     PointlessRunResult,
     find_pointless,
     mxlib_available,
+    parse_pointless_log,
     run_pointless,
 )
 from diffraction_lab.pointless_spec import (
@@ -100,6 +107,11 @@ from diffraction_lab.mosflm_client import find_ipmosflm
 from diffraction_lab.reflection_viewer_launch import launch_reflection_viewer
 from diffraction_lab.summary_vs_resolution import open_summary_vs_resolution_from_work_dir
 from diffraction_lab.terminal_log_viewer import TerminalLogViewer
+
+try:
+    from diffraction_lab.jobs.jobs_tab import JobsTab
+except ImportError:  # pragma: no cover
+    JobsTab = None  # type: ignore[misc, assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -788,8 +800,20 @@ class IndexingDialog(QDialog):
         self._pipeline_worker: _DialsFullPipelineWorker | None = None
         self._busy_cancel_requested = False
         self._terminal_viewer: TerminalLogViewer | None = None
+        self._jobs_tab: JobsTab | None = None
         self._build_ui()
         self._populate_defaults()
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        """Refresh MTZ / report / scale enables when the dialog is shown again."""
+        super().showEvent(event)
+        if not self._use_dials:
+            return
+        try:
+            self._discover_existing_mtz()
+            self._update_post_integrate_actions_enabled()
+        except Exception:  # noqa: BLE001
+            logger.debug("showEvent post-integrate refresh skipped", exc_info=True)
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
@@ -1166,7 +1190,9 @@ class IndexingDialog(QDialog):
         mtz_btn_row.addWidget(self.mtz_summary_btn)
         self.dials_report_btn = QPushButton("DIALS report HTML")
         self.dials_report_btn.setEnabled(False)
-        self.dials_report_btn.setToolTip("Run dials.report and open dials.report.html")
+        self.dials_report_btn.setToolTip(
+            "Open dials.report.html if present, otherwise run dials.report"
+        )
         self.dials_report_btn.clicked.connect(self._on_dials_report)
         mtz_btn_row.addWidget(self.dials_report_btn)
         self.spot_counts_btn = QPushButton("Spot counts")
@@ -1322,6 +1348,16 @@ class IndexingDialog(QDialog):
         scale_layout.addStretch(1)
         self._scale_tab_index = self.pipeline_tabs.addTab(scale_page, "7. Scale")
 
+        # ----- Tab: Jobs (SchedArray history) -----
+        if JobsTab is not None:
+            self._jobs_tab = JobsTab(
+                self,
+                work_dir_provider=self._jobs_work_dir,
+                prepare_service=self._prepare_schedarray_service,
+            )
+            self._jobs_tab.open_log_requested.connect(self._on_jobs_open_log)
+            self.pipeline_tabs.addTab(self._jobs_tab, "Jobs")
+
         # ----- Shared footer -----
         self.status_label = QLabel("Ready.")
         layout.addWidget(self.status_label)
@@ -1421,6 +1457,7 @@ class IndexingDialog(QDialog):
                     if existing is not None
                     else default_dials_work_dir(self._dials_master_path)
                 )
+                self._configure_schedarray_for_master(self._dials_master_path)
             else:
                 self._dials_master_path = None
                 stem = master.stem if master.name else "dataset"
@@ -1466,6 +1503,19 @@ class IndexingDialog(QDialog):
         if self._use_dials:
             self._discover_existing_mtz()
             self._update_summary_button_state()
+            # Rehydrate pipeline if this work dir already has DIALS products.
+            try:
+                work = self._resolve_dials_work_dir()
+                if work.is_dir() and (
+                    (work / "strong.refl").is_file()
+                    or (work / "indexed.expt").is_file()
+                    or (work / "integrated.mtz").is_file()
+                ):
+                    notes = self.restore_pipeline_from_work_dir(work)
+                    if notes:
+                        logger.info("Pipeline restore: %s", "; ".join(notes))
+            except Exception as ex:  # noqa: BLE001
+                logger.debug("Pipeline restore on populate skipped: %s", ex)
 
         if app is not None and hasattr(app, "show_indexing_spots"):
             self.show_spots_checkbox.blockSignals(True)
@@ -1581,6 +1631,11 @@ class IndexingDialog(QDialog):
         self.mtz_copy_btn.setEnabled(False)
         self.mtz_open_viewer_btn.setEnabled(False)
         self.mtz_summary_btn.setEnabled(False)
+        if hasattr(self, "dials_report_btn"):
+            self.dials_report_btn.setEnabled(False)
+            self.spot_counts_btn.setEnabled(False)
+        if hasattr(self, "scale_run_btn"):
+            self.scale_run_btn.setEnabled(False)
 
     def _mark_pipeline_step(self, label: QLabel, done: bool, detail: str) -> None:
         mark = "●" if done else "○"
@@ -1592,16 +1647,41 @@ class IndexingDialog(QDialog):
         self._busy_cancel_requested = False
         if busy:
             self.progress_bar.setRange(0, 0)
+            # Show newly submitted SchedArray jobs (e.g. dials.integrate) promptly.
+            self._refresh_jobs_tab()
 
     def _on_browse_work_dir(self) -> None:
         start = self.dials_work_dir_edit.text().strip() or str(self._dials_work_dir)
         chosen = QFileDialog.getExistingDirectory(
             self, "DIALS work directory", start
         )
-        if chosen:
-            self.dials_work_dir_edit.setText(chosen)
-            self._dials_work_dir = Path(chosen)
-            self._discover_existing_mtz()
+        if not chosen:
+            return
+        self.dials_work_dir_edit.setText(chosen)
+        self._dials_work_dir = Path(chosen)
+        self._discover_existing_mtz()
+        if self._use_dials:
+            try:
+                notes = self.restore_pipeline_from_work_dir(self._dials_work_dir)
+                if notes:
+                    logger.info("Pipeline restore (browse): %s", "; ".join(notes))
+            except Exception as ex:  # noqa: BLE001
+                logger.debug("Pipeline restore on browse skipped: %s", ex)
+                self._update_post_integrate_actions_enabled()
+        try:
+            from diffraction_lab.jobs.service import (
+                configure_job_service_for_work_dir,
+                use_schedarray,
+            )
+
+            if use_schedarray():
+                configure_job_service_for_work_dir(self._dials_work_dir)
+                self._refresh_jobs_tab()
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "Could not rebind SchedArray after work-dir browse",
+                exc_info=True,
+            )
 
     def _on_reveal_work_dir(self) -> None:
         path = self._resolve_dials_work_dir()
@@ -1654,11 +1734,94 @@ class IndexingDialog(QDialog):
         self._update_summary_button_state()
         self._sync_pointless_paths_from_mtz(path)
         self._update_pointless_run_enabled()
+        # Report / scale need integrated.expt+refl (or an existing report HTML),
+        # not the MTZ alone — load them from the MTZ's work dir when present.
+        self._update_post_integrate_actions_enabled()
         parent = self.parentWidget()
         if parent is not None and hasattr(parent, "_mark_session_dirty"):
             parent._mark_session_dirty()
         if switch_tab and hasattr(self, "_mtz_tab_index"):
             self.pipeline_tabs.setCurrentIndex(self._mtz_tab_index)
+
+    def _ensure_dials_integration_from_work_dir(
+        self,
+        work_dir: Path | str | None = None,
+    ) -> DialsIntegrationResult | None:
+        """Load ``_dials_integration`` from disk when integrate artifacts exist.
+
+        :param work_dir: Preferred root to search; also tries the UI work dir
+            and the parent of the current MTZ.
+        :returns: Loaded or cached :class:`DialsIntegrationResult`, or ``None``.
+        """
+        if self._dials_integration is not None:
+            try:
+                if (
+                    self._dials_integration.experiments.is_file()
+                    and self._dials_integration.reflections.is_file()
+                ):
+                    return self._dials_integration
+            except OSError:
+                pass
+            self._dials_integration = None
+
+        roots: list[Path] = []
+        if work_dir is not None:
+            roots.append(Path(work_dir).expanduser())
+        try:
+            roots.append(self._resolve_dials_work_dir())
+        except Exception:  # noqa: BLE001
+            pass
+        if self._mtz_path is not None:
+            roots.append(self._mtz_path.parent)
+
+        seen: set[Path] = set()
+        image_range = DialsImageRange(
+            first_image=max(1, int(self.integrate_first.value())),
+            last_image=max(1, int(self.integrate_last.value())),
+        )
+        if image_range.last_image < image_range.first_image:
+            image_range = DialsImageRange(
+                image_range.last_image, image_range.first_image
+            )
+        for root in roots:
+            try:
+                key = root.resolve()
+            except OSError:
+                key = root
+            if key in seen or not root.is_dir():
+                continue
+            seen.add(key)
+            integ = load_integration_result_from_work_dir(
+                root,
+                image_range=image_range,
+                mtz_path=self._mtz_path,
+            )
+            if integ is not None:
+                self._dials_integration = integ
+                return integ
+        return None
+
+    def _update_post_integrate_actions_enabled(self) -> None:
+        """Enable report / spot-counts / scale when work-dir inputs exist."""
+        if not self._use_dials:
+            return
+        if not hasattr(self, "dials_report_btn"):
+            return
+        integ = self._ensure_dials_integration_from_work_dir()
+        scale_ok = integ is not None
+        report_ok = scale_ok
+        spot_ok = False
+        try:
+            work = self._resolve_dials_work_dir()
+            report_ok = report_ok or work_dir_has_report_inputs(work)
+            spot_ok = (work / "imported.expt").is_file() and (
+                work / "strong.refl"
+            ).is_file()
+        except Exception:  # noqa: BLE001
+            pass
+        self.scale_run_btn.setEnabled(scale_ok)
+        self.dials_report_btn.setEnabled(report_ok)
+        self.spot_counts_btn.setEnabled(spot_ok or scale_ok)
 
     def _default_pointless_hklout(self, hklin: Path | None = None) -> Path:
         """Default HKLOUT beside the work directory / HKLIN parent."""
@@ -1875,12 +2038,280 @@ class IndexingDialog(QDialog):
                 warnings.append(f"DIALS log not found: {log}")
         if not mtz_ok and state.work_dir:
             self._discover_existing_mtz()
+        # Rehydrate Find spots → Scale from work-dir artifacts (no re-run).
+        if self._use_dials:
+            try:
+                work = self._resolve_dials_work_dir()
+            except Exception:
+                work = Path(state.work_dir).expanduser() if state.work_dir else None
+            if work is not None and work.is_dir():
+                warnings.extend(
+                    self.restore_pipeline_from_work_dir(
+                        work,
+                        mtz_path=self._mtz_path,
+                        pointless_hklin=state.pointless_hklin,
+                        pointless_hklout=state.pointless_hklout,
+                    )
+                )
         tab = int(state.pipeline_tab)
         if 0 <= tab < self.pipeline_tabs.count():
             self.pipeline_tabs.setCurrentIndex(tab)
         self._update_pointless_run_enabled()
         self._update_summary_button_state()
+        self._update_post_integrate_actions_enabled()
         return warnings
+
+    def restore_pipeline_from_work_dir(
+        self,
+        work_dir: Path | str,
+        *,
+        mtz_path: Path | str | None = None,
+        pointless_hklin: str | None = None,
+        pointless_hklout: str | None = None,
+        show_overlays: bool = True,
+    ) -> list[str]:
+        """Rebuild Processing results UI from DIALS artifacts under *work_dir*.
+
+        Does not re-run jobs. Updates in-memory result holders, pipeline
+        checklist, and button enables so the user can continue from the next
+        incomplete step.
+
+        :param work_dir: DIALS run directory.
+        :param mtz_path: Preferred MTZ path (Session pointer).
+        :param pointless_hklin: Optional Pointless HKLIN from Session.
+        :param pointless_hklout: Optional Pointless HKLOUT from Session.
+        :param show_overlays: If True, redraw spot overlays when possible.
+        :returns: Human-readable notes / soft warnings.
+        """
+        notes: list[str] = []
+        root = Path(work_dir).expanduser()
+        if not root.is_dir():
+            return [f"Work directory not found for restore: {root}"]
+
+        image_range = DialsImageRange(
+            first_image=max(1, int(self.integrate_first.value())),
+            last_image=max(1, int(self.integrate_last.value())),
+        )
+        if image_range.last_image < image_range.first_image:
+            image_range = DialsImageRange(
+                image_range.last_image, image_range.first_image
+            )
+
+        # --- 2. Find spots ---
+        spots = load_spot_result_from_work_dir(root, image_range=image_range)
+        if spots is not None:
+            self._dials_spots = spots
+            self.spot_summary_label.setText(
+                f"DIALS: {spots.n_spots} strong spots on images "
+                f"{spots.image_range.first_image}–{spots.image_range.last_image} "
+                f"(restored)."
+            )
+            self._mark_pipeline_step(
+                self.pipeline_import_label,
+                True,
+                f"Import — {spots.imported_expt.name}",
+            )
+            self._mark_pipeline_step(
+                self.pipeline_spots_label,
+                True,
+                f"Find spots — {spots.strong_refl.name} ({spots.n_spots})",
+            )
+            self._remember_dials_log(root, "dials.find_spots.log")
+            notes.append(f"Restored find spots ({spots.n_spots} spots)")
+            if show_overlays:
+                try:
+                    self._show_dials_found_spots_overlay()
+                except Exception as ex:  # noqa: BLE001
+                    logger.debug("Spot overlay restore skipped: %s", ex)
+        else:
+            notes.append("No strong.refl / imported.expt to restore find spots")
+
+        # --- 3. Index (+ Bravais) ---
+        index_payload = load_index_result_from_work_dir(root)
+        if index_payload is not None:
+            indexed, bravais = index_payload
+            self._dials_index = indexed
+            self._dials_bravais = bravais
+            sol = _dials_to_index_solution(indexed)
+            n_spots = self._dials_spots.n_spots if self._dials_spots else 0
+            self._result = IndexingResult(
+                spotfile=(
+                    self._dials_spots.strong_refl
+                    if self._dials_spots
+                    else Path(".")
+                ),
+                n_spots=n_spots,
+                suggested_number=1,
+                solutions=[sol],
+                refined=[sol] if indexed.refined else [],
+                messages=[
+                    f"Restored DIALS cell {sol.a:.2f} {sol.b:.2f} {sol.c:.2f} "
+                    f"{sol.spacegroup}"
+                ],
+                geometry=self._source_geometry,
+                uses_placeholder_template=False,
+            )
+            self._mark_pipeline_step(
+                self.pipeline_index_label,
+                True,
+                f"Index — {indexed.experiments.name}"
+                + (" (refined)" if indexed.refined else ""),
+            )
+            self._remember_dials_log(root, "dials.index.log")
+            if bravais is not None and bravais.solutions:
+                try:
+                    self._fill_bravais_table(bravais)
+                    notes.append(
+                        f"Restored index + {len(bravais.solutions)} Bravais solutions"
+                    )
+                except Exception as ex:  # noqa: BLE001
+                    logger.debug("Bravais table restore skipped: %s", ex)
+                    notes.append(
+                        f"Restored index ({indexed.experiments.name}); "
+                        f"Bravais table skipped ({ex})"
+                    )
+            else:
+                notes.append(f"Restored index ({indexed.experiments.name})")
+            try:
+                self._show_dials_predictions_overlay()
+            except Exception as ex:  # noqa: BLE001
+                logger.debug("Prediction overlay restore skipped: %s", ex)
+        else:
+            notes.append("No indexed/refined experiments to restore")
+
+        # --- 4–5. Integrate + MTZ ---
+        integ = load_integration_result_from_work_dir(
+            root, image_range=image_range, mtz_path=mtz_path
+        )
+        if integ is not None:
+            self._integration_range = IntegrationImageRange(
+                first_image=integ.image_range.first_image,
+                last_image=integ.image_range.last_image,
+                selection_method="dials_restored",
+            )
+            nref = integ.n_reflections or "?"
+            self.integrate_range_label.setText(
+                self._format_integration_range(self._integration_range)
+                + f" → {integ.mtz_path.name} ({nref} reflections, restored)"
+            )
+            # Avoid auto-opening summary dialog on restore.
+            self._dials_integration = integ
+            self._set_mtz_available(integ.mtz_path, switch_tab=False)
+            self._mark_pipeline_step(
+                self.pipeline_integrate_label,
+                True,
+                f"Integrate — {integ.experiments.name}",
+            )
+            self._mark_pipeline_step(
+                self.pipeline_export_label,
+                True,
+                f"Export MTZ — {integ.mtz_path.name}",
+            )
+            self._remember_dials_log(root, "dials.integrate.log")
+            notes.append(f"Restored integrate / MTZ ({integ.mtz_path.name})")
+        else:
+            # Still try MTZ-only discovery for the MTZ tab.
+            self._discover_existing_mtz()
+            notes.append("No integrated.expt/refl+MTZ pair to restore")
+
+        # --- 6. Symmetry (Pointless) ---
+        notes.extend(
+            self._restore_pointless_from_work_dir(
+                root,
+                hklin=pointless_hklin,
+                hklout=pointless_hklout,
+            )
+        )
+
+        # --- 7. Scale ---
+        notes.extend(self._restore_scale_from_work_dir(root))
+
+        self._update_run_button_state()
+        self._update_integration_button_state()
+        self._update_pointless_run_enabled()
+        self._update_summary_button_state()
+        self._update_post_integrate_actions_enabled()
+        return notes
+
+    def _restore_pointless_from_work_dir(
+        self,
+        work_dir: Path,
+        *,
+        hklin: str | None = None,
+        hklout: str | None = None,
+    ) -> list[str]:
+        """Fill Pointless Results from an existing log / MTZ if present."""
+        notes: list[str] = []
+        found_hklin, found_hklout, log = find_pointless_artifacts(
+            work_dir, hklout=hklout, hklin=hklin
+        )
+        if found_hklin is not None:
+            self.pointless_hklin_edit.setText(str(found_hklin))
+        if found_hklout is None:
+            notes.append("No Pointless MTZ to restore")
+            return notes
+        self.pointless_hklout_edit.setText(str(found_hklout))
+        parsed = (
+            parse_pointless_log(log)
+            if log is not None and log.is_file()
+            else {
+                "space_group": None,
+                "reindex_operator": None,
+                "confidence": None,
+            }
+        )
+        result = PointlessRunResult(
+            hklin=found_hklin or found_hklout,
+            hklout=found_hklout,
+            log=log if log is not None else found_hklout,
+            space_group=parsed.get("space_group"),
+            reindex_operator=parsed.get("reindex_operator"),
+            confidence=parsed.get("confidence"),
+            command="(restored from work directory)",
+        )
+        self._pointless_result = result
+        sg = result.space_group or "—"
+        reindex = result.reindex_operator or "—"
+        conf = (
+            f"{result.confidence:.3f}"
+            if isinstance(result.confidence, (int, float))
+            else "—"
+        )
+        self.pointless_sg_label.setText(f"Space group: {sg}")
+        self.pointless_reindex_label.setText(f"Reindex operator: {reindex}")
+        self.pointless_confidence_label.setText(f"Confidence: {conf}")
+        self.pointless_reveal_log_btn.setEnabled(
+            log is not None and log.is_file()
+        )
+        self.pointless_open_mtz_btn.setEnabled(found_hklout.is_file())
+        notes.append(f"Restored Pointless → {found_hklout.name}")
+        return notes
+
+    def _restore_scale_from_work_dir(self, work_dir: Path) -> list[str]:
+        """Enable Scale tab outputs from existing scaled.* artifacts."""
+        notes: list[str] = []
+        scale = load_scale_result_from_work_dir(work_dir)
+        if scale is None:
+            notes.append("No scaled.expt/refl to restore")
+            return notes
+        self._dials_scale = scale
+        parts = [
+            f"symmetrized: {scale.symmetrized_expt.name}",
+            f"scaled: {scale.scaled_expt.name}",
+        ]
+        if scale.merged_mtz is not None:
+            parts.append(f"merged MTZ: {scale.merged_mtz}")
+        if scale.unmerged_mtz is not None:
+            parts.append(f"unmerged MTZ: {scale.unmerged_mtz}")
+        self.scale_status_label.setText("\n".join(parts) + "\n(restored)")
+        self.scale_open_html_btn.setEnabled(
+            scale.scale_html is not None and scale.scale_html.is_file()
+        )
+        self.scale_open_mtz_btn.setEnabled(
+            scale.merged_mtz is not None and scale.merged_mtz.is_file()
+        )
+        notes.append("Restored DIALS scale outputs")
+        return notes
 
     def _update_pointless_run_enabled(self) -> None:
         """Enable Run Pointless when HKLIN exists and ``pointless`` is on PATH."""
@@ -2145,6 +2576,59 @@ class IndexingDialog(QDialog):
         viewer.set_log_file(Path(log_path), reload=True)
         self._last_dials_log = Path(log_path)
         self.open_log_button.setEnabled(True)
+        self._refresh_jobs_tab()
+
+    def _jobs_work_dir(self) -> Path | None:
+        """Work directory used to filter the Jobs tab (current DIALS run)."""
+        try:
+            return self._resolve_dials_work_dir()
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _configure_schedarray_for_master(self, master_path: Path) -> None:
+        """Point SchedArray at ``<master_stem>/schedarray_scheduler.db``."""
+        try:
+            from diffraction_lab.jobs.service import (
+                configure_job_service_for_master,
+                use_schedarray,
+            )
+
+            if not use_schedarray():
+                return
+            service = configure_job_service_for_master(master_path)
+            logger.info(
+                "SchedArray DB for %s → %s",
+                master_path.name,
+                service.db_path,
+            )
+            self._refresh_jobs_tab()
+        except Exception as ex:  # noqa: BLE001
+            logger.warning("Could not configure per-master SchedArray DB: %s", ex)
+
+    def _prepare_schedarray_service(self) -> None:
+        """Rebind JobService to the current master / work-dir SchedArray DB."""
+        from diffraction_lab.jobs.service import (
+            configure_job_service_for_master,
+            configure_job_service_for_work_dir,
+            use_schedarray,
+        )
+
+        if not use_schedarray():
+            return
+        if self._dials_master_path is not None:
+            configure_job_service_for_master(self._dials_master_path)
+        else:
+            configure_job_service_for_work_dir(self._resolve_dials_work_dir())
+
+    def _on_jobs_open_log(self, log_path: object) -> None:
+        """Open a job log from the Jobs tab in the terminal viewer."""
+        path = Path(str(log_path))
+        self.follow_dials_log(path)
+
+    def _refresh_jobs_tab(self) -> None:
+        """Refresh the SchedArray Jobs tab if present."""
+        if self._jobs_tab is not None:
+            self._jobs_tab.refresh()
 
     def _begin_dials_log(self, log_name: str = "dials.session.log") -> Path:
         """Prepare work-dir log *log_name*, open terminal on it, return path."""
@@ -2180,6 +2664,7 @@ class IndexingDialog(QDialog):
         if path.is_file():
             self._last_dials_log = path
             self.open_log_button.setEnabled(True)
+        self._refresh_jobs_tab()
 
     def _update_mtz_result_ui(self, result: DialsIntegrationResult) -> None:
         self._dials_integration = result
@@ -2839,9 +3324,13 @@ class IndexingDialog(QDialog):
 
     def _on_run_dials_scale(self) -> None:
         """Run dials.symmetry → scale → merge on integrated data."""
-        if self._dials_integration is None:
+        integ = self._ensure_dials_integration_from_work_dir()
+        if integ is None:
             QMessageBox.information(
-                self, "Scale", "Integrate with DIALS first (need integrated.expt/refl)."
+                self,
+                "Scale",
+                "Need integrated.expt + integrated.refl in the DIALS work directory "
+                "(run Integrate, or point Work dir at a completed run).",
             )
             return
         self._set_busy(True)
@@ -2850,8 +3339,8 @@ class IndexingDialog(QDialog):
         session_log = self._begin_dials_log()
         self._thread = QThread(self)
         self._worker = _DialsScaleWorker(
-            self._dials_integration.experiments,
-            self._dials_integration.reflections,
+            integ.experiments,
+            integ.reflections,
             work_dir,
             self._dials_settings_from_ui(),
             on_chunk=self._session_log_chunker(session_log),
@@ -2910,6 +3399,18 @@ class IndexingDialog(QDialog):
             QMessageBox.warning(self, "Reflection File Viewer", str(ex))
 
     def _on_dials_report(self) -> None:
+        """Open existing ``dials.report.html`` if present; else run ``dials.report``."""
+        try:
+            work = self._resolve_dials_work_dir()
+        except Exception:  # noqa: BLE001
+            work = None
+        if work is not None:
+            html = work / "dials.report.html"
+            if html.is_file():
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(html)))
+                self.status_label.setText(f"Opened {html.name}")
+                self.log.append(f"DIALS report: {html}")
+                return
         self._start_dials_qa("report")
 
     def _on_dials_spot_counts(self) -> None:
@@ -2964,6 +3465,7 @@ class IndexingDialog(QDialog):
         self._set_busy(False)
         self._update_run_button_state()
         self._update_integration_button_state()
+        self._update_post_integrate_actions_enabled()
 
     def _cleanup_refine_thread(self) -> None:
         self._refine_worker = None
@@ -3578,9 +4080,7 @@ class IndexingDialog(QDialog):
             self.log.append(f"Integrated reflections: {result.n_reflections}")
         self._update_mtz_result_ui(result)
         self._maybe_show_summary_vs_resolution(result.work_dir)
-        self.scale_run_btn.setEnabled(True)
-        self.dials_report_btn.setEnabled(True)
-        self.spot_counts_btn.setEnabled(True)
+        self._update_post_integrate_actions_enabled()
 
     def _on_run_full_pipeline(self) -> None:
         """One-shot import → find spots → index → integrate → MTZ."""

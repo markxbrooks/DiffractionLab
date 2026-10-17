@@ -168,6 +168,103 @@ def _keyword_lines(
     return lines
 
 
+def _pointless_heredoc_command(
+    exe: Path,
+    hklin: Path,
+    hklout: Path,
+    *,
+    choose_space_group: bool,
+    copy_free: bool,
+    custom: str,
+    redirect_log: Path | None = None,
+) -> tuple[str, str]:
+    """Build a Pointless shell heredoc command and keyword body.
+
+    :param redirect_log: If set, append ``>> logname`` (local subprocess path).
+        When ``None``, stdout is left for SchedArray's ``output_file``.
+    :returns: ``(command_str, heredoc_body)``.
+    """
+    keywords = _keyword_lines(
+        choose_space_group=choose_space_group,
+        copy_free=copy_free,
+        custom=custom,
+    )
+    heredoc = "\n".join(keywords)
+    redirect = ""
+    if redirect_log is not None:
+        redirect = f" >> {shlex.quote(str(redirect_log.name))}"
+    command_str = (
+        f"{shlex.quote(str(exe))} HKLIN {shlex.quote(str(hklin))} "
+        f"HKLOUT {shlex.quote(str(hklout))} << EOF{redirect}\n"
+        f"{heredoc}\n"
+        f"EOF"
+    )
+    return command_str, heredoc
+
+
+def _run_via_schedarray(
+    exe: Path,
+    hklin: Path,
+    hklout: Path,
+    cwd: Path,
+    *,
+    choose_space_group: bool,
+    copy_free: bool,
+    custom: str,
+) -> PointlessRunResult:
+    """Submit Pointless to SchedArray and wait for completion."""
+    from diffraction_lab.jobs.service import configure_job_service_for_work_dir
+
+    stamp = datetime.now().strftime("%y%m%d-%H%M%S")
+    log_path = cwd / f"{stamp}-pointless.log"
+    err_path = cwd / f"{stamp}-pointless.err"
+    command_str, _ = _pointless_heredoc_command(
+        exe,
+        hklin,
+        hklout,
+        choose_space_group=choose_space_group,
+        copy_free=copy_free,
+        custom=custom,
+        redirect_log=None,
+    )
+    # Ensure pointless is on PATH inside the worker shell
+    bin_dir = shlex.quote(str(exe.parent))
+    wrapped = f'export PATH={bin_dir}:"$PATH"; {command_str}'
+    logger.info("Running Pointless (SchedArray) in %s:\n%s", cwd, command_str)
+    service = configure_job_service_for_work_dir(cwd)
+    status = service.submit_and_wait(
+        wrapped,
+        working_dir=cwd,
+        job_name="pointless",
+        output_file=log_path,
+        error_file=err_path,
+        tool="pointless",
+        step="symmetry",
+        max_retries=0,
+        poll_interval=0.5,
+    )
+    state = str(status.get("state", "")).lower()
+    if state != "completed" and not hklout.is_file():
+        raise RuntimeError(
+            f"Pointless failed via SchedArray (state={state!r}, "
+            f"exit {status.get('return_code')}). {command_str}"
+        )
+    parsed = parse_pointless_log(log_path) if log_path.is_file() else {
+        "space_group": None,
+        "reindex_operator": None,
+        "confidence": None,
+    }
+    return PointlessRunResult(
+        hklin=hklin,
+        hklout=hklout,
+        log=log_path,
+        space_group=parsed.get("space_group"),
+        reindex_operator=parsed.get("reindex_operator"),
+        confidence=parsed.get("confidence"),
+        command=command_str,
+    )
+
+
 def _run_via_subprocess(
     exe: Path,
     hklin: Path,
@@ -181,18 +278,14 @@ def _run_via_subprocess(
     """Run Pointless with a shell heredoc (no MxLib)."""
     stamp = datetime.now().strftime("%y%m%d-%H%M%S")
     log_path = cwd / f"{stamp}-pointless.log"
-    keywords = _keyword_lines(
+    command_str, _ = _pointless_heredoc_command(
+        exe,
+        hklin,
+        hklout,
         choose_space_group=choose_space_group,
         copy_free=copy_free,
         custom=custom,
-    )
-    heredoc = "\n".join(keywords)
-    # Match MxLib's shell form: pointless HKLIN … HKLOUT … << EOF >> log
-    command_str = (
-        f"{shlex.quote(str(exe))} HKLIN {shlex.quote(str(hklin))} "
-        f"HKLOUT {shlex.quote(str(hklout))} << EOF >> {shlex.quote(str(log_path.name))}\n"
-        f"{heredoc}\n"
-        f"EOF"
+        redirect_log=log_path,
     )
     env = os.environ.copy()
     bin_dir = str(exe.parent)
@@ -338,6 +431,14 @@ def run_pointless(
         "copy_free": bool(copy_free),
         "custom": (custom or "").strip(),
     }
+
+    try:
+        from diffraction_lab.jobs.service import use_schedarray
+
+        if use_schedarray():
+            return _run_via_schedarray(exe, hklin, hklout, cwd, **opts)
+    except ImportError:
+        pass
 
     if mxlib_available():
         try:

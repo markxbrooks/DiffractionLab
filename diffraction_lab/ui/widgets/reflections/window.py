@@ -357,6 +357,15 @@ class ReflectionViewerWindow(QMainWindow):
         self._level_spin.setValue(0)
         form.addRow("Zone level", self._level_spin)
 
+        self._expand_symmetry_cb = QCheckBox("Expand by symmetry")
+        self._expand_symmetry_cb.setChecked(True)
+        self._expand_symmetry_cb.setToolTip(
+            "Map observations into this zone with space-group operations "
+            "(and Friedel mates). Needed when a zone is sparsely observed "
+            "(e.g. h0l on a spindle-aligned 0kl-rich scan)."
+        )
+        form.addRow(self._expand_symmetry_cb)
+
         self._nz_x = QDoubleSpinBox()
         self._nz_y = QDoubleSpinBox()
         self._nz_z = QDoubleSpinBox()
@@ -680,6 +689,7 @@ class ReflectionViewerWindow(QMainWindow):
             column_label=column,
             d_min=d_min,
             d_max=d_max,
+            expand_symmetry=bool(self._expand_symmetry_cb.isChecked()),
         )
 
     def _apply_filters(self) -> None:

@@ -638,12 +638,14 @@ class DialsEngine:
         settings: DialsSettings | None = None,
         dials_bin_dir: Path | None = None,
         on_chunk: Callable[[str], None] | None = None,
+        session_id: str | None = None,
     ) -> None:
         self.settings = settings or DialsSettings()
         self.work_dir = Path(work_dir or (Path.home() / ".qtmosflm" / "dials"))
         self.work_dir.mkdir(parents=True, exist_ok=True)
         self.dials_bin_dir = dials_bin_dir or find_dials_prefix()
         self.on_chunk = on_chunk
+        self.session_id = session_id
         if self.dials_bin_dir is None:
             raise FileNotFoundError(
                 "DIALS not found. Install CCP4/DIALS or ensure dials.import is on PATH."
@@ -668,14 +670,109 @@ class DialsEngine:
     ) -> str:
         """Run a ``dials.*`` command, streaming stdout/stderr to a log file.
 
-        Chunks are written incrementally so a JDXI-style terminal viewer can
-        tail the logfile in real time. Optional *on_chunk* receives decoded
-        text as it arrives.
+        When SchedArray is enabled (``USE_SCHEDARRAY``, default on if the
+        package is installed), the command is submitted to
+        :class:`~diffraction_lab.jobs.service.JobService` so it is persisted
+        and workers write stdout live to *log_name* for
+        :class:`~diffraction_lab.terminal_log_viewer.TerminalLogViewer`.
+
+        Otherwise chunks are written incrementally via local ``Popen``.
+        Optional *on_chunk* receives decoded text as it arrives (local path
+        only; SchedArray relies on file tailing).
         """
         cmd = [str(self._exe(name)), *args]
         logger.info("Running: %s", " ".join(cmd))
+        try:
+            from diffraction_lab.jobs.service import use_schedarray
+
+            if use_schedarray():
+                return self._run_via_schedarray(
+                    name, cmd, log_name=log_name, on_chunk=on_chunk
+                )
+            logger.info(
+                "SchedArray not active (package missing or USE_SCHEDARRAY=false); "
+                "running %s via local Popen (Jobs tab will not record this step)",
+                name,
+            )
+        except ImportError:
+            logger.info(
+                "SchedArray import failed; running %s via local Popen", name
+            )
+        return self._run_local(name, cmd, log_name=log_name, on_chunk=on_chunk)
+
+    def _run_via_schedarray(
+        self,
+        name: str,
+        cmd: Sequence[str],
+        *,
+        log_name: str | None = None,
+        on_chunk: Callable[[str], None] | None = None,
+    ) -> str:
+        """Submit *cmd* through SchedArray and wait for completion."""
+        import shlex
+
+        from diffraction_lab.jobs.service import configure_job_service_for_work_dir
+
+        log_path = (
+            self.work_dir / log_name
+            if log_name
+            else self.work_dir / f"{name}.log"
+        )
+        err_path = log_path.with_suffix(log_path.suffix + ".err")
+        # SchedArray opens output_file with mode "w", so echo the command
+        # header inside the shell command rather than pre-writing the file.
+        display = " ".join(str(c) for c in cmd)
+        quoted = " ".join(shlex.quote(str(c)) for c in cmd)
+        # Line-buffer stdout when redirected to a file so Terminal/Jobs log
+        # tailing sees output during long steps (e.g. dials.integrate).
+        shell_cmd = (
+            f"echo {shlex.quote('$ ' + display)}; "
+            f"if command -v stdbuf >/dev/null 2>&1; then "
+            f"stdbuf -oL -eL {quoted}; else {quoted}; fi"
+        )
+        step = name.replace("dials.", "", 1) if name.startswith("dials.") else name
         chunk_cb = on_chunk if on_chunk is not None else self.on_chunk
-        header = f"$ {' '.join(cmd)}\n"
+        if chunk_cb is not None:
+            chunk_cb(f"$ {display}\n")
+
+        # Per-master DB: <stem_root>/schedarray_scheduler.db
+        service = configure_job_service_for_work_dir(self.work_dir)
+        status = service.submit_and_wait(
+            shell_cmd,
+            working_dir=self.work_dir,
+            job_name=name,
+            output_file=log_path,
+            error_file=err_path,
+            tool="dials",
+            step=step,
+            session_id=getattr(self, "session_id", None),
+            max_retries=0,
+            poll_interval=0.5,
+        )
+        combined = ""
+        if log_path.is_file():
+            combined = log_path.read_text(encoding="utf-8", errors="replace")
+        state = str(status.get("state", "")).lower()
+        if state != "completed":
+            rc = status.get("return_code")
+            tail = "\n".join(combined.strip().splitlines()[-40:])
+            raise RuntimeError(
+                f"{name} failed via SchedArray "
+                f"(state={state!r}, exit {rc}). Last output:\n{tail}"
+            )
+        return combined
+
+    def _run_local(
+        self,
+        name: str,
+        cmd: Sequence[str],
+        *,
+        log_name: str | None = None,
+        on_chunk: Callable[[str], None] | None = None,
+    ) -> str:
+        """Run *cmd* with local ``Popen``, streaming to a log file."""
+        chunk_cb = on_chunk if on_chunk is not None else self.on_chunk
+        header = f"$ {' '.join(str(c) for c in cmd)}\n"
         log_path = self.work_dir / log_name if log_name else None
         if log_path is not None:
             log_path.write_text(header, encoding="utf-8")
@@ -684,7 +781,7 @@ class DialsEngine:
 
         chunks: list[str] = [header]
         proc = subprocess.Popen(
-            cmd,
+            list(cmd),
             cwd=str(self.work_dir),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -1201,3 +1298,269 @@ class DialsEngine:
                 image_range=image_range,
             )
         return spots, indexed, integ
+
+
+# ---------------------------------------------------------------------------
+# Session / work-dir rehydration (no DIALS re-run)
+# ---------------------------------------------------------------------------
+
+
+def load_spot_result_from_work_dir(
+    work_dir: Path | str,
+    *,
+    image_range: DialsImageRange | None = None,
+) -> DialsSpotFindingResult | None:
+    """Rebuild :class:`DialsSpotFindingResult` from ``imported.expt`` + ``strong.refl``.
+
+    :param work_dir: DIALS run directory.
+    :param image_range: Optional wedge (defaults to ``1…1`` if unknown).
+    :returns: Result or ``None`` if required files are missing.
+    """
+    root = Path(work_dir)
+    imported = root / "imported.expt"
+    strong = root / "strong.refl"
+    if not imported.is_file() or not strong.is_file():
+        return None
+    n_spots = count_strong_spots(strong)
+    centroids: Path | None = None
+    for candidate in (
+        root / "strong_centroids.npz",
+        root / "centroids.npz",
+    ):
+        if candidate.is_file():
+            centroids = candidate
+            break
+    if centroids is None:
+        try:
+            centroids = export_strong_centroids_npz(strong)
+        except Exception as ex:  # noqa: BLE001
+            logger.debug("Could not export centroids while rehydrating: %s", ex)
+    rng = image_range or DialsImageRange(1, 1)
+    log_text = ""
+    log_path = root / "dials.find_spots.log"
+    if log_path.is_file():
+        log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    return DialsSpotFindingResult(
+        work_dir=root,
+        imported_expt=imported,
+        strong_refl=strong,
+        n_spots=n_spots,
+        image_range=rng,
+        log=log_text,
+        centroids_npz=centroids,
+    )
+
+
+def _pair_expt_refl(root: Path, stem: str) -> tuple[Path, Path] | None:
+    expt = root / f"{stem}.expt"
+    refl = root / f"{stem}.refl"
+    if expt.is_file() and refl.is_file():
+        return expt, refl
+    return None
+
+
+def work_dir_has_report_inputs(work_dir: Path | str) -> bool:
+    """True when ``dials.report`` can run or ``dials.report.html`` already exists."""
+    root = Path(work_dir)
+    if (root / "dials.report.html").is_file():
+        return True
+    for stem in ("integrated", "refined", "indexed"):
+        if _pair_expt_refl(root, stem) is not None:
+            return True
+    return False
+
+
+def work_dir_has_scale_inputs(work_dir: Path | str) -> bool:
+    """True when ``integrated.expt`` + ``integrated.refl`` exist for symmetry/scale."""
+    return _pair_expt_refl(Path(work_dir), "integrated") is not None
+
+
+def load_index_result_from_work_dir(
+    work_dir: Path | str,
+) -> tuple[DialsIndexingResult, DialsBravaisResult | None] | None:
+    """Rebuild index (+ optional Bravais) results from work-dir experiments.
+
+    Prefers ``refined`` → ``reindexed`` → ``indexed`` experiment pairs.
+
+    :returns: ``(indexed, bravais_or_none)`` or ``None`` if no pair exists.
+    """
+    root = Path(work_dir)
+    pair = None
+    refined = False
+    for stem, is_refined in (
+        ("refined", True),
+        ("reindexed", True),
+        ("indexed", False),
+    ):
+        pair = _pair_expt_refl(root, stem)
+        if pair is not None:
+            refined = is_refined or stem != "indexed"
+            break
+    if pair is None:
+        return None
+    experiments, reflections = pair
+    try:
+        solution = parse_crystal_from_expt(experiments)
+    except Exception as ex:  # noqa: BLE001
+        logger.warning("Could not parse crystal from %s: %s", experiments, ex)
+        solution = DialsCrystalSolution(
+            a=0.0,
+            b=0.0,
+            c=0.0,
+            alpha=90.0,
+            beta=90.0,
+            gamma=90.0,
+            spacegroup="P1",
+        )
+    indexed_pair = _pair_expt_refl(root, "indexed")
+    predictions = None
+    for name in ("predictions.npz", "indexed_predictions.npz"):
+        cand = root / name
+        if cand.is_file():
+            predictions = cand
+            break
+    log_text = ""
+    for log_name in ("dials.refine.log", "dials.index.log"):
+        log_path = root / log_name
+        if log_path.is_file():
+            log_text = log_path.read_text(encoding="utf-8", errors="replace")
+            break
+    indexed = DialsIndexingResult(
+        work_dir=root,
+        experiments=experiments,
+        reflections=reflections,
+        solution=solution,
+        refined=refined,
+        log=log_text,
+        predictions_npz=predictions,
+        indexed_expt=indexed_pair[0] if indexed_pair else None,
+        indexed_refl=indexed_pair[1] if indexed_pair else None,
+    )
+    bravais: DialsBravaisResult | None = None
+    summary = root / "bravais_summary.json"
+    if summary.is_file():
+        try:
+            solutions = parse_bravais_summary(summary, work_dir=root)
+            bravais_log = root / "dials.refine_bravais_settings.log"
+            bravais = DialsBravaisResult(
+                work_dir=root,
+                summary_json=summary,
+                solutions=solutions,
+                log=(
+                    bravais_log.read_text(encoding="utf-8", errors="replace")
+                    if bravais_log.is_file()
+                    else ""
+                ),
+            )
+        except Exception as ex:  # noqa: BLE001
+            logger.warning("Could not rehydrate Bravais summary: %s", ex)
+    return indexed, bravais
+
+
+def load_integration_result_from_work_dir(
+    work_dir: Path | str,
+    *,
+    image_range: DialsImageRange | None = None,
+    mtz_path: Path | str | None = None,
+) -> DialsIntegrationResult | None:
+    """Rebuild :class:`DialsIntegrationResult` from integrated experiments + MTZ."""
+    root = Path(work_dir)
+    pair = _pair_expt_refl(root, "integrated")
+    if pair is None:
+        return None
+    experiments, reflections = pair
+    mtz: Path | None = Path(mtz_path) if mtz_path else None
+    if mtz is None or not mtz.is_file():
+        for name in ("integrated.mtz", "dials.mtz", "scaled.mtz"):
+            cand = root / name
+            if cand.is_file():
+                mtz = cand
+                break
+    if mtz is None or not mtz.is_file():
+        return None
+    n_ref = count_strong_spots(reflections) or None
+    log_text = ""
+    log_path = root / "dials.integrate.log"
+    if log_path.is_file():
+        log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    return DialsIntegrationResult(
+        work_dir=root,
+        experiments=experiments,
+        reflections=reflections,
+        mtz_path=mtz,
+        image_range=image_range or DialsImageRange(1, 1),
+        n_reflections=n_ref,
+        log=log_text,
+    )
+
+
+def load_scale_result_from_work_dir(
+    work_dir: Path | str,
+) -> DialsScaleResult | None:
+    """Rebuild :class:`DialsScaleResult` when ``scaled.expt`` / ``scaled.refl`` exist."""
+    root = Path(work_dir)
+    scaled = _pair_expt_refl(root, "scaled")
+    if scaled is None:
+        return None
+    scaled_expt, scaled_refl = scaled
+    sym = _pair_expt_refl(root, "symmetrized")
+    # Symmetrized may be missing on older runs; fall back to scaled paths.
+    if sym is None:
+        sym_expt, sym_refl = scaled_expt, scaled_refl
+    else:
+        sym_expt, sym_refl = sym
+    merged = None
+    for name in ("scaled.mtz", "merged.mtz"):
+        cand = root / name
+        if cand.is_file():
+            merged = cand
+            break
+    unmerged = _optional_file(root / "scaled_unmerged.mtz")
+    return DialsScaleResult(
+        work_dir=root,
+        symmetrized_expt=sym_expt,
+        symmetrized_refl=sym_refl,
+        scaled_expt=scaled_expt,
+        scaled_refl=scaled_refl,
+        merged_mtz=merged,
+        unmerged_mtz=unmerged,
+        symmetry_html=_optional_file(root / "dials.symmetry.html"),
+        scale_html=_optional_file(root / "dials.scale.html"),
+        log="",
+    )
+
+
+def find_pointless_artifacts(
+    work_dir: Path | str,
+    *,
+    hklout: Path | str | None = None,
+    hklin: Path | str | None = None,
+) -> tuple[Path | None, Path | None, Path | None]:
+    """Locate Pointless HKLIN / HKLOUT / log under *work_dir*.
+
+    :returns: ``(hklin, hklout, log)`` — any may be ``None``.
+    """
+    root = Path(work_dir)
+    out = Path(hklout).expanduser() if hklout else None
+    if out is not None and not out.is_file():
+        out = None
+    if out is None:
+        for pattern in ("*pointless.mtz", "pointless.mtz"):
+            matches = sorted(root.glob(pattern), key=lambda p: p.stat().st_mtime)
+            if matches:
+                out = matches[-1]
+                break
+    log: Path | None = None
+    logs = sorted(root.glob("*pointless.log"), key=lambda p: p.stat().st_mtime)
+    if logs:
+        log = logs[-1]
+    inp = Path(hklin).expanduser() if hklin else None
+    if inp is not None and not inp.is_file():
+        inp = None
+    if inp is None:
+        for name in ("integrated.mtz", "dials.mtz", "scaled.mtz"):
+            cand = root / name
+            if cand.is_file() and (out is None or cand.resolve() != out.resolve()):
+                inp = cand
+                break
+    return inp, out, log
