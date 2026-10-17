@@ -34,9 +34,28 @@ Optional flags:
 - Live readout: resolution, `beam_x` / `beam_y`, pixel coordinates, two-theta
 - **Show indexing spots** — overlay from the Index window on the current frame
 
+## Session (`.dlsession`)
+
+DiffractionLab saves a **native JSON Session** (not iMosflm `.mos`). The file stores viewer prefs and Processing paths/settings; DIALS/Mosflm binaries stay on disk as path pointers.
+
+| Command | Shortcut | Purpose |
+|---------|----------|---------|
+| **New Session** | `Ctrl+N` | Clear viewer and Processing |
+| **Open Session…** | `Ctrl+Shift+O` | Load a `.dlsession` (or session JSON) |
+| **Save Session** | `Ctrl+S` | Write to the current Session path |
+| **Save Session As…** | `Ctrl+Shift+S` | Choose a new `.dlsession` path |
+| Open Recent Session | — | QSettings list of recent Session files |
+
+Schema (`format`: `diffractionlab.session`, `version`: `1`):
+
+- **viewer** — `image_path`, NeXus `dataset_name`, `frame_index`, rings/spots/invert, `contrast`
+- **processing** — `backend` (`dials` / `mosflm`), `master_path`, `work_dir`, DIALS SpecEditor values, Mosflm frame/spot settings, integrate first/last, Pointless options, `mtz_path` / Pointless HKLIN·HKLOUT / last log pointers, `pipeline_tab`
+
+Paths under the Session file’s directory are stored relatively when possible. Opening a Session does **not** re-run integrate or Pointless.
+
 ## Processing window
 
-Open via **Process…** (toolbar, Process menu, or `Ctrl+I`). Pipeline steps are tabs: **Setup → Find spots → Index → Integrate → MTZ**.
+Open via **Process…** (toolbar, Process menu, or `Ctrl+I`). Pipeline steps are tabs: **Setup → Find spots → Index → Integrate → MTZ → Symmetry → Scale**.
 
 ### Mosflm path (CBF and similar)
 
@@ -54,11 +73,14 @@ When the loaded dataset is an HDF5 / NeXus master, Processing becomes a **DIALS 
 | DIALS settings | SpecEditor for `nproc`, `d_min`, min spot size, gain, known space group / unit cell (live phil preview) |
 | Frames Start/End | Contiguous 1-based DIALS image range (Step ignored) |
 | Pipeline checklist | Import → Find spots → Index/refine → Integrate → Export MTZ |
-| Step buttons | Find spots → Index → Integrate with DIALS |
-| **Run full DIALS pipeline → MTZ** | One-shot `import → find_spots → index → refine → integrate → export` |
+| Step buttons | Find spots → Index (+ Bravais) → Apply lattice → Integrate |
+| **Run full DIALS pipeline → MTZ** | `import → find_spots → index → refine_bravais_settings → reindex/refine → integrate → export` |
 | Integrate first/last | Contiguous wedge passed as `scan_range` to `dials.integrate` |
-| MTZ tab | Reveal / Copy / **Open in Reflection File Viewer**; **Summary vs resolution** plot from `dials.integrate.log` |
-| Progress / log | Indeterminate bar; **Show terminal** (JDXI-style live tail of `dials.session.log`); Open last `dials.*.log` |
+| MTZ tab | Reveal / Copy / Reflection Viewer; Summary vs resolution; **DIALS report HTML**; **Spot counts** |
+| Symmetry tab | CCP4 **Pointless** on the integrated MTZ (optional; leave Copy Free off for scoring) |
+| Scale tab | Dual-space **`dials.symmetry` → `dials.scale` → `dials.merge`**; open scale HTML / merged MTZ |
+| Progress / log | Indeterminate bar; **Show terminal**; Open last `dials.*.log` |
+| Index extras | Bravais table (* recommended); Apply selected lattice; **Reciprocal lattice…** (`dials.reciprocal_lattice_viewer`) |
 
 Typical interactive flow:
 
@@ -66,9 +88,10 @@ Typical interactive flow:
 2. **Process…** (`Ctrl+I`)  
 3. Adjust work dir / settings / image wedge on the **Setup** tab  
 4. **Find spots** → check overlays on the image  
-5. **Index** → inspect cell in the table  
+5. **Index** → review Bravais table → **Apply selected lattice** (or use full pipeline auto-pick)  
 6. **Integrate** (or **Run full pipeline**)  
-7. **MTZ** tab → **Open in Reflection File Viewer**  
+7. **MTZ** tab → Reflection Viewer / DIALS report  
+8. **Symmetry** (Pointless) and/or **Scale** (`dials.symmetry` → `scale` → `merge`)  
 
 DIALS stdout streams live into a JDXI Editor-like **Terminal** window (dark monospace viewer with fast/slow refresh). It opens automatically when a DIALS step starts, or via **View → Show Terminal** (`Ctrl+\``) / **Show terminal** in Processing.
 
@@ -91,6 +114,7 @@ Tutorial flow mirrored by the engine:
 |------|------|
 | Mosflm DPS | **Mosflm** (CCP4) |
 | HDF5 find-spots / index / integrate | **DIALS** (`dials.import`, …) via CCP4 or PATH |
+| Symmetry check | **Pointless** (CCP4); optional **MxLib** (subprocess fallback) |
 
 Discovery order for DIALS: `$DIALS_DIR`, `$CCP4`, `PATH`, then common install prefixes (e.g. `/Applications/ccp4-9`). Source CCP4 in your shell before launching if tools are not on `PATH`:
 
@@ -103,10 +127,13 @@ python imosflm/qtmosflm.py
 
 | Module | Role |
 |--------|------|
-| `qtmosflm.py` | Main window / image viewer |
+| `qtmosflm.py` | Main window / image viewer + Session File menu |
+| `session/` | Native `.dlsession` model, JSON I/O, path relativize/resolve |
 | `image_canvas.py` | Zoomable diffraction canvas & overlays |
-| `indexing_dialog.py` | Index UI (Mosflm + DIALS HDF5→MTZ panel) |
-| `dials_engine.py` | DIALS subprocess pipeline + `.npz` caches |
+| `indexing_dialog.py` | Processing UI (Mosflm + DIALS HDF5→MTZ + Pointless Symmetry) |
+| `dials_engine.py` | DIALS CLI pipeline (incl. Bravais/reindex, symmetry/scale/merge, report) |
+| `pointless_runner.py` | MxLib PointlessCommand wrapper + log parse |
+| `pointless_spec.py` | SpecEditor fields for Pointless keywords |
 | `terminal_log_viewer.py` | JDXI-style dark terminal that tails DIALS logs |
 | `reflection_viewer_launch.py` | Launch ElMo Reflection Viewer on an MTZ |
 | `mosflm_client.py` | Mosflm process I/O |

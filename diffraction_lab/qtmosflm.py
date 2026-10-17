@@ -51,6 +51,14 @@ from PySide6.QtCore import Qt, QSettings, QSize
 from diffraction_lab.image_canvas import DiffractionImageCanvas, build_resolution_rings
 from diffraction_lab.indexing import IndexingGeometry, as_float
 from diffraction_lab.indexing_dialog import IndexingDialog
+from diffraction_lab.session import (
+    DiffractionLabSession,
+    ViewerState,
+    load_session,
+    save_session,
+)
+from diffraction_lab.session.io import SESSION_SUFFIX
+from diffraction_lab.session.model import ProcessingState
 
 from PIL import Image, ImageOps
 import fabio  # Import FabIO
@@ -595,6 +603,58 @@ class RecentFilesManager:
         self._write([])
 
 
+class RecentSessionsManager:
+    """Persist recently opened Session paths in ``QSettings``."""
+
+    MAX_RECENT = 10
+    ORG = "DiffractionLab"
+    APP = "preferences"
+    KEY = "recent_sessions"
+
+    def __init__(self) -> None:
+        self._settings = QSettings(self.ORG, self.APP)
+
+    def _read(self) -> list[str]:
+        raw = self._settings.value(self.KEY)
+        if raw is None or raw == "":
+            return []
+        if isinstance(raw, list):
+            return [str(p) for p in raw if p and str(p).strip()]
+        if isinstance(raw, str):
+            return [raw] if raw.strip() else []
+        try:
+            return [str(p) for p in raw if p and str(p).strip()]
+        except TypeError:
+            return []
+
+    def _write(self, paths: list[str]) -> None:
+        self._settings.setValue(self.KEY, paths)
+        self._settings.sync()
+
+    def add(self, file_path: str | Path) -> None:
+        """Move *file_path* to the front of the recent sessions list."""
+        if not file_path:
+            return
+        resolved = str(Path(file_path).expanduser().resolve())
+        paths = self._read()
+        if resolved in paths:
+            paths.remove(resolved)
+        paths.insert(0, resolved)
+        self._write(paths[: self.MAX_RECENT])
+
+    def get(self) -> list[str]:
+        """Return existing recent session paths, pruning missing entries."""
+        paths = self._read()
+        existing = [p for p in paths if Path(p).exists()]
+        if len(existing) != len(paths):
+            self._write(existing)
+        return existing
+
+    def clear(self) -> None:
+        """Clear the recent-sessions list."""
+        self._write([])
+
+
 class IMosflmApp(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -620,6 +680,9 @@ class IMosflmApp(QMainWindow):
         self.show_rings = True  # Default to showing rings
         self.show_indexing_spots = True
         self._recent_files = RecentFilesManager()
+        self._recent_sessions = RecentSessionsManager()
+        self._session_path: Path | None = None
+        self._session_dirty = False
         self._indexing_dialog: IndexingDialog | None = None
         self._indexing_spot_overlay: list[tuple[float, float, bool]] | None = None
         self._indexing_solution = None
@@ -649,6 +712,31 @@ class IMosflmApp(QMainWindow):
         self._act_open.setShortcut("Ctrl+O")
         self._act_open.setStatusTip("Open a diffraction image or HDF5 dataset")
         self._act_open.triggered.connect(self.open_file)
+
+        self._act_new_session = QAction("&New Session", self)
+        self._act_new_session.setShortcut("Ctrl+N")
+        self._act_new_session.setStatusTip("Clear the viewer and start a new Session")
+        self._act_new_session.triggered.connect(self.new_session)
+
+        self._act_open_session = QAction("Open &Session…", self)
+        self._act_open_session.setShortcut("Ctrl+Shift+O")
+        self._act_open_session.setStatusTip(
+            "Open a DiffractionLab Session (.dlsession)"
+        )
+        self._act_open_session.triggered.connect(self.open_session_dialog)
+
+        self._act_save_session = QAction("&Save Session", self)
+        self._act_save_session.setShortcut("Ctrl+S")
+        self._act_save_session.setStatusTip("Save the current Session")
+        self._act_save_session.setEnabled(False)
+        self._act_save_session.triggered.connect(self.save_session_action)
+
+        self._act_save_session_as = QAction("Save Session &As…", self)
+        self._act_save_session_as.setShortcut("Ctrl+Shift+S")
+        self._act_save_session_as.setStatusTip(
+            "Save the current Session under a new name"
+        )
+        self._act_save_session_as.triggered.connect(self.save_session_as_action)
 
         self._act_reload = QAction(
             _registry_icon(_icon_key("MDI_REFRESH", _icon_key("REFRESH"))),
@@ -775,12 +863,23 @@ class IMosflmApp(QMainWindow):
     def _build_menus(self) -> None:
         """Build File / Process menus with IconRegistry actions."""
         file_menu = self.menuBar().addMenu("&File")
+        file_menu.addAction(self._act_new_session)
         file_menu.addAction(self._act_open)
         self._recent_menu = QMenu("Open &Recent", self)
         file_menu.addMenu(self._recent_menu)
         self._recent_menu.aboutToShow.connect(self._refresh_recent_files_menu)
         self._refresh_recent_files_menu()
         file_menu.addAction(self._act_reload)
+        file_menu.addSeparator()
+        file_menu.addAction(self._act_open_session)
+        self._recent_sessions_menu = QMenu("Open Recent &Session", self)
+        file_menu.addMenu(self._recent_sessions_menu)
+        self._recent_sessions_menu.aboutToShow.connect(
+            self._refresh_recent_sessions_menu
+        )
+        self._refresh_recent_sessions_menu()
+        file_menu.addAction(self._act_save_session)
+        file_menu.addAction(self._act_save_session_as)
         file_menu.addSeparator()
         file_menu.addAction(self._act_invert)
         file_menu.addAction(self._act_histogram)
@@ -831,6 +930,300 @@ class IMosflmApp(QMainWindow):
         self._recent_files.clear()
         self._refresh_recent_files_menu()
         self.statusBar().showMessage("Recent files cleared.", 3000)
+
+    def _refresh_recent_sessions_menu(self) -> None:
+        """Rebuild the Open Recent Session submenu from persisted paths."""
+        self._recent_sessions_menu.clear()
+        paths = self._recent_sessions.get()
+        if not paths:
+            empty = QAction("(No recent sessions)", self)
+            empty.setEnabled(False)
+            self._recent_sessions_menu.addAction(empty)
+            return
+        for index, path in enumerate(paths):
+            label = path if len(path) < 80 else f"…{path[-77:]}"
+            if index < 9:
+                label = f"&{index + 1}  {label}"
+            action = QAction(label, self)
+            action.setStatusTip(path)
+            action.triggered.connect(
+                lambda checked=False, p=path: self.open_session_path(p)
+            )
+            self._recent_sessions_menu.addAction(action)
+        self._recent_sessions_menu.addSeparator()
+        clear_action = QAction("Clear Recent Sessions", self)
+        clear_action.triggered.connect(self._clear_recent_sessions)
+        self._recent_sessions_menu.addAction(clear_action)
+
+    def _clear_recent_sessions(self) -> None:
+        """Clear persisted recent sessions and refresh the submenu."""
+        self._recent_sessions.clear()
+        self._refresh_recent_sessions_menu()
+        self.statusBar().showMessage("Recent sessions cleared.", 3000)
+
+    def _mark_session_dirty(self) -> None:
+        """Mark the Session as modified and update Save enablement / title."""
+        self._session_dirty = True
+        self._update_session_actions()
+
+    def _update_session_actions(self) -> None:
+        """Enable Save when a session path is known; refresh window title."""
+        self._act_save_session.setEnabled(self._session_path is not None)
+        title = "DiffractionLab"
+        if self._session_path is not None:
+            title = f"DiffractionLab — {self._session_path.name}"
+            if self._session_dirty:
+                title += " *"
+        elif self._session_dirty:
+            title = "DiffractionLab *"
+        self.setWindowTitle(title)
+
+    def to_viewer_state(self) -> ViewerState:
+        """Capture viewer prefs into a :class:`ViewerState` for Session save."""
+        dataset_name = None
+        if hasattr(self, "dataset_combo") and self.dataset_combo.count():
+            dataset_name = self.dataset_combo.currentText() or None
+        frame_index = 0
+        if hasattr(self, "frame_slider"):
+            frame_index = int(self.frame_slider.value())
+        contrast = 100
+        if hasattr(self, "contrast_slider"):
+            contrast = int(self.contrast_slider.value())
+        return ViewerState(
+            image_path=str(self.current_file) if self.current_file else None,
+            dataset_name=dataset_name,
+            frame_index=frame_index,
+            show_rings=bool(self.show_rings),
+            show_indexing_spots=bool(self.show_indexing_spots),
+            image_inverted=bool(self.image_inverted),
+            contrast=contrast,
+        )
+
+    def apply_viewer_state(self, state: ViewerState) -> list[str]:
+        """Apply viewer prefs from *state* (image must already be loaded).
+
+        :returns: Warnings for missing or skipped fields.
+        """
+        warnings: list[str] = []
+        if state.dataset_name and hasattr(self, "dataset_combo"):
+            idx = self.dataset_combo.findText(state.dataset_name)
+            if idx >= 0:
+                self.dataset_combo.setCurrentIndex(idx)
+            else:
+                warnings.append(f"Dataset not found: {state.dataset_name}")
+        if hasattr(self, "frame_slider") and self.num_frames > 0:
+            frame = max(0, min(int(state.frame_index), self.num_frames - 1))
+            self.frame_slider.setValue(frame)
+        if hasattr(self, "contrast_slider"):
+            contrast = max(50, min(300, int(state.contrast)))
+            self.contrast_slider.setValue(contrast)
+        if bool(state.image_inverted) != bool(self.image_inverted):
+            # invert_image toggles; call only when needed
+            if hasattr(self, "invert_image"):
+                self.invert_image()
+            else:
+                self.image_inverted = bool(state.image_inverted)
+        self.show_rings = bool(state.show_rings)
+        if hasattr(self, "rings_checkbox"):
+            self.rings_checkbox.blockSignals(True)
+            self.rings_checkbox.setChecked(self.show_rings)
+            self.rings_checkbox.blockSignals(False)
+        if hasattr(self, "_act_rings"):
+            self._act_rings.blockSignals(True)
+            self._act_rings.setChecked(self.show_rings)
+            self._act_rings.blockSignals(False)
+        if hasattr(self, "image_canvas"):
+            self.image_canvas.set_rings_visible(self.show_rings)
+        self.show_indexing_spots = bool(state.show_indexing_spots)
+        if hasattr(self, "_act_indexing_spots"):
+            self._act_indexing_spots.blockSignals(True)
+            self._act_indexing_spots.setChecked(self.show_indexing_spots)
+            self._act_indexing_spots.blockSignals(False)
+        if hasattr(self, "image_canvas"):
+            self.image_canvas.set_spots_visible(self.show_indexing_spots)
+        return warnings
+
+    def gather_session(self) -> DiffractionLabSession:
+        """Build a :class:`DiffractionLabSession` from the current UI."""
+        processing: ProcessingState | None = None
+        if self._indexing_dialog is not None:
+            processing = self._indexing_dialog.to_processing_state()
+        return DiffractionLabSession(
+            viewer=self.to_viewer_state(),
+            processing=processing,
+        )
+
+    def new_session(self) -> None:
+        """Clear viewer and Processing; start an untitled Session."""
+        if self._session_dirty and self._session_path is not None:
+            reply = QMessageBox.question(
+                self,
+                "New Session",
+                "Discard unsaved Session changes?",
+                QMessageBox.StandardButton.Discard
+                | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if reply != QMessageBox.StandardButton.Discard:
+                return
+        self._close_indexing_dialog()
+        self._clear_viewer()
+        self._session_path = None
+        self._session_dirty = False
+        self._update_session_actions()
+        self.statusBar().showMessage("New Session.", 3000)
+
+    def _close_indexing_dialog(self) -> None:
+        """Close and discard the Processing dialog if open."""
+        dialog = self._indexing_dialog
+        if dialog is None:
+            return
+        dialog.close()
+        dialog.deleteLater()
+        self._indexing_dialog = None
+
+    def _clear_viewer(self) -> None:
+        """Unload the current image / HDF5 dataset from the viewer."""
+        self.current_file = None
+        self.current_image = None
+        self._raw_frame = None
+        self.dataset = None
+        self._h5_master = None
+        self._h5_data = None
+        self._external_data_paths = {}
+        self.num_frames = 0
+        self.beam_center = None
+        self.beam_x = None
+        self.beam_y = None
+        self.incident_wavelength = None
+        self._indexing_spot_overlay = None
+        self._indexing_solution = None
+        self.image_inverted = False
+        if hasattr(self, "dataset_combo"):
+            self.dataset_combo.blockSignals(True)
+            self.dataset_combo.clear()
+            self.dataset_combo.blockSignals(False)
+        if hasattr(self, "frame_slider"):
+            self.frame_slider.setMinimum(0)
+            self.frame_slider.setMaximum(0)
+            self.frame_slider.setValue(0)
+        if hasattr(self, "image_canvas"):
+            self.image_canvas.set_spot_overlay(None)
+            self.image_canvas.set_resolution_rings(None)
+            self.image_canvas.set_image_pixmap(QPixmap(), reset_view=True)
+            self.image_canvas.set_placeholder("No image loaded")
+
+    def open_session_dialog(self) -> None:
+        """Prompt for a ``.dlsession`` file and open it."""
+        start_dir = ""
+        recent = self._recent_sessions.get()
+        if recent:
+            start_dir = str(Path(recent[0]).parent)
+        elif self._recent_files.get():
+            start_dir = str(Path(self._recent_files.get()[0]).parent)
+        chosen, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open Session",
+            start_dir,
+            f"DiffractionLab Session (*{SESSION_SUFFIX} *.json);;All files (*)",
+        )
+        if chosen:
+            self.open_session_path(chosen)
+
+    def open_session_path(self, file_path: str | Path) -> None:
+        """Load a Session from *file_path* and restore viewer + Processing."""
+        path = Path(file_path).expanduser()
+        try:
+            session = load_session(path)
+        except Exception as ex:
+            QMessageBox.warning(self, "Open Session", str(ex))
+            return
+
+        warnings: list[str] = []
+        image = session.viewer.image_path
+        if image:
+            image_path = Path(image)
+            if image_path.is_file():
+                self.open_path(image_path)
+                warnings.extend(self.apply_viewer_state(session.viewer))
+            else:
+                warnings.append(f"Image not found: {image_path}")
+                self.apply_viewer_state(session.viewer)
+        else:
+            warnings.extend(self.apply_viewer_state(session.viewer))
+
+        if session.processing is not None:
+            if self.current_file is None and session.processing.master_path:
+                master = Path(session.processing.master_path)
+                if master.is_file():
+                    self.open_path(master)
+                    warnings.extend(self.apply_viewer_state(session.viewer))
+            if self.current_image is not None or self.dataset is not None:
+                self.open_indexing_dialog()
+                dialog = self._indexing_dialog
+                if dialog is not None:
+                    # Refresh defaults from the loaded image, then overlay session.
+                    dialog._populate_defaults()
+                    warnings.extend(dialog.apply_processing_state(session.processing))
+
+        self._session_path = path.resolve()
+        self._session_dirty = False
+        self._recent_sessions.add(self._session_path)
+        self._refresh_recent_sessions_menu()
+        self._update_session_actions()
+        msg = f"Opened Session {self._session_path.name}"
+        if warnings:
+            msg += f" ({len(warnings)} warning(s))"
+            self.statusBar().showMessage(msg, 8000)
+            QMessageBox.information(
+                self,
+                "Open Session",
+                msg + ":\n\n" + "\n".join(warnings[:12]),
+            )
+        else:
+            self.statusBar().showMessage(msg, 5000)
+
+    def save_session_action(self) -> None:
+        """Save to the current Session path, or prompt if untitled."""
+        if self._session_path is None:
+            self.save_session_as_action()
+            return
+        self._write_session(self._session_path)
+
+    def save_session_as_action(self) -> None:
+        """Prompt for a Session path and save."""
+        start = ""
+        if self._session_path is not None:
+            start = str(self._session_path)
+        elif self.current_file:
+            start = str(Path(self.current_file).with_suffix(SESSION_SUFFIX))
+        chosen, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Session As",
+            start,
+            f"DiffractionLab Session (*{SESSION_SUFFIX});;JSON (*.json)",
+        )
+        if not chosen:
+            return
+        path = Path(chosen)
+        if path.suffix.lower() not in (SESSION_SUFFIX, ".json"):
+            path = path.with_suffix(SESSION_SUFFIX)
+        self._write_session(path)
+
+    def _write_session(self, path: Path) -> None:
+        """Serialize the current UI to *path*."""
+        try:
+            session = self.gather_session()
+            saved = save_session(path, session)
+        except Exception as ex:
+            QMessageBox.warning(self, "Save Session", str(ex))
+            return
+        self._session_path = saved
+        self._session_dirty = False
+        self._recent_sessions.add(saved)
+        self._refresh_recent_sessions_menu()
+        self._update_session_actions()
+        self.statusBar().showMessage(f"Saved Session {saved.name}", 5000)
 
     def _build_toolbar(self) -> None:
         """Build a themed toolbar with IconRegistry actions."""
@@ -1312,6 +1705,7 @@ class IMosflmApp(QMainWindow):
             self.load_hdf5_image(file_path)
         else:
             self.display_image(file_path)
+        self._mark_session_dirty()
 
     def display_image(self, file_path):
         """ display_image """

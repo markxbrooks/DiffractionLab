@@ -1,8 +1,11 @@
 """DIALS processing pipeline for datasets Mosflm cannot open (e.g. Eiger HDF5).
 
 Mirrors the DUI tutorial flow:
-``import → find_spots → index → refine → integrate → export``
-(https://dials.github.io/documentation/tutorials/processing_in_detail_betalactamase_dui.html).
+``import → find_spots → index → refine_bravais_settings → reindex → refine
+→ integrate → export`` (+ optional ``symmetry → scale → merge`` / report).
+
+See https://dials.github.io/documentation/tutorials/processing_in_detail_betalactamase_dui.html
+and https://github.com/dials/dials/
 """
 
 from __future__ import annotations
@@ -155,6 +158,36 @@ class DialsIndexingResult:
     log: str = ""
     #: Optional ``.npz`` with predicted ``x``, ``y``, ``z`` (``xyzcal.px``).
     predictions_npz: Path | None = None
+    #: Path to triclinic ``indexed.expt`` (before Bravais / reindex).
+    indexed_expt: Path | None = None
+    indexed_refl: Path | None = None
+
+
+@dataclass
+class DialsBravaisSolution:
+    """One row from ``bravais_summary.json``."""
+
+    setting_number: int
+    bravais: str
+    unit_cell: tuple[float, float, float, float, float, float]
+    cb_op: str
+    metric_fit: float
+    rmsd: float
+    nspots: int
+    recommended: bool
+    min_cc: float | None = None
+    max_cc: float | None = None
+    experiments: Path | None = None  # bravais_setting_N.expt
+
+
+@dataclass
+class DialsBravaisResult:
+    """Result of ``dials.refine_bravais_settings``."""
+
+    work_dir: Path
+    summary_json: Path
+    solutions: list[DialsBravaisSolution]
+    log: str = ""
 
 
 @dataclass
@@ -171,6 +204,32 @@ class DialsIntegrationResult:
 
 
 @dataclass
+class DialsScaleResult:
+    """Result of ``dials.symmetry`` → ``dials.scale`` → ``dials.merge``."""
+
+    work_dir: Path
+    symmetrized_expt: Path
+    symmetrized_refl: Path
+    scaled_expt: Path
+    scaled_refl: Path
+    merged_mtz: Path | None
+    unmerged_mtz: Path | None
+    symmetry_html: Path | None = None
+    scale_html: Path | None = None
+    log: str = ""
+
+
+@dataclass
+class DialsReportResult:
+    """Result of ``dials.report`` / spot-count QA helpers."""
+
+    work_dir: Path
+    report_html: Path | None = None
+    spot_counts_json: Path | None = None
+    log: str = ""
+
+
+@dataclass
 class DialsSettings:
     """User-facing DIALS defaults for DiffractionLab."""
 
@@ -180,6 +239,7 @@ class DialsSettings:
     d_min: float | None = None
     space_group: str | None = None
     unit_cell: str | None = None  # "a,b,c,alpha,beta,gamma"
+    scan_varying: bool = False
 
 
 def auto_dials_image_range(
@@ -223,6 +283,78 @@ def _angle_deg(u: Sequence[float], v: Sequence[float]) -> float:
     dot = sum(float(a) * float(b) for a, b in zip(u, v)) / (lu * lv)
     dot = max(-1.0, min(1.0, dot))
     return math.degrees(math.acos(dot))
+
+
+def _optional_file(path: Path) -> Path | None:
+    return path if path.is_file() else None
+
+
+def _is_identity_cb_op(cb_op: str) -> bool:
+    """Return True if *cb_op* is the identity change-of-basis."""
+    normalized = (
+        cb_op.strip().lower().replace(" ", "").replace("[", "").replace("]", "")
+    )
+    return normalized in {"a,b,c", "h,k,l", ""}
+
+
+def parse_bravais_summary(
+    path: Path,
+    *,
+    work_dir: Path | None = None,
+) -> list[DialsBravaisSolution]:
+    """Parse ``bravais_summary.json`` from ``dials.refine_bravais_settings``."""
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Unexpected bravais_summary format in {path}")
+    root = Path(work_dir) if work_dir is not None else Path(path).parent
+    solutions: list[DialsBravaisSolution] = []
+    for key, item in data.items():
+        try:
+            number = int(key)
+        except (TypeError, ValueError):
+            continue
+        cell = item.get("unit_cell") or [0, 0, 0, 90, 90, 90]
+        if len(cell) != 6:
+            continue
+        setting_path = root / f"bravais_setting_{number}.expt"
+        solutions.append(
+            DialsBravaisSolution(
+                setting_number=number,
+                bravais=str(item.get("bravais") or ""),
+                unit_cell=(
+                    float(cell[0]),
+                    float(cell[1]),
+                    float(cell[2]),
+                    float(cell[3]),
+                    float(cell[4]),
+                    float(cell[5]),
+                ),
+                cb_op=str(item.get("cb_op") or "a,b,c"),
+                metric_fit=float(item.get("max_angular_difference") or 0.0),
+                rmsd=float(item.get("rmsd") or 0.0),
+                nspots=int(item.get("nspots") or 0),
+                recommended=bool(item.get("recommended")),
+                min_cc=(
+                    float(item["min_cc"]) if item.get("min_cc") is not None else None
+                ),
+                max_cc=(
+                    float(item["max_cc"]) if item.get("max_cc") is not None else None
+                ),
+                experiments=setting_path if setting_path.is_file() else None,
+            )
+        )
+    solutions.sort(key=lambda s: s.setting_number, reverse=True)
+    return solutions
+
+
+def pick_recommended_bravais(
+    solutions: Sequence[DialsBravaisSolution],
+) -> DialsBravaisSolution | None:
+    """Pick the highest-numbered recommended Bravais solution (DIALS convention)."""
+    recommended = [s for s in solutions if s.recommended]
+    if recommended:
+        return max(recommended, key=lambda s: s.setting_number)
+    return solutions[0] if solutions else None
 
 
 def parse_crystal_from_expt(path: Path) -> DialsCrystalSolution:
@@ -635,7 +767,11 @@ class DialsEngine:
         *,
         refine: bool = True,
     ) -> DialsIndexingResult:
-        """Run ``dials.index`` and optionally ``dials.refine``."""
+        """Run ``dials.index`` and optionally ``dials.refine``.
+
+        Prefer ``refine=False`` when following with
+        :meth:`refine_bravais_settings` (tutorial order).
+        """
         args = [
             str(imported_expt),
             str(strong_refl),
@@ -655,17 +791,11 @@ class DialsEngine:
         reflections = indexed_refl
         did_refine = False
         if refine:
-            refine_log = self._run(
-                "dials.refine",
-                [str(indexed_expt), str(indexed_refl)],
+            experiments, reflections, refine_log = self._refine_pair(
+                indexed_expt, indexed_refl
             )
             log = log + "\n" + refine_log
-            refined_expt = self.work_dir / "refined.expt"
-            refined_refl = self.work_dir / "refined.refl"
-            if refined_expt.is_file():
-                experiments = refined_expt
-                reflections = refined_refl
-                did_refine = True
+            did_refine = experiments.name.startswith("refined")
         solution = parse_crystal_from_expt(experiments)
         # Pull indexed counts from log if present.
         for line in log.splitlines():
@@ -690,7 +820,277 @@ class DialsEngine:
             refined=did_refine,
             log=log,
             predictions_npz=predictions_npz,
+            indexed_expt=indexed_expt,
+            indexed_refl=indexed_refl if indexed_refl.is_file() else None,
         )
+
+    def _refine_pair(
+        self,
+        experiments: Path,
+        reflections: Path,
+    ) -> tuple[Path, Path, str]:
+        """Run ``dials.refine``; return refined paths when written."""
+        args = [str(experiments), str(reflections)]
+        if self.settings.scan_varying:
+            args.append("scan_varying=True")
+        refine_log = self._run(
+            "dials.refine",
+            args,
+            log_name="dials.refine.log",
+        )
+        refined_expt = self.work_dir / "refined.expt"
+        refined_refl = self.work_dir / "refined.refl"
+        if refined_expt.is_file() and refined_refl.is_file():
+            return refined_expt, refined_refl, refine_log
+        return experiments, reflections, refine_log
+
+    def refine_bravais_settings(
+        self,
+        experiments: Path | None = None,
+        reflections: Path | None = None,
+    ) -> DialsBravaisResult:
+        """Run ``dials.refine_bravais_settings``; parse ``bravais_summary.json``."""
+        expt = Path(experiments or (self.work_dir / "indexed.expt"))
+        refl = Path(reflections or (self.work_dir / "indexed.refl"))
+        if not expt.is_file() or not refl.is_file():
+            raise FileNotFoundError(
+                f"Need indexed.expt/refl for Bravais settings (got {expt}, {refl})"
+            )
+        log = self._run(
+            "dials.refine_bravais_settings",
+            [str(expt), str(refl), f"nproc={self.settings.nproc}"],
+            log_name="dials.refine_bravais_settings.log",
+        )
+        summary = self.work_dir / "bravais_summary.json"
+        if not summary.is_file():
+            raise RuntimeError("dials.refine_bravais_settings did not write bravais_summary.json")
+        solutions = parse_bravais_summary(summary, work_dir=self.work_dir)
+        return DialsBravaisResult(
+            work_dir=self.work_dir,
+            summary_json=summary,
+            solutions=solutions,
+            log=log,
+        )
+
+    def apply_bravais_solution(
+        self,
+        solution: DialsBravaisSolution,
+        *,
+        indexed_expt: Path | None = None,
+        indexed_refl: Path | None = None,
+        refine: bool = True,
+    ) -> DialsIndexingResult:
+        """Reindex (if needed) + refine for a chosen Bravais solution.
+
+        Uses ``bravais_setting_N.expt`` plus ``dials.reindex`` on the triclinic
+        reflections when ``cb_op`` is not the identity ``a,b,c``.
+        """
+        expt = Path(indexed_expt or (self.work_dir / "indexed.expt"))
+        refl = Path(indexed_refl or (self.work_dir / "indexed.refl"))
+        setting_expt = solution.experiments or (
+            self.work_dir / f"bravais_setting_{solution.setting_number}.expt"
+        )
+        if not setting_expt.is_file():
+            raise FileNotFoundError(setting_expt)
+        if not refl.is_file():
+            raise FileNotFoundError(refl)
+
+        cb = (solution.cb_op or "a,b,c").strip()
+        log_parts: list[str] = []
+        if _is_identity_cb_op(cb):
+            # Reflections already match; copy/use setting experiments.
+            experiments = setting_expt
+            reflections = refl
+            log_parts.append(f"Identity cb_op ({cb}); using {setting_expt.name}")
+        else:
+            reindex_log = self._run(
+                "dials.reindex",
+                [
+                    str(setting_expt),
+                    str(refl),
+                    f"change_of_basis_op={cb}",
+                ],
+                log_name="dials.reindex.log",
+            )
+            log_parts.append(reindex_log)
+            # dials.reindex writes reindexed.expt / reindexed.refl by default
+            reindexed_expt = self.work_dir / "reindexed.expt"
+            reindexed_refl = self.work_dir / "reindexed.refl"
+            if not reindexed_expt.is_file():
+                # Some versions only rewrite reflections; keep setting expt.
+                experiments = setting_expt
+            else:
+                experiments = reindexed_expt
+            if not reindexed_refl.is_file():
+                raise RuntimeError("dials.reindex did not write reindexed.refl")
+            reflections = reindexed_refl
+
+        did_refine = False
+        if refine:
+            experiments, reflections, refine_log = self._refine_pair(
+                experiments, reflections
+            )
+            log_parts.append(refine_log)
+            did_refine = experiments.name.startswith("refined")
+
+        solution_crystal = parse_crystal_from_expt(experiments)
+        solution_crystal.lattice = solution.bravais or solution_crystal.lattice
+        predictions_npz: Path | None = None
+        try:
+            predictions_npz = export_indexed_predictions_npz(reflections)
+        except Exception as ex:  # noqa: BLE001
+            logger.warning("Could not export DIALS predictions for overlay: %s", ex)
+        return DialsIndexingResult(
+            work_dir=self.work_dir,
+            experiments=experiments,
+            reflections=reflections,
+            solution=solution_crystal,
+            refined=did_refine,
+            log="\n".join(log_parts),
+            predictions_npz=predictions_npz,
+            indexed_expt=expt if expt.is_file() else None,
+            indexed_refl=refl if refl.is_file() else None,
+        )
+
+    def symmetry_scale_merge(
+        self,
+        experiments: Path,
+        reflections: Path,
+        *,
+        d_min: float | None = None,
+    ) -> DialsScaleResult:
+        """Run ``dials.symmetry`` → ``dials.scale`` → ``dials.merge``.
+
+        Writes ``symmetrized.*``, ``scaled.*``, ``merged.mtz``, and HTML reports.
+        """
+        expt = Path(experiments)
+        refl = Path(reflections)
+        log_parts: list[str] = []
+        sym_log = self._run(
+            "dials.symmetry",
+            [str(expt), str(refl)],
+            log_name="dials.symmetry.log",
+        )
+        log_parts.append(sym_log)
+        sym_expt = self.work_dir / "symmetrized.expt"
+        sym_refl = self.work_dir / "symmetrized.refl"
+        if not sym_expt.is_file() or not sym_refl.is_file():
+            raise RuntimeError("dials.symmetry did not write symmetrized.{expt,refl}")
+
+        scale_args = [
+            str(sym_expt),
+            str(sym_refl),
+            f"nproc={self.settings.nproc}",
+            "unmerged_mtz=scaled_unmerged.mtz",
+            "merged_mtz=scaled.mtz",
+        ]
+        res = d_min if d_min is not None else self.settings.d_min
+        if res is not None and res > 0:
+            scale_args.append(f"cut_data.d_min={res:g}")
+        scale_log = self._run(
+            "dials.scale",
+            scale_args,
+            log_name="dials.scale.log",
+        )
+        log_parts.append(scale_log)
+        scaled_expt = self.work_dir / "scaled.expt"
+        scaled_refl = self.work_dir / "scaled.refl"
+        if not scaled_expt.is_file() or not scaled_refl.is_file():
+            raise RuntimeError("dials.scale did not write scaled.{expt,refl}")
+
+        merged_mtz = self.work_dir / "merged.mtz"
+        unmerged = self.work_dir / "scaled_unmerged.mtz"
+        # Prefer dials.merge when scaled.mtz was not written by scale.
+        if not (self.work_dir / "scaled.mtz").is_file():
+            merge_log = self._run(
+                "dials.merge",
+                [str(scaled_refl), str(scaled_expt)],
+                log_name="dials.merge.log",
+            )
+            log_parts.append(merge_log)
+        scaled_mtz = self.work_dir / "scaled.mtz"
+        if scaled_mtz.is_file() and not merged_mtz.is_file():
+            # Treat scale's merged_mtz as the merge product.
+            merged_mtz = scaled_mtz
+        elif not merged_mtz.is_file() and scaled_mtz.is_file():
+            merged_mtz = scaled_mtz
+
+        return DialsScaleResult(
+            work_dir=self.work_dir,
+            symmetrized_expt=sym_expt,
+            symmetrized_refl=sym_refl,
+            scaled_expt=scaled_expt,
+            scaled_refl=scaled_refl,
+            merged_mtz=merged_mtz if merged_mtz.is_file() else None,
+            unmerged_mtz=unmerged if unmerged.is_file() else None,
+            symmetry_html=_optional_file(self.work_dir / "dials.symmetry.html"),
+            scale_html=_optional_file(self.work_dir / "dials.scale.html"),
+            log="\n".join(log_parts),
+        )
+
+    def report(
+        self,
+        experiments: Path | None = None,
+        reflections: Path | None = None,
+    ) -> DialsReportResult:
+        """Run ``dials.report`` → ``dials.report.html``."""
+        expt = Path(experiments or (self.work_dir / "refined.expt"))
+        refl = Path(reflections or (self.work_dir / "refined.refl"))
+        # Prefer integrated when present.
+        if (self.work_dir / "integrated.expt").is_file():
+            expt = self.work_dir / "integrated.expt"
+            refl = self.work_dir / "integrated.refl"
+        args: list[str] = []
+        if expt.is_file():
+            args.append(str(expt))
+        if refl.is_file():
+            args.append(str(refl))
+        if not args:
+            raise FileNotFoundError("No experiments/reflections for dials.report")
+        log = self._run("dials.report", args, log_name="dials.report.log")
+        html = self.work_dir / "dials.report.html"
+        return DialsReportResult(
+            work_dir=self.work_dir,
+            report_html=html if html.is_file() else None,
+            log=log,
+        )
+
+    def spot_counts_per_image(
+        self,
+        experiments: Path | None = None,
+        reflections: Path | None = None,
+    ) -> DialsReportResult:
+        """Run ``dials.spot_counts_per_image`` (JSON plot data)."""
+        expt = Path(experiments or (self.work_dir / "imported.expt"))
+        refl = Path(reflections or (self.work_dir / "strong.refl"))
+        if not expt.is_file() or not refl.is_file():
+            raise FileNotFoundError("Need imported.expt + strong.refl for spot counts")
+        json_path = self.work_dir / "spot_counts.json"
+        log = self._run(
+            "dials.spot_counts_per_image",
+            [str(expt), str(refl), f"json={json_path.name}"],
+            log_name="dials.spot_counts_per_image.log",
+        )
+        return DialsReportResult(
+            work_dir=self.work_dir,
+            spot_counts_json=json_path if json_path.is_file() else None,
+            log=log,
+        )
+
+    def launch_reciprocal_lattice_viewer(
+        self,
+        experiments: Path | None = None,
+        reflections: Path | None = None,
+    ) -> subprocess.Popen:
+        """Start ``dials.reciprocal_lattice_viewer`` (external GUI)."""
+        expt = Path(experiments or (self.work_dir / "indexed.expt"))
+        refl = Path(reflections or (self.work_dir / "indexed.refl"))
+        args = [str(self._exe("dials.reciprocal_lattice_viewer"))]
+        if expt.is_file():
+            args.append(str(expt))
+        if refl.is_file():
+            args.append(str(refl))
+        return subprocess.Popen(args, cwd=str(self.work_dir))
 
     def integrate(
         self,
@@ -761,11 +1161,38 @@ class DialsEngine:
         *,
         refine: bool = True,
         integrate: bool = True,
+        bravais: bool = True,
     ) -> tuple[DialsSpotFindingResult, DialsIndexingResult, DialsIntegrationResult | None]:
-        """Full interactive pipeline on an HDF5 master for *image_range*."""
+        """Full interactive pipeline on an HDF5 master for *image_range*.
+
+        When *bravais* is True, runs refine_bravais_settings and applies the
+        recommended solution before the final refine / integrate.
+        """
         imported = self.import_images(master_h5)
         spots = self.find_spots(imported, image_range)
-        indexed = self.index(imported, spots.strong_refl, refine=refine)
+        indexed = self.index(
+            imported, spots.strong_refl, refine=False if bravais else refine
+        )
+        if bravais:
+            try:
+                bravais_result = self.refine_bravais_settings(
+                    indexed.indexed_expt or indexed.experiments,
+                    indexed.indexed_refl or indexed.reflections,
+                )
+                chosen = pick_recommended_bravais(bravais_result.solutions)
+                if chosen is not None:
+                    indexed = self.apply_bravais_solution(
+                        chosen,
+                        indexed_expt=indexed.indexed_expt,
+                        indexed_refl=indexed.indexed_refl,
+                        refine=refine,
+                    )
+                elif refine:
+                    indexed = self.index(imported, spots.strong_refl, refine=True)
+            except Exception as ex:  # noqa: BLE001
+                logger.warning("Bravais step failed (%s); falling back", ex)
+                if refine:
+                    indexed = self.index(imported, spots.strong_refl, refine=True)
         integ = None
         if integrate:
             integ = self.integrate(

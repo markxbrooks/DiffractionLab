@@ -34,10 +34,14 @@ from PySide6.QtWidgets import (
 )
 
 from diffraction_lab.dials_engine import (
+    DialsBravaisResult,
+    DialsBravaisSolution,
     DialsEngine,
     DialsImageRange,
     DialsIndexingResult,
     DialsIntegrationResult,
+    DialsReportResult,
+    DialsScaleResult,
     DialsSettings,
     DialsSpotFindingResult,
     auto_dials_image_range,
@@ -48,12 +52,25 @@ from diffraction_lab.dials_engine import (
     export_strong_centroids_npz,
     find_dials_prefix,
     latest_dials_run_dir,
+    pick_recommended_bravais,
 )
 from diffraction_lab.dials_spec import (
     dials_settings_fields,
     dials_settings_to_values,
     values_to_dials_settings,
 )
+from diffraction_lab.pointless_runner import (
+    PointlessRunResult,
+    find_pointless,
+    mxlib_available,
+    run_pointless,
+)
+from diffraction_lab.pointless_spec import (
+    pointless_defaults,
+    pointless_settings_fields,
+    values_to_pointless_options,
+)
+from diffraction_lab.session.model import ProcessingState
 
 try:
     from picoui.widget.spec_editor import SpecEditor
@@ -227,9 +244,9 @@ class _DialsSpotFindWorker(QObject):
 
 
 class _DialsIndexWorker(QObject):
-    """DIALS ``index`` + ``refine`` after spot finding."""
+    """DIALS ``index`` (P1) then ``refine_bravais_settings``."""
 
-    finished = Signal(object)
+    finished = Signal(object)  # tuple[DialsIndexingResult, DialsBravaisResult]
     failed = Signal(str)
     progress = Signal(str)
 
@@ -254,14 +271,144 @@ class _DialsIndexWorker(QObject):
                 on_chunk=self._on_chunk,
             )
             self.progress.emit("DIALS: indexing (fft3d)…")
-            result = engine.index(
+            indexed = engine.index(
                 self._spots.imported_expt,
                 self._spots.strong_refl,
+                refine=False,
+            )
+            self.progress.emit("DIALS: refine Bravais settings…")
+            bravais = engine.refine_bravais_settings(
+                indexed.indexed_expt or indexed.experiments,
+                indexed.indexed_refl or indexed.reflections,
+            )
+            self.finished.emit((indexed, bravais))
+        except Exception as ex:  # noqa: BLE001
+            logger.exception("DIALS indexing / Bravais failed")
+            self.failed.emit(str(ex))
+
+
+class _DialsApplyBravaisWorker(QObject):
+    """``dials.reindex`` + ``dials.refine`` for a chosen Bravais solution."""
+
+    finished = Signal(object)  # DialsIndexingResult
+    failed = Signal(str)
+    progress = Signal(str)
+
+    def __init__(
+        self,
+        solution: DialsBravaisSolution,
+        indexed: DialsIndexingResult,
+        work_dir: Path,
+        settings: DialsSettings | None = None,
+        on_chunk=None,
+    ) -> None:
+        super().__init__()
+        self._solution = solution
+        self._indexed = indexed
+        self._work_dir = work_dir
+        self._settings = settings or DialsSettings()
+        self._on_chunk = on_chunk
+
+    def run(self) -> None:
+        try:
+            engine = DialsEngine(
+                work_dir=self._work_dir,
+                settings=self._settings,
+                on_chunk=self._on_chunk,
+            )
+            self.progress.emit(
+                f"DIALS: apply Bravais #{self._solution.setting_number} "
+                f"({self._solution.bravais}, cb_op={self._solution.cb_op})…"
+            )
+            result = engine.apply_bravais_solution(
+                self._solution,
+                indexed_expt=self._indexed.indexed_expt,
+                indexed_refl=self._indexed.indexed_refl,
                 refine=True,
             )
             self.finished.emit(result)
         except Exception as ex:  # noqa: BLE001
-            logger.exception("DIALS indexing failed")
+            logger.exception("DIALS apply Bravais failed")
+            self.failed.emit(str(ex))
+
+
+class _DialsScaleWorker(QObject):
+    """``dials.symmetry`` → ``dials.scale`` → ``dials.merge``."""
+
+    finished = Signal(object)  # DialsScaleResult
+    failed = Signal(str)
+    progress = Signal(str)
+
+    def __init__(
+        self,
+        experiments: Path,
+        reflections: Path,
+        work_dir: Path,
+        settings: DialsSettings | None = None,
+        on_chunk=None,
+    ) -> None:
+        super().__init__()
+        self._experiments = experiments
+        self._reflections = reflections
+        self._work_dir = work_dir
+        self._settings = settings or DialsSettings()
+        self._on_chunk = on_chunk
+
+    def run(self) -> None:
+        try:
+            engine = DialsEngine(
+                work_dir=self._work_dir,
+                settings=self._settings,
+                on_chunk=self._on_chunk,
+            )
+            self.progress.emit("DIALS: symmetry → scale → merge…")
+            result = engine.symmetry_scale_merge(
+                self._experiments,
+                self._reflections,
+            )
+            self.finished.emit(result)
+        except Exception as ex:  # noqa: BLE001
+            logger.exception("DIALS scale pipeline failed")
+            self.failed.emit(str(ex))
+
+
+class _DialsReportWorker(QObject):
+    """``dials.report`` and/or ``dials.spot_counts_per_image``."""
+
+    finished = Signal(object)  # DialsReportResult
+    failed = Signal(str)
+    progress = Signal(str)
+
+    def __init__(
+        self,
+        work_dir: Path,
+        *,
+        mode: str = "report",
+        settings: DialsSettings | None = None,
+        on_chunk=None,
+    ) -> None:
+        super().__init__()
+        self._work_dir = work_dir
+        self._mode = mode
+        self._settings = settings or DialsSettings()
+        self._on_chunk = on_chunk
+
+    def run(self) -> None:
+        try:
+            engine = DialsEngine(
+                work_dir=self._work_dir,
+                settings=self._settings,
+                on_chunk=self._on_chunk,
+            )
+            if self._mode == "spot_counts":
+                self.progress.emit("DIALS: spot counts per image…")
+                result = engine.spot_counts_per_image()
+            else:
+                self.progress.emit("DIALS: writing HTML report…")
+                result = engine.report()
+            self.finished.emit(result)
+        except Exception as ex:  # noqa: BLE001
+            logger.exception("DIALS QA failed")
             self.failed.emit(str(ex))
 
 
@@ -310,9 +457,9 @@ class _DialsIntegrateWorker(QObject):
 
 
 class _DialsFullPipelineWorker(QObject):
-    """One-shot ``import → find_spots → index → integrate → export``."""
+    """One-shot import → spots → index → Bravais → refine → integrate → export."""
 
-    finished = Signal(object)  # tuple[spots, indexed, integ]
+    finished = Signal(object)  # tuple[spots, indexed, integ, bravais|None]
     failed = Signal(str)
     progress = Signal(str)
 
@@ -345,15 +492,39 @@ class _DialsFullPipelineWorker(QObject):
                 f"{self._image_range.first_image}–{self._image_range.last_image}…"
             )
             spots = engine.find_spots(imported, self._image_range)
-            self.progress.emit("DIALS full pipeline: index + refine…")
-            indexed = engine.index(imported, spots.strong_refl, refine=True)
+            self.progress.emit("DIALS full pipeline: index…")
+            indexed = engine.index(imported, spots.strong_refl, refine=False)
+            bravais = None
+            try:
+                self.progress.emit("DIALS full pipeline: Bravais settings…")
+                bravais = engine.refine_bravais_settings(
+                    indexed.indexed_expt or indexed.experiments,
+                    indexed.indexed_refl or indexed.reflections,
+                )
+                chosen = pick_recommended_bravais(bravais.solutions)
+                if chosen is not None:
+                    self.progress.emit(
+                        f"DIALS full pipeline: apply Bravais "
+                        f"#{chosen.setting_number} {chosen.bravais}…"
+                    )
+                    indexed = engine.apply_bravais_solution(
+                        chosen,
+                        indexed_expt=indexed.indexed_expt,
+                        indexed_refl=indexed.indexed_refl,
+                        refine=True,
+                    )
+            except Exception as bravais_ex:  # noqa: BLE001
+                logger.warning(
+                    "Bravais auto-apply skipped (%s); refining triclinic", bravais_ex
+                )
+                indexed = engine.index(imported, spots.strong_refl, refine=True)
             self.progress.emit("DIALS full pipeline: integrate + export MTZ…")
             integ = engine.integrate(
                 indexed.experiments,
                 indexed.reflections,
                 image_range=self._image_range,
             )
-            self.finished.emit((spots, indexed, integ))
+            self.finished.emit((spots, indexed, integ, bravais))
         except Exception as ex:  # noqa: BLE001
             logger.exception("DIALS full pipeline failed")
             self.failed.emit(str(ex))
@@ -530,8 +701,50 @@ class _RefineWorker(QObject):
             self.failed.emit(str(ex))
 
 
+class _PointlessWorker(QObject):
+    """Background worker: CCP4 Pointless on a single HKLIN MTZ."""
+
+    finished = Signal(object)  # PointlessRunResult
+    failed = Signal(str)
+    progress = Signal(str)
+
+    def __init__(
+        self,
+        hklin: Path,
+        hklout: Path,
+        work_dir: Path,
+        *,
+        choose_space_group: bool = True,
+        copy_free: bool = False,
+        custom: str = "",
+    ) -> None:
+        super().__init__()
+        self._hklin = hklin
+        self._hklout = hklout
+        self._work_dir = work_dir
+        self._choose_space_group = choose_space_group
+        self._copy_free = copy_free
+        self._custom = custom
+
+    def run(self) -> None:
+        try:
+            self.progress.emit(f"Pointless: checking symmetry on {self._hklin.name}…")
+            result = run_pointless(
+                self._hklin,
+                self._hklout,
+                work_dir=self._work_dir,
+                choose_space_group=self._choose_space_group,
+                copy_free=self._copy_free,
+                custom=self._custom,
+            )
+            self.finished.emit(result)
+        except Exception as ex:  # noqa: BLE001
+            logger.exception("Pointless failed")
+            self.failed.emit(str(ex))
+
+
 class IndexingDialog(QDialog):
-    """Processing dialog: find spots → index → integrate → MTZ."""
+    """Processing dialog: find spots → index → integrate → MTZ → Symmetry."""
 
     solutionSelected = Signal(object)  # IndexSolution | None
 
@@ -552,13 +765,19 @@ class IndexingDialog(QDialog):
         self._mosaic_worker: _MosaicityWorker | None = None
         self._integrate_thread: QThread | None = None
         self._integrate_worker: _IntegrationWorker | None = None
+        self._pointless_thread: QThread | None = None
+        self._pointless_worker: _PointlessWorker | None = None
         self._spotfinding: SpotFindingResult | None = None
         self._dials_spots: DialsSpotFindingResult | None = None
         self._dials_index: DialsIndexingResult | None = None
+        self._dials_bravais: DialsBravaisResult | None = None
+        self._bravais_solutions: list[DialsBravaisSolution] = []
+        self._dials_scale: DialsScaleResult | None = None
         self._integration_range: IntegrationImageRange | None = None
         self._integration_result: IntegrationResult | None = None
         self._dials_integration: DialsIntegrationResult | None = None
         self._mtz_path: Path | None = None
+        self._pointless_result: PointlessRunResult | None = None
         self._use_dials: bool = False
         self._selected_frames: list[int] = []
         self._source_geometry: IndexingGeometry | None = None
@@ -792,6 +1011,28 @@ class IndexingDialog(QDialog):
         self.table.currentCellChanged.connect(self._on_current_cell_changed)
         index_layout.addWidget(self.table, stretch=1)
 
+        bravais_row = QHBoxLayout()
+        self.bravais_hint = QLabel(
+            "DIALS: after indexing, Bravais solutions fill the table "
+            "(* = recommended)."
+        )
+        self.bravais_hint.setWordWrap(True)
+        bravais_row.addWidget(self.bravais_hint, stretch=1)
+        self.apply_bravais_button = QPushButton("Apply selected lattice (reindex + refine)")
+        self.apply_bravais_button.setEnabled(False)
+        self.apply_bravais_button.setToolTip(
+            "Run dials.reindex (if needed) and dials.refine for the selected "
+            "Bravais setting before integrate"
+        )
+        self.apply_bravais_button.clicked.connect(self._on_apply_bravais)
+        bravais_row.addWidget(self.apply_bravais_button)
+        self.rlv_button = QPushButton("Reciprocal lattice…")
+        self.rlv_button.setEnabled(False)
+        self.rlv_button.setToolTip("Launch dials.reciprocal_lattice_viewer")
+        self.rlv_button.clicked.connect(self._on_launch_rlv)
+        bravais_row.addWidget(self.rlv_button)
+        index_layout.addLayout(bravais_row)
+
         refine_box = QGroupBox("Refine unit cell")
         refine_layout = QHBoxLayout(refine_box)
         refine_layout.addWidget(QLabel("Space group"))
@@ -923,12 +1164,163 @@ class IndexingDialog(QDialog):
         )
         self.mtz_summary_btn.clicked.connect(self._on_show_summary_vs_resolution)
         mtz_btn_row.addWidget(self.mtz_summary_btn)
+        self.dials_report_btn = QPushButton("DIALS report HTML")
+        self.dials_report_btn.setEnabled(False)
+        self.dials_report_btn.setToolTip("Run dials.report and open dials.report.html")
+        self.dials_report_btn.clicked.connect(self._on_dials_report)
+        mtz_btn_row.addWidget(self.dials_report_btn)
+        self.spot_counts_btn = QPushButton("Spot counts")
+        self.spot_counts_btn.setEnabled(False)
+        self.spot_counts_btn.setToolTip(
+            "Run dials.spot_counts_per_image (JSON beside work dir)"
+        )
+        self.spot_counts_btn.clicked.connect(self._on_dials_spot_counts)
+        mtz_btn_row.addWidget(self.spot_counts_btn)
         mtz_btn_row.addStretch(1)
         mtz_layout.addLayout(mtz_btn_row)
         mtz_page_layout.addWidget(self.mtz_result_box)
         mtz_page_layout.addStretch(1)
         self._mtz_tab_index = self.pipeline_tabs.addTab(mtz_page, "5. MTZ")
         self._summary_dialog = None
+
+        # ----- Tab: Symmetry (Pointless) -----
+        sym_page = QWidget()
+        sym_page_layout = QVBoxLayout(sym_page)
+
+        self.symmetry_io_box = QGroupBox("Check Symmetry (Pointless)")
+        sym_io_form = QFormLayout(self.symmetry_io_box)
+
+        hklin_row = QHBoxLayout()
+        self.pointless_hklin_edit = QLineEdit()
+        self.pointless_hklin_edit.setPlaceholderText("integrated.mtz")
+        self.pointless_hklin_edit.textChanged.connect(
+            lambda _t: self._update_pointless_run_enabled()
+        )
+        hklin_row.addWidget(self.pointless_hklin_edit, stretch=1)
+        self.pointless_hklin_browse_btn = QPushButton("Browse…")
+        self.pointless_hklin_browse_btn.clicked.connect(self._on_browse_pointless_hklin)
+        hklin_row.addWidget(self.pointless_hklin_browse_btn)
+        sym_io_form.addRow("HKLIN", hklin_row)
+
+        hklout_row = QHBoxLayout()
+        self.pointless_hklout_edit = QLineEdit()
+        self.pointless_hklout_edit.setPlaceholderText("pointless.mtz")
+        hklout_row.addWidget(self.pointless_hklout_edit, stretch=1)
+        self.pointless_hklout_browse_btn = QPushButton("Browse…")
+        self.pointless_hklout_browse_btn.clicked.connect(self._on_browse_pointless_hklout)
+        hklout_row.addWidget(self.pointless_hklout_browse_btn)
+        sym_io_form.addRow("HKLOUT", hklout_row)
+        sym_page_layout.addWidget(self.symmetry_io_box)
+
+        self.pointless_settings_box = QGroupBox("Pointless options")
+        pointless_settings_layout = QVBoxLayout(self.pointless_settings_box)
+        self._pointless_spec_editor: SpecEditor | None = None
+        self.pointless_choose_sg: QCheckBox | None = None
+        self.pointless_copy_free: QCheckBox | None = None
+        self.pointless_custom: QLineEdit | None = None
+        if _HAS_SPEC_EDITOR and SpecEditor is not None:
+            try:
+                self._pointless_spec_editor = SpecEditor(
+                    fields=pointless_settings_fields(),
+                    show_argv_preview=True,
+                    program="pointless",
+                )
+                self._pointless_spec_editor.set_values(pointless_defaults())
+                pointless_settings_layout.addWidget(self._pointless_spec_editor)
+            except Exception as ex:  # noqa: BLE001
+                logger.warning("Pointless SpecEditor unavailable: %s", ex)
+                self._pointless_spec_editor = None
+        if self._pointless_spec_editor is None:
+            fallback = QFormLayout()
+            self.pointless_choose_sg = QCheckBox("Choose space group (SETTING SYMMETRY-BASED)")
+            self.pointless_choose_sg.setChecked(True)
+            fallback.addRow(self.pointless_choose_sg)
+            self.pointless_copy_free = QCheckBox("Copy Free-R flags (COPY FREE)")
+            self.pointless_copy_free.setChecked(False)
+            self.pointless_copy_free.setToolTip(
+                "Leave off for first-pass symmetry — COPY FREE can skip Laue scoring"
+            )
+            fallback.addRow(self.pointless_copy_free)
+            self.pointless_custom = QLineEdit()
+            self.pointless_custom.setPlaceholderText("optional keyword line(s)")
+            fallback.addRow("Custom", self.pointless_custom)
+            pointless_settings_layout.addLayout(fallback)
+        sym_page_layout.addWidget(self.pointless_settings_box)
+
+        run_row = QHBoxLayout()
+        self.pointless_run_btn = QPushButton("Run Pointless")
+        self.pointless_run_btn.setEnabled(False)
+        self.pointless_run_btn.clicked.connect(self._on_run_pointless)
+        run_row.addWidget(self.pointless_run_btn)
+        self.pointless_status_hint = QLabel("")
+        self.pointless_status_hint.setWordWrap(True)
+        run_row.addWidget(self.pointless_status_hint, stretch=1)
+        sym_page_layout.addLayout(run_row)
+
+        self.symmetry_results_box = QGroupBox("Results")
+        results_layout = QVBoxLayout(self.symmetry_results_box)
+        self.pointless_sg_label = QLabel("Space group: —")
+        self.pointless_reindex_label = QLabel("Reindex operator: —")
+        self.pointless_confidence_label = QLabel("Confidence: —")
+        for lab in (
+            self.pointless_sg_label,
+            self.pointless_reindex_label,
+            self.pointless_confidence_label,
+        ):
+            lab.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            results_layout.addWidget(lab)
+
+        results_btn_row = QHBoxLayout()
+        self.pointless_reveal_log_btn = QPushButton("Reveal log")
+        self.pointless_reveal_log_btn.setEnabled(False)
+        self.pointless_reveal_log_btn.clicked.connect(self._on_reveal_pointless_log)
+        results_btn_row.addWidget(self.pointless_reveal_log_btn)
+        self.pointless_open_mtz_btn = QPushButton("Open MTZ in Reflection File Viewer")
+        self.pointless_open_mtz_btn.setEnabled(False)
+        self.pointless_open_mtz_btn.clicked.connect(self._on_open_pointless_mtz)
+        results_btn_row.addWidget(self.pointless_open_mtz_btn)
+        results_btn_row.addStretch(1)
+        results_layout.addLayout(results_btn_row)
+        sym_page_layout.addWidget(self.symmetry_results_box)
+        sym_page_layout.addStretch(1)
+        self._symmetry_tab_index = self.pipeline_tabs.addTab(sym_page, "6. Symmetry")
+        self._update_pointless_run_enabled()
+
+        # ----- Tab: Scale (DIALS dual-space) -----
+        scale_page = QWidget()
+        scale_layout = QVBoxLayout(scale_page)
+        scale_box = QGroupBox("DIALS symmetry → scale → merge")
+        scale_box_layout = QVBoxLayout(scale_box)
+        scale_box_layout.addWidget(
+            QLabel(
+                "Dual-space alternative to Pointless/Aimless: "
+                "dials.symmetry → dials.scale → dials.merge on integrated.{expt,refl}."
+            )
+        )
+        self.scale_run_btn = QPushButton("Run DIALS symmetry + scale + merge")
+        self.scale_run_btn.setEnabled(False)
+        self.scale_run_btn.clicked.connect(self._on_run_dials_scale)
+        scale_box_layout.addWidget(self.scale_run_btn)
+        self.scale_status_label = QLabel("No scaled data yet.")
+        self.scale_status_label.setWordWrap(True)
+        self.scale_status_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        scale_box_layout.addWidget(self.scale_status_label)
+        scale_btn_row = QHBoxLayout()
+        self.scale_open_html_btn = QPushButton("Open scale HTML")
+        self.scale_open_html_btn.setEnabled(False)
+        self.scale_open_html_btn.clicked.connect(self._on_open_scale_html)
+        scale_btn_row.addWidget(self.scale_open_html_btn)
+        self.scale_open_mtz_btn = QPushButton("Open merged MTZ in Reflection Viewer")
+        self.scale_open_mtz_btn.setEnabled(False)
+        self.scale_open_mtz_btn.clicked.connect(self._on_open_scaled_mtz)
+        scale_btn_row.addWidget(self.scale_open_mtz_btn)
+        scale_btn_row.addStretch(1)
+        scale_box_layout.addLayout(scale_btn_row)
+        scale_layout.addWidget(scale_box)
+        scale_layout.addStretch(1)
+        self._scale_tab_index = self.pipeline_tabs.addTab(scale_page, "7. Scale")
 
         # ----- Shared footer -----
         self.status_label = QLabel("Ready.")
@@ -1135,6 +1527,11 @@ class IndexingDialog(QDialog):
             self.full_pipeline_button,
             self.dials_range_hint,
             self.open_log_button,
+            self.apply_bravais_button,
+            self.rlv_button,
+            self.bravais_hint,
+            self.dials_report_btn,
+            self.spot_counts_btn,
         ):
             w.setVisible(use_dials)
         self.frame_step.setVisible(not use_dials)
@@ -1150,6 +1547,8 @@ class IndexingDialog(QDialog):
             w.setVisible(not use_dials)
         if hasattr(self, "mosaic_box"):
             self.mosaic_box.setVisible(not use_dials)
+        if hasattr(self, "_scale_tab_index"):
+            self.pipeline_tabs.setTabEnabled(self._scale_tab_index, use_dials)
         if use_dials:
             self.setWindowTitle("Processing — DIALS (HDF5 → MTZ)")
             self.setMinimumSize(820, 720)
@@ -1253,8 +1652,402 @@ class IndexingDialog(QDialog):
         self.mtz_copy_btn.setEnabled(True)
         self.mtz_open_viewer_btn.setEnabled(True)
         self._update_summary_button_state()
+        self._sync_pointless_paths_from_mtz(path)
+        self._update_pointless_run_enabled()
+        parent = self.parentWidget()
+        if parent is not None and hasattr(parent, "_mark_session_dirty"):
+            parent._mark_session_dirty()
         if switch_tab and hasattr(self, "_mtz_tab_index"):
             self.pipeline_tabs.setCurrentIndex(self._mtz_tab_index)
+
+    def _default_pointless_hklout(self, hklin: Path | None = None) -> Path:
+        """Default HKLOUT beside the work directory / HKLIN parent."""
+        try:
+            work = self._resolve_dials_work_dir()
+            return work / "pointless.mtz"
+        except Exception:
+            if hklin is not None:
+                return hklin.parent / "pointless.mtz"
+            return Path.home() / ".qtmosflm" / "pointless.mtz"
+
+    def _sync_pointless_paths_from_mtz(self, mtz_path: Path) -> None:
+        """Prefill Symmetry HKLIN/HKLOUT from the current integrated MTZ."""
+        if not hasattr(self, "pointless_hklin_edit"):
+            return
+        self.pointless_hklin_edit.setText(str(mtz_path))
+        self.pointless_hklout_edit.setText(
+            str(self._default_pointless_hklout(mtz_path))
+        )
+
+    def _pointless_options_from_ui(self) -> dict:
+        """Read Pointless SpecEditor / fallback widgets."""
+        if self._pointless_spec_editor is not None:
+            return values_to_pointless_options(self._pointless_spec_editor.values())
+        return {
+            "choose_space_group": (
+                self.pointless_choose_sg.isChecked()
+                if self.pointless_choose_sg is not None
+                else True
+            ),
+            "copy_free": (
+                self.pointless_copy_free.isChecked()
+                if self.pointless_copy_free is not None
+                else False
+            ),
+            "custom": (
+                self.pointless_custom.text().strip()
+                if self.pointless_custom is not None
+                else ""
+            ),
+        }
+
+    def _pointless_values_from_ui(self) -> dict:
+        """SpecEditor-shaped Pointless values for Session persistence."""
+        if self._pointless_spec_editor is not None:
+            return dict(self._pointless_spec_editor.values())
+        opts = self._pointless_options_from_ui()
+        return {
+            "choose_space_group": opts["choose_space_group"],
+            "copy_free": opts["copy_free"],
+            "custom": opts["custom"],
+        }
+
+    def _apply_pointless_values(self, values: dict) -> None:
+        """Apply Session Pointless values to the SpecEditor / fallback widgets."""
+        if not values:
+            return
+        if self._pointless_spec_editor is not None:
+            merged = pointless_defaults()
+            merged.update(values)
+            self._pointless_spec_editor.set_values(merged)
+            return
+        if self.pointless_choose_sg is not None:
+            self.pointless_choose_sg.setChecked(
+                bool(values.get("choose_space_group", True))
+            )
+        if self.pointless_copy_free is not None:
+            self.pointless_copy_free.setChecked(bool(values.get("copy_free", False)))
+        if self.pointless_custom is not None:
+            self.pointless_custom.setText(str(values.get("custom") or ""))
+
+    def _dials_values_from_ui(self) -> dict:
+        """SpecEditor-shaped DIALS values for Session persistence."""
+        if self._dials_spec_editor is not None:
+            return dict(self._dials_spec_editor.values())
+        return dials_settings_to_values(self._dials_settings_from_ui())
+
+    def _apply_dials_values(self, values: dict) -> None:
+        """Apply Session DIALS values to the SpecEditor / fallback form."""
+        if not values:
+            return
+        if self._dials_spec_editor is not None:
+            self._dials_spec_editor.set_values(values)
+            return
+        settings = values_to_dials_settings(values)
+        if self.dials_nproc is not None:
+            self.dials_nproc.setValue(int(settings.nproc))
+        if self.dials_min_spot_size is not None:
+            self.dials_min_spot_size.setValue(int(settings.min_spot_size))
+        if self.dials_d_min is not None:
+            self.dials_d_min.setValue(
+                float(settings.d_min) if settings.d_min is not None else 0.0
+            )
+        if self.dials_gain is not None:
+            self.dials_gain.setValue(
+                float(settings.gain) if settings.gain is not None else 0.0
+            )
+        if self.dials_space_group is not None:
+            self.dials_space_group.setText(settings.space_group or "")
+        if self.dials_unit_cell is not None:
+            self.dials_unit_cell.setText(settings.unit_cell or "")
+
+    def to_processing_state(self) -> ProcessingState:
+        """Capture Processing UI into a :class:`ProcessingState` for Session save."""
+        work_dir: str | None = None
+        try:
+            work_dir = str(self._resolve_dials_work_dir())
+        except Exception:
+            text = self.dials_work_dir_edit.text().strip()
+            work_dir = text or (
+                str(self._dials_work_dir) if self._dials_work_dir else None
+            )
+        master = None
+        if self._dials_master_path is not None:
+            master = str(self._dials_master_path)
+        elif self.dials_master_label.text().strip() not in ("", "(no master)"):
+            master = self.dials_master_label.text().strip()
+        mtz = str(self._mtz_path) if self._mtz_path is not None else None
+        hklin = self.pointless_hklin_edit.text().strip() or None
+        hklout = self.pointless_hklout_edit.text().strip() or None
+        log = str(self._last_dials_log) if self._last_dials_log is not None else None
+        return ProcessingState(
+            backend="dials" if self._use_dials else "mosflm",
+            master_path=master,
+            work_dir=work_dir,
+            dials_settings=self._dials_values_from_ui(),
+            mosflm={
+                "frame_start": int(self.frame_start.value()),
+                "frame_end": int(self.frame_end.value()),
+                "frame_step": int(self.frame_step.value()),
+                "spot_sigma": float(self.spot_sigma.value()),
+                "i_sig_i": float(self.i_sig_i.value()),
+                "max_penalty": float(self.max_penalty.value()),
+            },
+            integrate_first=int(self.integrate_first.value()),
+            integrate_last=int(self.integrate_last.value()),
+            pointless=self._pointless_values_from_ui(),
+            mtz_path=mtz,
+            pointless_hklin=hklin,
+            pointless_hklout=hklout,
+            last_dials_log=log,
+            pipeline_tab=int(self.pipeline_tabs.currentIndex()),
+        )
+
+    def apply_processing_state(self, state: ProcessingState) -> list[str]:
+        """Restore Processing UI from *state*.
+
+        :returns: Human-readable warnings (missing paths, etc.).
+        """
+        warnings: list[str] = []
+        if state.work_dir:
+            work = Path(state.work_dir).expanduser()
+            self._dials_work_dir = work
+            self.dials_work_dir_edit.setText(str(work))
+            if not work.is_dir():
+                warnings.append(f"Work directory not found: {work}")
+        if state.master_path:
+            master = Path(state.master_path).expanduser()
+            self.dials_master_label.setText(str(master))
+            if master.is_file():
+                self._dials_master_path = master.resolve()
+            else:
+                self._dials_master_path = None
+                warnings.append(f"Master path not found: {master}")
+        self._apply_dials_values(state.dials_settings)
+        mos = state.mosflm or {}
+        # Expand ranges before setValue so restored indices are not clamped to 0.
+        for key, spin in (
+            ("frame_start", self.frame_start),
+            ("frame_end", self.frame_end),
+        ):
+            if key in mos:
+                value = int(mos[key])
+                if value > spin.maximum():
+                    spin.setMaximum(max(value, spin.maximum()))
+                spin.setValue(value)
+        if "frame_step" in mos:
+            self.frame_step.setValue(max(1, int(mos["frame_step"])))
+        if "spot_sigma" in mos:
+            self.spot_sigma.setValue(float(mos["spot_sigma"]))
+        if "i_sig_i" in mos:
+            self.i_sig_i.setValue(float(mos["i_sig_i"]))
+        if "max_penalty" in mos:
+            self.max_penalty.setValue(float(mos["max_penalty"]))
+        first = max(1, int(state.integrate_first))
+        last = max(1, int(state.integrate_last))
+        if first > self.integrate_first.maximum():
+            self.integrate_first.setMaximum(first)
+        if last > self.integrate_last.maximum():
+            self.integrate_last.setMaximum(last)
+        self.integrate_first.setValue(first)
+        self.integrate_last.setValue(last)
+        self._apply_pointless_values(state.pointless)
+        mtz_ok = False
+        if state.mtz_path:
+            mtz = Path(state.mtz_path).expanduser()
+            if mtz.is_file():
+                self._set_mtz_available(mtz, switch_tab=False)
+                mtz_ok = True
+            else:
+                warnings.append(f"MTZ not found: {mtz}")
+        if state.pointless_hklin:
+            self.pointless_hklin_edit.setText(state.pointless_hklin)
+        elif mtz_ok and self._mtz_path is not None:
+            self.pointless_hklin_edit.setText(str(self._mtz_path))
+        if state.pointless_hklout:
+            self.pointless_hklout_edit.setText(state.pointless_hklout)
+        if state.last_dials_log:
+            log = Path(state.last_dials_log).expanduser()
+            if log.is_file():
+                self._last_dials_log = log
+                self.open_log_button.setEnabled(True)
+            else:
+                warnings.append(f"DIALS log not found: {log}")
+        if not mtz_ok and state.work_dir:
+            self._discover_existing_mtz()
+        tab = int(state.pipeline_tab)
+        if 0 <= tab < self.pipeline_tabs.count():
+            self.pipeline_tabs.setCurrentIndex(tab)
+        self._update_pointless_run_enabled()
+        self._update_summary_button_state()
+        return warnings
+
+    def _update_pointless_run_enabled(self) -> None:
+        """Enable Run Pointless when HKLIN exists and ``pointless`` is on PATH."""
+        if not hasattr(self, "pointless_run_btn"):
+            return
+        hklin_text = self.pointless_hklin_edit.text().strip()
+        hklin_ok = False
+        if hklin_text:
+            try:
+                hklin_ok = Path(hklin_text).expanduser().is_file()
+            except OSError:
+                hklin_ok = False
+        exe = find_pointless()
+        can_run = hklin_ok and exe is not None
+        self.pointless_run_btn.setEnabled(can_run)
+        if can_run:
+            via = "MxLib" if mxlib_available() else "subprocess"
+            self.pointless_status_hint.setText(f"Ready ({exe.name}, {via})")
+        elif exe is None:
+            self.pointless_status_hint.setText(
+                "pointless not found — source CCP4 / set $CBIN / add to PATH."
+            )
+        elif not hklin_ok:
+            self.pointless_status_hint.setText(
+                "Set HKLIN to an existing MTZ (from the MTZ tab or Browse)."
+            )
+        else:
+            self.pointless_status_hint.setText("")
+
+    def _on_browse_pointless_hklin(self) -> None:
+        start = self.pointless_hklin_edit.text().strip()
+        if not start and self._mtz_path is not None:
+            start = str(self._mtz_path.parent)
+        chosen, _ = QFileDialog.getOpenFileName(
+            self,
+            "Pointless HKLIN",
+            start or "",
+            "MTZ files (*.mtz);;All files (*)",
+        )
+        if chosen:
+            self.pointless_hklin_edit.setText(chosen)
+            if not self.pointless_hklout_edit.text().strip():
+                self.pointless_hklout_edit.setText(
+                    str(self._default_pointless_hklout(Path(chosen)))
+                )
+            self._update_pointless_run_enabled()
+
+    def _on_browse_pointless_hklout(self) -> None:
+        start = self.pointless_hklout_edit.text().strip() or str(
+            self._default_pointless_hklout(
+                Path(self.pointless_hklin_edit.text().strip())
+                if self.pointless_hklin_edit.text().strip()
+                else None
+            )
+        )
+        chosen, _ = QFileDialog.getSaveFileName(
+            self,
+            "Pointless HKLOUT",
+            start,
+            "MTZ files (*.mtz);;All files (*)",
+        )
+        if chosen:
+            self.pointless_hklout_edit.setText(chosen)
+
+    def _on_run_pointless(self) -> None:
+        """Launch Pointless in a background thread."""
+        if self._pointless_thread is not None and self._pointless_thread.isRunning():
+            QMessageBox.information(self, "Pointless", "Pointless is already running.")
+            return
+        hklin_text = self.pointless_hklin_edit.text().strip()
+        if not hklin_text:
+            QMessageBox.warning(self, "Pointless", "HKLIN path is required.")
+            return
+        hklin = Path(hklin_text).expanduser()
+        if not hklin.is_file():
+            QMessageBox.warning(self, "Pointless", f"HKLIN not found:\n{hklin}")
+            return
+        hklout_text = self.pointless_hklout_edit.text().strip()
+        if not hklout_text:
+            hklout = self._default_pointless_hklout(hklin)
+            self.pointless_hklout_edit.setText(str(hklout))
+        else:
+            hklout = Path(hklout_text).expanduser()
+        try:
+            work_dir = self._resolve_dials_work_dir()
+        except Exception:
+            work_dir = hklout.parent
+        opts = self._pointless_options_from_ui()
+        self._set_busy(True)
+        self.status_label.setText(f"Running Pointless on {hklin.name}…")
+        self.pointless_run_btn.setEnabled(False)
+
+        self._pointless_thread = QThread(self)
+        self._pointless_worker = _PointlessWorker(
+            hklin,
+            hklout,
+            work_dir,
+            choose_space_group=opts["choose_space_group"],
+            copy_free=opts["copy_free"],
+            custom=opts["custom"],
+        )
+        self._pointless_worker.moveToThread(self._pointless_thread)
+        self._pointless_thread.started.connect(self._pointless_worker.run)
+        self._pointless_worker.progress.connect(self.status_label.setText)
+        self._pointless_worker.finished.connect(self._on_pointless_finished)
+        self._pointless_worker.failed.connect(self._on_pointless_failed)
+        self._pointless_worker.finished.connect(self._pointless_thread.quit)
+        self._pointless_worker.failed.connect(self._pointless_thread.quit)
+        self._pointless_thread.finished.connect(self._pointless_worker.deleteLater)
+        self._pointless_thread.start()
+
+    def _on_pointless_finished(self, result: object) -> None:
+        self._set_busy(False)
+        self._update_pointless_run_enabled()
+        if not isinstance(result, PointlessRunResult):
+            self.status_label.setText("Pointless finished (unexpected result).")
+            return
+        self._pointless_result = result
+        sg = result.space_group or "—"
+        reindex = result.reindex_operator or "—"
+        conf = (
+            f"{result.confidence:.3f}"
+            if isinstance(result.confidence, (int, float))
+            else "—"
+        )
+        self.pointless_sg_label.setText(f"Space group: {sg}")
+        self.pointless_reindex_label.setText(f"Reindex operator: {reindex}")
+        self.pointless_confidence_label.setText(f"Confidence: {conf}")
+        self.pointless_reveal_log_btn.setEnabled(result.log.is_file())
+        self.pointless_open_mtz_btn.setEnabled(result.hklout.is_file())
+        self.pointless_hklout_edit.setText(str(result.hklout))
+        if result.space_group is None and result.log.is_file():
+            self.status_label.setText(
+                f"Pointless wrote {result.hklout.name} but no Best Solution in log — "
+                "turn off Copy Free-R and ensure Choose space group is on, then re-run "
+                f"(see {result.log.name})."
+            )
+        else:
+            self.status_label.setText(
+                f"Pointless done — SG {sg}, reindex {reindex} → {result.hklout.name}"
+            )
+
+    def _on_pointless_failed(self, message: str) -> None:
+        self._set_busy(False)
+        self._update_pointless_run_enabled()
+        self.status_label.setText(f"Pointless failed: {message}")
+        QMessageBox.warning(self, "Pointless", message)
+
+    def _on_reveal_pointless_log(self) -> None:
+        if self._pointless_result is None or not self._pointless_result.log.is_file():
+            return
+        QDesktopServices.openUrl(
+            QUrl.fromLocalFile(str(self._pointless_result.log.parent))
+        )
+
+    def _on_open_pointless_mtz(self) -> None:
+        if self._pointless_result is None or not self._pointless_result.hklout.is_file():
+            QMessageBox.information(self, "Pointless", "No Pointless MTZ yet.")
+            return
+        try:
+            launch_reflection_viewer(self._pointless_result.hklout)
+            self.status_label.setText(
+                f"Launched Reflection File Viewer for "
+                f"{self._pointless_result.hklout.name}"
+            )
+        except Exception as ex:
+            QMessageBox.warning(self, "Reflection File Viewer", str(ex))
 
     def _update_summary_button_state(self) -> None:
         """Enable Summary vs resolution when dials.integrate.log is available."""
@@ -1786,8 +2579,18 @@ class IndexingDialog(QDialog):
         self._thread.finished.connect(self._cleanup_thread)
         self._thread.start()
 
-    def _on_dials_index_finished(self, indexed: DialsIndexingResult) -> None:
+    def _on_dials_index_finished(self, payload: object) -> None:
+        indexed: DialsIndexingResult
+        bravais: DialsBravaisResult | None = None
+        if isinstance(payload, tuple) and len(payload) == 2:
+            indexed, bravais = payload  # type: ignore[misc]
+        elif isinstance(payload, DialsIndexingResult):
+            indexed = payload
+        else:
+            self._on_failed(f"Unexpected index result: {type(payload)!r}")
+            return
         self._dials_index = indexed
+        self._dials_bravais = bravais
         sol = _dials_to_index_solution(indexed)
         n_spots = self._dials_spots.n_spots if self._dials_spots else 0
         result = IndexingResult(
@@ -1817,7 +2620,7 @@ class IndexingDialog(QDialog):
         self._mark_pipeline_step(
             self.pipeline_index_label,
             True,
-            f"Index / refine — {indexed.experiments.name}"
+            f"Index — {indexed.experiments.name}"
             + (" (refined)" if indexed.refined else ""),
         )
         self._remember_dials_log(indexed.work_dir, "dials.index.log")
@@ -1839,11 +2642,318 @@ class IndexingDialog(QDialog):
             self.log.append(f"Indexed {sol.reflections_used}")
         if indexed.predictions_npz is not None:
             self.log.append(f"predictions cache: {indexed.predictions_npz}")
-        self._fill_table(result)
+        if bravais is not None and bravais.solutions:
+            self._fill_bravais_table(bravais)
+            self._remember_dials_log(
+                bravais.work_dir, "dials.refine_bravais_settings.log"
+            )
+            rec = pick_recommended_bravais(bravais.solutions)
+            n_rec = sum(1 for s in bravais.solutions if s.recommended)
+            self.log.append(
+                f"Bravais settings: {len(bravais.solutions)} "
+                f"({n_rec} recommended)"
+                + (
+                    f"; suggested #{rec.setting_number} {rec.bravais}"
+                    if rec is not None
+                    else ""
+                )
+            )
+            self.status_label.setText(
+                "DIALS Bravais ready — select a lattice (* recommended) "
+                "then Apply selected lattice"
+            )
+            self.apply_bravais_button.setEnabled(True)
+        else:
+            self._fill_table(result)
+            self.apply_bravais_button.setEnabled(False)
+        self.rlv_button.setEnabled(True)
         self.refine_button.setEnabled(False)
         self.mosaicity_estimate_button.setEnabled(False)
         self._update_integration_button_state()
-        self.pipeline_tabs.setCurrentIndex(3)  # Integrate tab
+        self.spot_counts_btn.setEnabled(True)
+        if bravais is not None and bravais.solutions:
+            self.pipeline_tabs.setCurrentIndex(2)  # Index tab — pick lattice
+        else:
+            self.pipeline_tabs.setCurrentIndex(3)  # Integrate tab
+
+    def _fill_bravais_table(self, bravais: DialsBravaisResult) -> None:
+        """Populate the Index table with Bravais setting solutions."""
+        solutions = list(bravais.solutions)
+        self._bravais_solutions = solutions
+        self._table_solutions = []
+        self.table.blockSignals(True)
+        self.table.setRowCount(len(solutions))
+        select_row = 0
+        rec = pick_recommended_bravais(solutions)
+        for row, sol in enumerate(solutions):
+            if rec is not None and sol.setting_number == rec.setting_number:
+                select_row = row
+            cell = sol.unit_cell
+            kind = "*" if sol.recommended else ""
+            beta_gamma = f"{cell[4]:.2f} / {cell[5]:.2f}"
+            values = [
+                kind,
+                str(sol.setting_number),
+                f"{sol.metric_fit:.4f}",
+                sol.bravais,
+                sol.cb_op,
+                f"{cell[0]:.2f}",
+                f"{cell[1]:.2f}",
+                f"{cell[2]:.2f}",
+                f"{cell[3]:.2f}",
+                beta_gamma,
+            ]
+            for col, text in enumerate(values):
+                self.table.setItem(row, col, QTableWidgetItem(text))
+        self.table.setHorizontalHeaderLabels(
+            [
+                "Rec",
+                "#",
+                "Metric",
+                "Lattice",
+                "cb_op",
+                "a",
+                "b",
+                "c",
+                "α",
+                "β / γ",
+            ]
+        )
+        self.table.blockSignals(False)
+        if solutions:
+            self.table.selectRow(select_row)
+            self.table.setCurrentCell(select_row, 0)
+
+    def _selected_bravais_solution(self) -> DialsBravaisSolution | None:
+        """Return the Bravais solution for the current table row."""
+        row = self.table.currentRow()
+        if row < 0 or row >= len(self._bravais_solutions):
+            return None
+        return self._bravais_solutions[row]
+
+    def _on_apply_bravais(self) -> None:
+        """Reindex + refine the selected Bravais lattice."""
+        if self._dials_index is None:
+            return
+        solution = self._selected_bravais_solution()
+        if solution is None:
+            QMessageBox.information(
+                self, "Bravais", "Select a Bravais solution in the table."
+            )
+            return
+        self._set_busy(True)
+        self.apply_bravais_button.setEnabled(False)
+        work_dir = self._resolve_dials_work_dir()
+        session_log = self._begin_dials_log()
+        self._thread = QThread(self)
+        self._worker = _DialsApplyBravaisWorker(
+            solution,
+            self._dials_index,
+            work_dir,
+            self._dials_settings_from_ui(),
+            on_chunk=self._session_log_chunker(session_log),
+        )
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.progress.connect(self.status_label.setText)
+        self._worker.finished.connect(self._on_bravais_applied)
+        self._worker.failed.connect(self._on_failed)
+        self._worker.finished.connect(self._thread.quit)
+        self._worker.failed.connect(self._thread.quit)
+        self._thread.finished.connect(self._cleanup_thread)
+        self._thread.start()
+
+    def _on_bravais_applied(self, indexed: object) -> None:
+        if not isinstance(indexed, DialsIndexingResult):
+            self._on_failed(f"Unexpected Bravais apply result: {type(indexed)!r}")
+            return
+        self._dials_index = indexed
+        sol = _dials_to_index_solution(indexed)
+        self.status_label.setText(
+            f"Bravais applied — {sol.lattice} {sol.spacegroup}; "
+            f"a={sol.a:.2f} b={sol.b:.2f} c={sol.c:.2f}"
+            + (" (refined)" if indexed.refined else "")
+        )
+        self.log.append(f"Applied lattice → {indexed.experiments}")
+        self.log.append(
+            f"Cell: {sol.a:.3f} {sol.b:.3f} {sol.c:.3f} "
+            f"{sol.alpha:.2f} {sol.beta:.2f} {sol.gamma:.2f}  {sol.spacegroup}"
+        )
+        if indexed.predictions_npz is not None:
+            self.log.append(f"predictions cache: {indexed.predictions_npz}")
+        self._mark_pipeline_step(
+            self.pipeline_index_label,
+            True,
+            f"Index / Bravais / refine — {indexed.experiments.name}",
+        )
+        # Show the applied solution as a single Mosflm-style row.
+        n_spots = self._dials_spots.n_spots if self._dials_spots else 0
+        result = IndexingResult(
+            spotfile=self._dials_spots.strong_refl if self._dials_spots else Path("."),
+            n_spots=n_spots,
+            suggested_number=1,
+            solutions=[sol],
+            refined=[sol] if indexed.refined else [],
+            messages=[],
+            geometry=self._source_geometry,
+            uses_placeholder_template=False,
+        )
+        self._result = result
+        self._bravais_solutions = []
+        self.table.setHorizontalHeaderLabels(
+            [
+                "Kind",
+                "#",
+                "Penalty",
+                "Lattice",
+                "SG",
+                "a",
+                "b",
+                "c",
+                "α",
+                "β / γ",
+            ]
+        )
+        self._fill_table(result)
+        self.apply_bravais_button.setEnabled(False)
+        self._update_integration_button_state()
+        self.pipeline_tabs.setCurrentIndex(3)
+
+    def _on_launch_rlv(self) -> None:
+        """Launch dials.reciprocal_lattice_viewer for the current indexing."""
+        try:
+            work = self._resolve_dials_work_dir()
+            engine = DialsEngine(
+                work_dir=work,
+                settings=self._dials_settings_from_ui(),
+            )
+            expt = None
+            refl = None
+            if self._dials_index is not None:
+                expt = self._dials_index.indexed_expt or self._dials_index.experiments
+                refl = self._dials_index.indexed_refl or self._dials_index.reflections
+            engine.launch_reciprocal_lattice_viewer(expt, refl)
+            self.status_label.setText("Launched dials.reciprocal_lattice_viewer")
+        except Exception as ex:
+            QMessageBox.warning(self, "Reciprocal lattice viewer", str(ex))
+
+    def _on_run_dials_scale(self) -> None:
+        """Run dials.symmetry → scale → merge on integrated data."""
+        if self._dials_integration is None:
+            QMessageBox.information(
+                self, "Scale", "Integrate with DIALS first (need integrated.expt/refl)."
+            )
+            return
+        self._set_busy(True)
+        self.scale_run_btn.setEnabled(False)
+        work_dir = self._resolve_dials_work_dir()
+        session_log = self._begin_dials_log()
+        self._thread = QThread(self)
+        self._worker = _DialsScaleWorker(
+            self._dials_integration.experiments,
+            self._dials_integration.reflections,
+            work_dir,
+            self._dials_settings_from_ui(),
+            on_chunk=self._session_log_chunker(session_log),
+        )
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.progress.connect(self.status_label.setText)
+        self._worker.finished.connect(self._on_dials_scale_finished)
+        self._worker.failed.connect(self._on_failed)
+        self._worker.finished.connect(self._thread.quit)
+        self._worker.failed.connect(self._thread.quit)
+        self._thread.finished.connect(self._cleanup_thread)
+        self._thread.start()
+
+    def _on_dials_scale_finished(self, result: object) -> None:
+        if not isinstance(result, DialsScaleResult):
+            self._on_failed(f"Unexpected scale result: {type(result)!r}")
+            return
+        self._dials_scale = result
+        parts = [
+            f"symmetrized: {result.symmetrized_expt.name}",
+            f"scaled: {result.scaled_expt.name}",
+        ]
+        if result.merged_mtz is not None:
+            parts.append(f"merged MTZ: {result.merged_mtz}")
+        if result.unmerged_mtz is not None:
+            parts.append(f"unmerged MTZ: {result.unmerged_mtz}")
+        self.scale_status_label.setText("\n".join(parts))
+        self.scale_open_html_btn.setEnabled(
+            result.scale_html is not None and result.scale_html.is_file()
+        )
+        self.scale_open_mtz_btn.setEnabled(
+            result.merged_mtz is not None and result.merged_mtz.is_file()
+        )
+        self.scale_run_btn.setEnabled(True)
+        self.status_label.setText("DIALS scale complete")
+        self.log.append("DIALS symmetry/scale/merge done")
+        for part in parts:
+            self.log.append(part)
+        if result.scale_html is not None:
+            self.log.append(f"scale HTML: {result.scale_html}")
+
+    def _on_open_scale_html(self) -> None:
+        if self._dials_scale is None or self._dials_scale.scale_html is None:
+            return
+        QDesktopServices.openUrl(
+            QUrl.fromLocalFile(str(self._dials_scale.scale_html))
+        )
+
+    def _on_open_scaled_mtz(self) -> None:
+        if self._dials_scale is None or self._dials_scale.merged_mtz is None:
+            return
+        try:
+            launch_reflection_viewer(self._dials_scale.merged_mtz)
+        except Exception as ex:
+            QMessageBox.warning(self, "Reflection File Viewer", str(ex))
+
+    def _on_dials_report(self) -> None:
+        self._start_dials_qa("report")
+
+    def _on_dials_spot_counts(self) -> None:
+        self._start_dials_qa("spot_counts")
+
+    def _start_dials_qa(self, mode: str) -> None:
+        self._set_busy(True)
+        work_dir = self._resolve_dials_work_dir()
+        session_log = self._begin_dials_log()
+        self._thread = QThread(self)
+        self._worker = _DialsReportWorker(
+            work_dir,
+            mode=mode,
+            settings=self._dials_settings_from_ui(),
+            on_chunk=self._session_log_chunker(session_log),
+        )
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.progress.connect(self.status_label.setText)
+        self._worker.finished.connect(self._on_dials_qa_finished)
+        self._worker.failed.connect(self._on_failed)
+        self._worker.finished.connect(self._thread.quit)
+        self._worker.failed.connect(self._thread.quit)
+        self._thread.finished.connect(self._cleanup_thread)
+        self._thread.start()
+
+    def _on_dials_qa_finished(self, result: object) -> None:
+        if not isinstance(result, DialsReportResult):
+            self._on_failed(f"Unexpected QA result: {type(result)!r}")
+            return
+        if result.report_html is not None and result.report_html.is_file():
+            self.log.append(f"DIALS report: {result.report_html}")
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(result.report_html)))
+            self.status_label.setText(f"Opened {result.report_html.name}")
+        elif result.spot_counts_json is not None:
+            self.log.append(f"Spot counts JSON: {result.spot_counts_json}")
+            QDesktopServices.openUrl(
+                QUrl.fromLocalFile(str(result.spot_counts_json.parent))
+            )
+            self.status_label.setText(
+                f"Spot counts written: {result.spot_counts_json.name}"
+            )
+        else:
+            self.status_label.setText("DIALS QA finished (no HTML/JSON found)")
 
     def _cleanup_thread(self) -> None:
         self._worker = None
@@ -2468,6 +3578,9 @@ class IndexingDialog(QDialog):
             self.log.append(f"Integrated reflections: {result.n_reflections}")
         self._update_mtz_result_ui(result)
         self._maybe_show_summary_vs_resolution(result.work_dir)
+        self.scale_run_btn.setEnabled(True)
+        self.dials_report_btn.setEnabled(True)
+        self.spot_counts_btn.setEnabled(True)
 
     def _on_run_full_pipeline(self) -> None:
         """One-shot import → find spots → index → integrate → MTZ."""
@@ -2529,9 +3642,22 @@ class IndexingDialog(QDialog):
         self._pipeline_thread.start()
 
     def _on_full_pipeline_finished(self, payload: object) -> None:
-        spots, indexed, integ = payload  # type: ignore[misc]
+        # Supports legacy 3-tuple or new 4-tuple with Bravais.
+        if not isinstance(payload, tuple) or len(payload) < 3:
+            self._on_full_pipeline_failed(f"Unexpected pipeline payload: {payload!r}")
+            return
+        spots, indexed, integ = payload[0], payload[1], payload[2]
+        bravais = payload[3] if len(payload) > 3 else None
         self._on_dials_spots_found(spots)
-        self._on_dials_index_finished(indexed)
+        # Applied lattice already refined — present as final index, not Bravais picker.
+        if bravais is not None and isinstance(indexed, DialsIndexingResult) and indexed.refined:
+            self._dials_bravais = bravais
+            self._on_dials_index_finished(indexed)
+            self.apply_bravais_button.setEnabled(False)
+        else:
+            self._on_dials_index_finished(
+                (indexed, bravais) if bravais is not None else indexed
+            )
         if integ is not None:
             self._on_dials_integrate_finished(integ)
         self.status_label.setText(

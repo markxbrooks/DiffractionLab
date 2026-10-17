@@ -127,6 +127,16 @@ def dials_settings_fields() -> list:
             group="Parameters",
             formatter=_phil_str("indexing.known_symmetry.unit_cell"),
         ),
+        SpecField(
+            name="scan_varying",
+            kind=SpecFieldKind.FLAG,
+            label="Scan-varying refine",
+            help="Pass scan_varying=True to dials.refine (long wedges)",
+            token="scan_varying=True",
+            value_type=SpecValueType.BOOL,
+            default=False,
+            group="Parameters",
+        ),
     ]
 
 
@@ -139,6 +149,7 @@ def dials_settings_to_values(settings: DialsSettings) -> dict[str, Any]:
         "gain": float(settings.gain) if settings.gain is not None else 0.0,
         "space_group": settings.space_group or "",
         "unit_cell": settings.unit_cell or "",
+        "scan_varying": bool(getattr(settings, "scan_varying", False)),
     }
 
 
@@ -155,6 +166,7 @@ def values_to_dials_settings(values: dict[str, Any]) -> DialsSettings:
         d_min=d_min_val if d_min_val > 0 else None,
         space_group=sg,
         unit_cell=cell,
+        scan_varying=bool(values.get("scan_varying", False)),
     )
 
 
