@@ -50,7 +50,7 @@ from PySide6.QtCore import Qt, QSettings, QSize
 
 from diffraction_lab.image_canvas import DiffractionImageCanvas, build_resolution_rings
 from diffraction_lab.indexing import IndexingGeometry, as_float
-from diffraction_lab.indexing_dialog import IndexingDialog
+from diffraction_lab.indexing_dialog import ProcessingDialog
 from diffraction_lab.session import (
     DiffractionLabSession,
     ViewerState,
@@ -683,7 +683,7 @@ class IMosflmApp(QMainWindow):
         self._recent_sessions = RecentSessionsManager()
         self._session_path: Path | None = None
         self._session_dirty = False
-        self._indexing_dialog: IndexingDialog | None = None
+        self._indexing_dialog: ProcessingDialog | None = None
         self._indexing_spot_overlay: list[tuple[float, float, bool]] | None = None
         self._indexing_solution = None
 
@@ -1472,7 +1472,37 @@ class IMosflmApp(QMainWindow):
 
     def open_indexing_dialog(self) -> None:
         """Open the Processing dialog for the loaded image / dataset."""
+        # #region agent log
+        import json
+        import time
+
+        _dbg = "/Users/brooks/projects/ElMo/.cursor/debug-677e52.log"
+
+        def _olog(hid: str, msg: str, data: dict | None = None) -> None:
+            try:
+                with open(_dbg, "a", encoding="utf-8") as h:
+                    h.write(
+                        json.dumps(
+                            {
+                                "sessionId": "677e52",
+                                "runId": "pre-fix",
+                                "hypothesisId": hid,
+                                "location": "qtmosflm.py:open_indexing_dialog",
+                                "message": msg,
+                                "data": data or {},
+                                "timestamp": int(time.time() * 1000),
+                            }
+                        )
+                        + "\n"
+                    )
+            except Exception:
+                pass
+
+        # #endregion
         if self.current_image is None and self.dataset is None:
+            # #region agent log
+            _olog("E", "open blocked: no image/dataset")
+            # #endregion
             QMessageBox.information(
                 self,
                 "Process",
@@ -1480,11 +1510,48 @@ class IMosflmApp(QMainWindow):
             )
             return
         if self._indexing_dialog is None:
-            self._indexing_dialog = IndexingDialog(self)
-            self._indexing_dialog.destroyed.connect(self._on_indexing_dialog_destroyed)
+            # #region agent log
+            _olog("A", "constructing IndexingDialog")
+            # #endregion
+            try:
+                self._indexing_dialog = ProcessingDialog(self)
+                self._indexing_dialog.destroyed.connect(
+                    self._on_indexing_dialog_destroyed
+                )
+                # #region agent log
+                _olog(
+                    "A",
+                    "IndexingDialog constructed",
+                    {"visible": self._indexing_dialog.isVisible()},
+                )
+                # #endregion
+            except Exception as ex:
+                # #region agent log
+                _olog(
+                    "A",
+                    "IndexingDialog construct FAILED",
+                    {"error": repr(ex), "type": type(ex).__name__},
+                )
+                # #endregion
+                QMessageBox.critical(
+                    self,
+                    "Process",
+                    f"Could not open Processing dialog:\n{ex}",
+                )
+                return
         self._indexing_dialog.show()
         self._indexing_dialog.raise_()
         self._indexing_dialog.activateWindow()
+        # #region agent log
+        _olog(
+            "E",
+            "IndexingDialog shown",
+            {
+                "visible": self._indexing_dialog.isVisible(),
+                "title": self._indexing_dialog.windowTitle(),
+            },
+        )
+        # #endregion
 
     def _on_indexing_dialog_destroyed(self, *_args) -> None:
         self._indexing_dialog = None

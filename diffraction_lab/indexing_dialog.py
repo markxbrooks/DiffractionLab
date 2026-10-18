@@ -64,6 +64,11 @@ from diffraction_lab.dials_spec import (
     dials_settings_to_values,
     values_to_dials_settings,
 )
+from diffraction_lab.mosflm_spec import (
+    mosflm_settings_defaults,
+    mosflm_settings_fields,
+    values_to_mosflm_settings,
+)
 from diffraction_lab.pointless_runner import (
     PointlessRunResult,
     find_pointless,
@@ -85,6 +90,77 @@ try:
 except ImportError:  # pragma: no cover
     SpecEditor = None  # type: ignore[misc, assignment]
     _HAS_SPEC_EDITOR = False
+
+try:
+    from picoui.widget.helper import create_widget_with_items as _picoui_create_widget_with_items
+
+    _HAS_CREATE_WIDGET = True
+except ImportError:  # pragma: no cover
+    _picoui_create_widget_with_items = None  # type: ignore[assignment]
+    _HAS_CREATE_WIDGET = False
+
+_ROW_MARGINS = (0, 0, 0, 0)
+_ROW_SPACING = 4
+
+
+def _hrow(items: list[QWidget], *, end_stretch: bool = True) -> QWidget:
+    """Left-aligned horizontal row via PicoUI ``create_widget_with_items`` when available."""
+    if _HAS_CREATE_WIDGET and _picoui_create_widget_with_items is not None:
+        return _picoui_create_widget_with_items(
+            items=items,
+            margins=_ROW_MARGINS,
+            spacing=_ROW_SPACING,
+            start_stretch=False,
+            end_stretch=end_stretch,
+        )
+    host = QWidget()
+    row = QHBoxLayout(host)
+    row.setContentsMargins(*_ROW_MARGINS)
+    row.setSpacing(_ROW_SPACING)
+    for widget in items:
+        row.addWidget(widget)
+    if end_stretch:
+        row.addStretch(1)
+    return host
+
+
+# #region agent log
+_DEBUG_LOG_PATH = "/Users/brooks/projects/ElMo/.cursor/debug-677e52.log"
+
+
+def _agent_log(
+    hypothesis_id: str,
+    location: str,
+    message: str,
+    data: dict | None = None,
+    *,
+    run_id: str = "pre-fix",
+) -> None:
+    """Append one NDJSON debug line for session 677e52."""
+    import json
+    import time
+
+    try:
+        with open(_DEBUG_LOG_PATH, "a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "sessionId": "677e52",
+                        "runId": run_id,
+                        "hypothesisId": hypothesis_id,
+                        "location": location,
+                        "message": message,
+                        "data": data or {},
+                        "timestamp": int(time.time() * 1000),
+                    }
+                )
+                + "\n"
+            )
+    except Exception:
+        pass
+
+
+# #endregion
 from diffraction_lab.indexing import (
     IndexSolution,
     IndexingEngine,
@@ -758,7 +834,7 @@ class _PointlessWorker(QObject):
             self.failed.emit(str(ex))
 
 
-class IndexingDialog(QDialog):
+class ProcessingDialog(QDialog):
     """Processing dialog: find spots → index → integrate → MTZ → Symmetry."""
 
     solutionSelected = Signal(object)  # IndexSolution | None
@@ -804,7 +880,42 @@ class IndexingDialog(QDialog):
         self._busy_cancel_requested = False
         self._terminal_viewer: TerminalLogViewer | None = None
         self._jobs_tab: JobsTab | None = None
-        self._build_ui()
+        # #region agent log
+        _agent_log(
+            "A",
+            "indexing_dialog.py:__init__",
+            "IndexingDialog init before _build_ui",
+            {
+                "has_spec_editor": _HAS_SPEC_EDITOR,
+                "has_create_widget": _HAS_CREATE_WIDGET,
+            },
+        )
+        # #endregion
+        try:
+            self._build_ui()
+            # #region agent log
+            _agent_log(
+                "A",
+                "indexing_dialog.py:__init__",
+                "IndexingDialog _build_ui ok",
+                {
+                    "has_mosflm_spec": getattr(self, "_mosflm_spec_editor", None)
+                    is not None,
+                    "has_integrate_row": hasattr(self, "dials_integrate_range_row"),
+                    "has_spot_sigma_attr": hasattr(self, "spot_sigma"),
+                },
+            )
+            # #endregion
+        except Exception as ex:
+            # #region agent log
+            _agent_log(
+                "A",
+                "indexing_dialog.py:__init__",
+                "IndexingDialog _build_ui FAILED",
+                {"error": repr(ex), "type": type(ex).__name__},
+            )
+            # #endregion
+            raise
         self._populate_defaults()
 
     def showEvent(self, event) -> None:  # noqa: N802
@@ -836,17 +947,21 @@ class IndexingDialog(QDialog):
         self.dials_master_label.setWordWrap(True)
         dials_input_form.addRow("Master .h5", self.dials_master_label)
 
-        work_row = QHBoxLayout()
         self.dials_work_dir_edit = QLineEdit()
         self.dials_work_dir_edit.setPlaceholderText(
             "<master_dir>/<master_stem>/YYYY-MM-DD-HH-MM-SS-dials/"
         )
-        work_row.addWidget(self.dials_work_dir_edit, stretch=1)
         self.dials_work_browse_btn = QPushButton("Browse…")
         self.dials_work_browse_btn.clicked.connect(self._on_browse_work_dir)
-        work_row.addWidget(self.dials_work_browse_btn)
         self.dials_work_reveal_btn = QPushButton("Reveal")
         self.dials_work_reveal_btn.clicked.connect(self._on_reveal_work_dir)
+        # Stretch on the path edit: keep a QHBoxLayout (create_widget_with_items
+        # cannot set per-item stretch factors).
+        work_row = QHBoxLayout()
+        work_row.setContentsMargins(*_ROW_MARGINS)
+        work_row.setSpacing(_ROW_SPACING)
+        work_row.addWidget(self.dials_work_dir_edit, stretch=1)
+        work_row.addWidget(self.dials_work_browse_btn)
         work_row.addWidget(self.dials_work_reveal_btn)
         dials_input_form.addRow("Work directory", work_row)
         setup_layout.addWidget(self.dials_input_box)
@@ -938,14 +1053,19 @@ class IndexingDialog(QDialog):
         self.frame_step.setValue(90)
         self.frame_step_label = QLabel("Step")
 
-        frame_row = QHBoxLayout()
-        frame_row.addWidget(QLabel("Start"))
-        frame_row.addWidget(self.frame_start)
-        frame_row.addWidget(QLabel("End"))
-        frame_row.addWidget(self.frame_end)
-        frame_row.addWidget(self.frame_step_label)
-        frame_row.addWidget(self.frame_step)
-        form.addRow("Frames (0-based)", frame_row)
+        form.addRow(
+            "Frames (0-based)",
+            _hrow(
+                [
+                    QLabel("Start"),
+                    self.frame_start,
+                    QLabel("End"),
+                    self.frame_end,
+                    self.frame_step_label,
+                    self.frame_step,
+                ]
+            ),
+        )
 
         self.dials_range_hint = QLabel("")
         self.dials_range_hint.setWordWrap(True)
@@ -953,27 +1073,63 @@ class IndexingDialog(QDialog):
         self.frame_start.valueChanged.connect(self._update_dials_range_hint)
         self.frame_end.valueChanged.connect(self._update_dials_range_hint)
 
-        self.spot_sigma = QDoubleSpinBox()
-        self.spot_sigma.setRange(1.0, 50.0)
-        self.spot_sigma.setDecimals(1)
-        self.spot_sigma.setSingleStep(0.5)
-        self.spot_sigma.setValue(5.0)
-        self.spot_sigma_label = QLabel("Spot σ threshold")
-        form.addRow(self.spot_sigma_label, self.spot_sigma)
+        # Mosflm DPS thresholds via SpecEditor (fallback spinboxes if PicoUI missing).
+        self._mosflm_spec_editor: SpecEditor | None = None
+        self.spot_sigma: QDoubleSpinBox | None = None
+        self.spot_sigma_label: QLabel | None = None
+        self.i_sig_i: QDoubleSpinBox | None = None
+        self.i_sig_i_label: QLabel | None = None
+        self.max_penalty: QDoubleSpinBox | None = None
+        self.max_penalty_label: QLabel | None = None
+        if _HAS_SPEC_EDITOR and SpecEditor is not None:
+            try:
+                self._mosflm_spec_editor = SpecEditor(
+                    fields=mosflm_settings_fields(),
+                    show_argv_preview=False,
+                    program="mosflm",
+                )
+                self._mosflm_spec_editor.set_values(mosflm_settings_defaults())
+                form.addRow(self._mosflm_spec_editor)
+                # #region agent log
+                _agent_log(
+                    "B",
+                    "indexing_dialog.py:_build_ui",
+                    "Mosflm SpecEditor created",
+                    {"fields": [f.name for f in mosflm_settings_fields()]},
+                )
+                # #endregion
+            except Exception as ex:
+                # #region agent log
+                _agent_log(
+                    "B",
+                    "indexing_dialog.py:_build_ui",
+                    "Mosflm SpecEditor FAILED",
+                    {"error": repr(ex)},
+                )
+                # #endregion
+                self._mosflm_spec_editor = None
+        if self._mosflm_spec_editor is None:
+            self.spot_sigma = QDoubleSpinBox()
+            self.spot_sigma.setRange(1.0, 50.0)
+            self.spot_sigma.setDecimals(1)
+            self.spot_sigma.setSingleStep(0.5)
+            self.spot_sigma.setValue(5.0)
+            self.spot_sigma_label = QLabel("Spot σ threshold")
+            form.addRow(self.spot_sigma_label, self.spot_sigma)
 
-        self.i_sig_i = QDoubleSpinBox()
-        self.i_sig_i.setRange(1.0, 200.0)
-        self.i_sig_i.setDecimals(1)
-        self.i_sig_i.setValue(5.0)
-        self.i_sig_i_label = QLabel("DPS I/σI")
-        form.addRow(self.i_sig_i_label, self.i_sig_i)
+            self.i_sig_i = QDoubleSpinBox()
+            self.i_sig_i.setRange(1.0, 200.0)
+            self.i_sig_i.setDecimals(1)
+            self.i_sig_i.setValue(5.0)
+            self.i_sig_i_label = QLabel("DPS I/σI")
+            form.addRow(self.i_sig_i_label, self.i_sig_i)
 
-        self.max_penalty = QDoubleSpinBox()
-        self.max_penalty.setRange(0.0, 500.0)
-        self.max_penalty.setDecimals(1)
-        self.max_penalty.setValue(50.0)
-        self.max_penalty_label = QLabel("Max penalty to refine")
-        form.addRow(self.max_penalty_label, self.max_penalty)
+            self.max_penalty = QDoubleSpinBox()
+            self.max_penalty.setRange(0.0, 500.0)
+            self.max_penalty.setDecimals(1)
+            self.max_penalty.setValue(50.0)
+            self.max_penalty_label = QLabel("Max penalty to refine")
+            form.addRow(self.max_penalty_label, self.max_penalty)
 
         setup_layout.addWidget(form_box)
 
@@ -987,15 +1143,20 @@ class IndexingDialog(QDialog):
         spots_page = QWidget()
         spots_layout = QVBoxLayout(spots_page)
         spot_box = QGroupBox("Spot finding")
-        spot_layout = QHBoxLayout(spot_box)
+        spot_layout = QVBoxLayout(spot_box)
         self.find_spots_button = QPushButton("Find spots")
         self.find_spots_button.clicked.connect(self._on_find_spots)
-        spot_layout.addWidget(self.find_spots_button)
         self.spot_summary_label = QLabel(
             "Search selected frames, then check spots on the image before indexing."
         )
         self.spot_summary_label.setWordWrap(True)
-        spot_layout.addWidget(self.spot_summary_label, stretch=1)
+        # Summary needs stretch; keep QHBoxLayout for the button+label pair.
+        spot_row = QHBoxLayout()
+        spot_row.setContentsMargins(*_ROW_MARGINS)
+        spot_row.setSpacing(_ROW_SPACING)
+        spot_row.addWidget(self.find_spots_button)
+        spot_row.addWidget(self.spot_summary_label, stretch=1)
+        spot_layout.addLayout(spot_row)
         spots_layout.addWidget(spot_box)
 
         self.show_spots_checkbox = QCheckBox("Show indexing spots on image")
@@ -1038,13 +1199,11 @@ class IndexingDialog(QDialog):
         self.table.currentCellChanged.connect(self._on_current_cell_changed)
         index_layout.addWidget(self.table, stretch=1)
 
-        bravais_row = QHBoxLayout()
         self.bravais_hint = QLabel(
             "DIALS: after indexing, Bravais solutions fill the table "
             "(* = recommended)."
         )
         self.bravais_hint.setWordWrap(True)
-        bravais_row.addWidget(self.bravais_hint, stretch=1)
         self.apply_bravais_button = QPushButton("Apply selected lattice (reindex + refine)")
         self.apply_bravais_button.setEnabled(False)
         self.apply_bravais_button.setToolTip(
@@ -1052,56 +1211,73 @@ class IndexingDialog(QDialog):
             "Bravais setting before integrate"
         )
         self.apply_bravais_button.clicked.connect(self._on_apply_bravais)
-        bravais_row.addWidget(self.apply_bravais_button)
         self.rlv_button = QPushButton("Reciprocal lattice…")
         self.rlv_button.setEnabled(False)
         self.rlv_button.setToolTip("Launch dials.reciprocal_lattice_viewer")
         self.rlv_button.clicked.connect(self._on_launch_rlv)
+        # Hint needs stretch; keep QHBoxLayout for that factor.
+        bravais_row = QHBoxLayout()
+        bravais_row.setContentsMargins(*_ROW_MARGINS)
+        bravais_row.setSpacing(_ROW_SPACING)
+        bravais_row.addWidget(self.bravais_hint, stretch=1)
+        bravais_row.addWidget(self.apply_bravais_button)
         bravais_row.addWidget(self.rlv_button)
         index_layout.addLayout(bravais_row)
 
         refine_box = QGroupBox("Refine unit cell")
-        refine_layout = QHBoxLayout(refine_box)
-        refine_layout.addWidget(QLabel("Space group"))
         self.spacegroup_combo = QComboBox()
         self.spacegroup_combo.setEditable(True)
         self.spacegroup_combo.setMinimumWidth(120)
-        refine_layout.addWidget(self.spacegroup_combo)
-        refine_layout.addWidget(QLabel("σ cutoff"))
         self.refine_sigma = QDoubleSpinBox()
         self.refine_sigma.setRange(0.5, 20.0)
         self.refine_sigma.setDecimals(2)
         self.refine_sigma.setSingleStep(0.25)
         self.refine_sigma.setValue(2.5)
-        refine_layout.addWidget(self.refine_sigma)
         self.refine_button = QPushButton("Refine selected solution")
         self.refine_button.setEnabled(False)
         self.refine_button.clicked.connect(self._on_refine)
-        refine_layout.addWidget(self.refine_button)
-        refine_layout.addStretch(1)
+        refine_box_layout = QVBoxLayout(refine_box)
+        refine_box_layout.setContentsMargins(*_ROW_MARGINS)
+        refine_box_layout.addWidget(
+            _hrow(
+                [
+                    QLabel("Space group"),
+                    self.spacegroup_combo,
+                    QLabel("σ cutoff"),
+                    self.refine_sigma,
+                    self.refine_button,
+                ]
+            )
+        )
         index_layout.addWidget(refine_box)
 
         mosaic_box = QGroupBox("Mosaicity estimation (§5.6)")
         self.mosaic_box = mosaic_box
-        mosaic_layout = QHBoxLayout(mosaic_box)
-        mosaic_layout.addWidget(QLabel("Mosaic spread (°)"))
         self.mosaicity_value = QDoubleSpinBox()
         self.mosaicity_value.setRange(0.0, 20.0)
         self.mosaicity_value.setDecimals(3)
         self.mosaicity_value.setSingleStep(0.05)
         self.mosaicity_value.setValue(0.05)
-        mosaic_layout.addWidget(self.mosaicity_value)
-        mosaic_layout.addWidget(QLabel("Block size (µm)"))
         self.mosaic_block = QDoubleSpinBox()
         self.mosaic_block.setRange(0.1, 500.0)
         self.mosaic_block.setDecimals(1)
         self.mosaic_block.setValue(100.0)
-        mosaic_layout.addWidget(self.mosaic_block)
         self.mosaicity_estimate_button = QPushButton("Estimate")
         self.mosaicity_estimate_button.setEnabled(False)
         self.mosaicity_estimate_button.clicked.connect(self._on_estimate_mosaicity)
-        mosaic_layout.addWidget(self.mosaicity_estimate_button)
-        mosaic_layout.addStretch(1)
+        mosaic_box_layout = QVBoxLayout(mosaic_box)
+        mosaic_box_layout.setContentsMargins(*_ROW_MARGINS)
+        mosaic_box_layout.addWidget(
+            _hrow(
+                [
+                    QLabel("Mosaic spread (°)"),
+                    self.mosaicity_value,
+                    QLabel("Block size (µm)"),
+                    self.mosaic_block,
+                    self.mosaicity_estimate_button,
+                ]
+            )
+        )
         index_layout.addWidget(mosaic_box)
         self.pipeline_tabs.addTab(index_page, "3. Index")
 
@@ -1125,20 +1301,31 @@ class IndexingDialog(QDialog):
         range_row.addWidget(self.auto_integrate_select_button)
         integrate_layout.addLayout(range_row)
 
-        dials_integ_row = QHBoxLayout()
-        dials_integ_row.addWidget(QLabel("Integrate first (1-based)"))
         self.integrate_first = QSpinBox()
         self.integrate_first.setRange(1, 999999)
         self.integrate_first.setValue(1)
-        dials_integ_row.addWidget(self.integrate_first)
-        dials_integ_row.addWidget(QLabel("Last"))
         self.integrate_last = QSpinBox()
         self.integrate_last.setRange(1, 999999)
         self.integrate_last.setValue(40)
-        dials_integ_row.addWidget(self.integrate_last)
-        dials_integ_row.addStretch(1)
-        self.dials_integrate_range_row = QWidget()
-        self.dials_integrate_range_row.setLayout(dials_integ_row)
+        self.dials_integrate_range_row = _hrow(
+            [
+                QLabel("Integrate first (1-based)"),
+                self.integrate_first,
+                QLabel("Last"),
+                self.integrate_last,
+            ]
+        )
+        # #region agent log
+        _agent_log(
+            "D",
+            "indexing_dialog.py:_build_ui",
+            "integrate range row built",
+            {
+                "via_create_widget": _HAS_CREATE_WIDGET,
+                "row_type": type(self.dials_integrate_range_row).__name__,
+            },
+        )
+        # #endregion
         integrate_layout.addWidget(self.dials_integrate_range_row)
 
         self.integrate_button = QPushButton("Integrate selected wedge")
@@ -1557,11 +1744,38 @@ class IndexingDialog(QDialog):
             self.show_spots_checkbox.setChecked(bool(app.show_indexing_spots))
             self.show_spots_checkbox.blockSignals(False)
 
+    def _mosflm_values_from_ui(self) -> dict[str, float]:
+        """Read Mosflm DPS SpecEditor (or fallback spinboxes)."""
+        if self._mosflm_spec_editor is not None:
+            return values_to_mosflm_settings(self._mosflm_spec_editor.values())
+        assert self.spot_sigma is not None
+        assert self.i_sig_i is not None
+        assert self.max_penalty is not None
+        return {
+            "spot_sigma": float(self.spot_sigma.value()),
+            "i_sig_i": float(self.i_sig_i.value()),
+            "max_penalty": float(self.max_penalty.value()),
+        }
+
+    def _apply_mosflm_values(self, values: dict) -> None:
+        """Apply Mosflm DPS values to the SpecEditor / fallback spinboxes."""
+        merged = {**mosflm_settings_defaults(), **(values or {})}
+        if self._mosflm_spec_editor is not None:
+            self._mosflm_spec_editor.set_values(merged)
+            return
+        if self.spot_sigma is not None:
+            self.spot_sigma.setValue(float(merged.get("spot_sigma", 5.0)))
+        if self.i_sig_i is not None:
+            self.i_sig_i.setValue(float(merged.get("i_sig_i", 5.0)))
+        if self.max_penalty is not None:
+            self.max_penalty.setValue(float(merged.get("max_penalty", 50.0)))
+
     def _settings(self) -> IndexingSettings:
+        mos = self._mosflm_values_from_ui()
         return IndexingSettings(
-            spot_threshold_sigma=float(self.spot_sigma.value()),
-            i_sig_i=float(self.i_sig_i.value()),
-            max_penalty_to_refine=float(self.max_penalty.value()),
+            spot_threshold_sigma=float(mos["spot_sigma"]),
+            i_sig_i=float(mos["i_sig_i"]),
+            max_penalty_to_refine=float(mos["max_penalty"]),
             sigma_cutoff=float(self.refine_sigma.value()),
             mosaic_block_size=float(self.mosaic_block.value()),
         )
@@ -1621,15 +1835,19 @@ class IndexingDialog(QDialog):
             w.setVisible(use_dials)
         self.frame_step.setVisible(not use_dials)
         self.frame_step_label.setVisible(not use_dials)
-        for w in (
-            self.spot_sigma,
-            self.spot_sigma_label,
-            self.i_sig_i,
-            self.i_sig_i_label,
-            self.max_penalty,
-            self.max_penalty_label,
-        ):
-            w.setVisible(not use_dials)
+        if self._mosflm_spec_editor is not None:
+            self._mosflm_spec_editor.setVisible(not use_dials)
+        else:
+            for w in (
+                self.spot_sigma,
+                self.spot_sigma_label,
+                self.i_sig_i,
+                self.i_sig_i_label,
+                self.max_penalty,
+                self.max_penalty_label,
+            ):
+                if w is not None:
+                    w.setVisible(not use_dials)
         if hasattr(self, "mosaic_box"):
             self.mosaic_box.setVisible(not use_dials)
         if hasattr(self, "_scale_tab_index"):
@@ -1993,9 +2211,7 @@ class IndexingDialog(QDialog):
                 "frame_start": int(self.frame_start.value()),
                 "frame_end": int(self.frame_end.value()),
                 "frame_step": int(self.frame_step.value()),
-                "spot_sigma": float(self.spot_sigma.value()),
-                "i_sig_i": float(self.i_sig_i.value()),
-                "max_penalty": float(self.max_penalty.value()),
+                **self._mosflm_values_from_ui(),
             },
             integrate_first=int(self.integrate_first.value()),
             integrate_last=int(self.integrate_last.value()),
@@ -2041,12 +2257,7 @@ class IndexingDialog(QDialog):
                 spin.setValue(value)
         if "frame_step" in mos:
             self.frame_step.setValue(max(1, int(mos["frame_step"])))
-        if "spot_sigma" in mos:
-            self.spot_sigma.setValue(float(mos["spot_sigma"]))
-        if "i_sig_i" in mos:
-            self.i_sig_i.setValue(float(mos["i_sig_i"]))
-        if "max_penalty" in mos:
-            self.max_penalty.setValue(float(mos["max_penalty"]))
+        self._apply_mosflm_values(mos)
         first = max(1, int(state.integrate_first))
         last = max(1, int(state.integrate_last))
         if first > self.integrate_first.maximum():
@@ -2785,7 +2996,7 @@ class IndexingDialog(QDialog):
         self.log.append(f"Spot finding on frames: {indices}")
         self.log.append(
             f"Beam {geometry.beam_x_mm:.3f}, {geometry.beam_y_mm:.3f} mm; "
-            f"σ threshold {self.spot_sigma.value():.1f}"
+            f"σ threshold {self._mosflm_values_from_ui()['spot_sigma']:.1f}"
         )
         self.solutionSelected.emit(None)
         self.find_spots_button.setEnabled(False)
