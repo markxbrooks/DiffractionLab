@@ -986,7 +986,7 @@ def resolve_indexing_backend(
         if pl is None:
             raise FileNotFoundError(
                 "ProcessingLab not found. Build ProcessingLab (`make cpp`) or set "
-                "INTEGRATIONLAB / PROCESSINGLAB_HOME."
+                "PROCESSINGLAB / PROCESSINGLAB_HOME."
             )
         return "processinglab", pl
     if want in {"mosflm", "ipmosflm", "f77"}:
@@ -1004,7 +1004,7 @@ def resolve_indexing_backend(
         return "processinglab", pl
     raise FileNotFoundError(
         "No indexing backend found. Install CCP4 ipmosflm or ProcessingLab "
-        "ProcessingLab (set MOSFLM_EXEC or INTEGRATIONLAB)."
+        "ProcessingLab (set MOSFLM_EXEC or PROCESSINGLAB)."
     )
 
 

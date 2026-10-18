@@ -80,7 +80,7 @@ Optional dependencies:
 | `DIFFRACTIONLAB_BACKEND=processinglab` | Force ProcessingLab `ProcessingLab` |
 | `DIFFRACTIONLAB_BACKEND=mosflm` | Force F77 `ipmosflm` (MOSFLMSOCKET) |
 | `DIFFRACTIONLAB_PREFER_PROCESSINGLAB=1` | Prefer ProcessingLab when both are installed |
-| `INTEGRATIONLAB` / `PROCESSINGLAB_HOME` | Path to `ProcessingLab` binary or ProcessingLab root |
+| `PROCESSINGLAB` / `PROCESSINGLAB_HOME` | Path to `ProcessingLab` binary or ProcessingLab root |
 | `MOSFLM_EXEC` | Path to F77 `ipmosflm` |
 
 Default: use F77 Mosflm when found; otherwise fall back to ProcessingLab. ProcessingLab does not implement `MOSFLMSOCKET` (mosaicity estimate / index2 refine stay Mosflm-only).

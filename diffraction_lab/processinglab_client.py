@@ -2,7 +2,7 @@
 
 ``ProcessingLab`` does **not** speak ``MOSFLMSOCKET`` (that remains CCP4 /
 F77 ``ipmosflm``). DiffractionLab drives it with CONTROL scripts on stdin and
-parses machine-readable ``INTEGRATIONLAB_*`` lines (or
+parses machine-readable ``PROCESSINGLAB_*`` lines (or
 ``integrationlab_index.txt``) after AUTOINDEX.
 """
 
@@ -22,10 +22,10 @@ logger = logging.getLogger(__name__)
 def find_integrationlab() -> Path | None:
     """Locate ProcessingLab ``ProcessingLab`` (``.exe`` on Windows)."""
     for key in (
-        "INTEGRATIONLAB",
+        "PROCESSINGLAB",
         "PROCESSINGLAB_EXEC",
         "PROCESSINGLAB_BIN",
-        "ELMO_INTEGRATIONLAB",
+        "ELMO_PROCESSINGLAB",
     ):
         value = os.environ.get(key)
         if not value:
@@ -127,7 +127,7 @@ class ProcessingLabRun:
 
 
 def parse_autoindex_dump(text: str) -> AutoIndexDump | None:
-    """Parse ``INTEGRATIONLAB_*`` lines from stdout (or a sidecar file)."""
+    """Parse ``PROCESSINGLAB_*`` lines from stdout (or a sidecar file)."""
     cell: tuple[float, ...] | None = None
     matrix: list[float] = []
     system = ""
@@ -138,20 +138,20 @@ def parse_autoindex_dump(text: str) -> AutoIndexDump | None:
         if not line:
             continue
         # Sidecar format uses CELL / MATRIX without prefix.
-        if line.startswith("INTEGRATIONLAB_CELL ") or line.startswith("CELL "):
+        if line.startswith("PROCESSINGLAB_CELL ") or line.startswith("CELL "):
             parts = line.split()
             vals = [float(x) for x in parts[1:7]]
             if len(vals) == 6:
                 cell = tuple(vals)  # type: ignore[assignment]
             continue
-        if line.startswith("INTEGRATIONLAB_MATRIX ") or line.startswith("MATRIX "):
+        if line.startswith("PROCESSINGLAB_MATRIX ") or line.startswith("MATRIX "):
             parts = line.split()
             matrix = [float(x) for x in parts[1:10]]
             continue
-        if line.startswith("INTEGRATIONLAB_SYSTEM ") or line.startswith("SYSTEM "):
+        if line.startswith("PROCESSINGLAB_SYSTEM ") or line.startswith("SYSTEM "):
             system = line.split(None, 1)[1].strip()
             continue
-        if line.startswith("INTEGRATIONLAB_CHARACTER ") or line.startswith(
+        if line.startswith("PROCESSINGLAB_CHARACTER ") or line.startswith(
             "CHARACTER "
         ):
             try:
@@ -159,7 +159,7 @@ def parse_autoindex_dump(text: str) -> AutoIndexDump | None:
             except (IndexError, ValueError):
                 pass
             continue
-        if line.startswith("INTEGRATIONLAB_NSPOTS ") or line.startswith("NSPOTS "):
+        if line.startswith("PROCESSINGLAB_NSPOTS ") or line.startswith("NSPOTS "):
             try:
                 n_spots = int(line.split()[1])
             except (IndexError, ValueError):
@@ -276,18 +276,25 @@ def build_autoindex_commands(
     hkldev: float = 0.3,
     nvect: int = 30,
     nvref: int = 30,
-    solution: int = 12,
+    solution: int | None = None,
     prefer_system: str | None = None,
     extra: Iterable[str] | None = None,
 ) -> list[str]:
-    """CONTROL lines for ProcessingLab AUTOINDEX from a ``.spt`` file."""
+    """CONTROL lines for ProcessingLab AUTOINDEX from a ``.spt`` file.
+
+    Does **not** emit ``SOLUTION n`` by default (unconstrained SUGGLATT /
+    LASTGOOD). Pass ``solution=`` only when the caller wants a MOSFLM-style
+    solution pick (e.g. insulin ``12`` → cI).
+    """
     spot = Path(spotfile)
     spot_arg = spot.name if spot.parent.resolve() == Path(directory).resolve() else str(spot)
     auto = (
         f"AUTOINDEX DPS THRESHOLD {threshold:g} HKLDEV {hkldev:g} "
-        f"NVECT {nvect} NVREF {nvref} SOLUTION {solution} "
-        f'FILE "{spot_arg}"'
+        f"NVECT {nvect} NVREF {nvref}"
     )
+    if solution is not None:
+        auto += f" SOLUTION {solution}"
+    auto += f' FILE "{spot_arg}"'
     if prefer_system:
         auto += f" SYSTEM {prefer_system}"
     cmds = [
@@ -302,6 +309,53 @@ def build_autoindex_commands(
     ]
     if extra:
         cmds.extend(list(extra))
+    return cmds
+
+
+def build_findspots_commands(
+    *,
+    directory: Path,
+    image_path: Path | str | None = None,
+    template: str | None = None,
+    spot_file: str = "spots.spt",
+    threshold: float = 5.0,
+    max_spots: int = 500,
+    find_image: int = 1,
+    range_first: int | None = None,
+    range_last: int | None = None,
+    multiframe: bool = False,
+    distance_mm: float | None = None,
+    wavelength_a: float | None = None,
+    beam_x_mm: float | None = None,
+    beam_y_mm: float | None = None,
+    pixel_mm: float | None = None,
+) -> list[str]:
+    """CONTROL lines for ProcessingLab FINDSPOTS (optional MULTIFRAME COLSPOT)."""
+    cmds: list[str] = [f"DIRECTORY {directory}"]
+    if template:
+        cmds.append(f"TEMPLATE {template}")
+    if image_path is not None:
+        cmds.append(f"IMAGE {image_path}")
+    if distance_mm is not None:
+        cmds.append(f"DISTANCE {distance_mm:.4f}")
+    if wavelength_a is not None:
+        cmds.append(f"WAVELENGTH {wavelength_a:.6f}")
+    if pixel_mm is not None:
+        cmds.append(f"PIXEL {pixel_mm:.6f} {pixel_mm:.6f}")
+    if beam_x_mm is not None and beam_y_mm is not None:
+        cmds.append(f"BEAM {beam_x_mm:.4f} {beam_y_mm:.4f}")
+    fs = (
+        f"FINDSPOTS THRESHOLD {threshold:g} MAXSPOTS {max_spots} "
+        f"FIND {find_image} FILE {spot_file}"
+    )
+    use_multi = multiframe or (
+        range_first is not None and range_last is not None and range_last > (range_first or 0)
+    )
+    if use_multi:
+        first = int(range_first if range_first is not None else find_image)
+        last = int(range_last if range_last is not None else first)
+        fs += f" MULTIFRAME RANGE {first} {last}"
+    cmds.extend([fs, "GO"])
     return cmds
 
 
@@ -324,8 +378,19 @@ def build_process_commands(
     phi_start: float = 0.0,
     osc_deg: float = 1.0,
     separation_mm: float = 0.57,
+    cellfix: bool | str = True,
+    xparm_out: Path | str | None = "GXPARM.XDS",
+    polarization: float = 0.98,
+    postrefine_period: int | None = 25,
+    air: float = 0.0001,
+    partial_scale: bool = True,
+    auto_sigma: bool = True,
 ) -> list[str]:
-    """CONTROL lines for ProcessingLab PROCESS with known CELL/MATRIX."""
+    """CONTROL lines for ProcessingLab PROCESS with known CELL/MATRIX.
+
+    Emits ``CELLFIX``, ``POLARIZATION``, ``XPARMOUT``, ``POSTREFINE PERIOD``,
+    ``AIR``, ``PARTIALSCALE``, and ``AUTOSIGMA`` (wave-2/3 XDS-gap wrap).
+    """
     if len(cell) != 6:
         raise ValueError("cell needs 6 values")
     if len(matrix) != 9:
@@ -337,6 +402,8 @@ def build_process_commands(
         f"PIXEL {pixel_mm:.6f} {pixel_mm:.6f}",
         f"BEAM {beam_x_mm:.4f} {beam_y_mm:.4f}",
         f"SEPARATION {separation_mm:.3f} {separation_mm:.3f}",
+        f"POLARIZATION {polarization:g}",
+        f"AIR {air:g}",
         (
             f"CELL {cell[0]:.4f} {cell[1]:.4f} {cell[2]:.4f} "
             f"{cell[3]:.3f} {cell[4]:.3f} {cell[5]:.3f}"
@@ -348,6 +415,22 @@ def build_process_commands(
         f"{matrix[3]:.8f} {matrix[4]:.8f} {matrix[5]:.8f}",
         f"{matrix[6]:.8f} {matrix[7]:.8f} {matrix[8]:.8f}",
     ]
+    if cellfix is True or (isinstance(cellfix, str) and cellfix.upper() in {"ON", "HARD", "YES"}):
+        cmds.append("CELLFIX ON")
+    elif cellfix is False or (isinstance(cellfix, str) and cellfix.upper() in {"OFF", "NO"}):
+        cmds.append("CELLFIX OFF")
+    elif isinstance(cellfix, str):
+        cmds.append(f"CELLFIX {cellfix}")
+    if xparm_out is None or (isinstance(xparm_out, str) and xparm_out.upper() == "OFF"):
+        cmds.append("XPARMOUT OFF")
+    else:
+        cmds.append(f"XPARMOUT {xparm_out}")
+    cmds.append("PARTIALSCALE ON" if partial_scale else "PARTIALSCALE OFF")
+    cmds.append("AUTOSIGMA ON" if auto_sigma else "AUTOSIGMA OFF")
+    if postrefine_period is not None and postrefine_period > 0:
+        cmds.append(f"POSTREFINE PERIOD {int(postrefine_period)}")
+    elif postrefine_period == 0:
+        cmds.append("POSTREFINE OFF")
     if template:
         cmds.insert(1, f"TEMPLATE {template}")
     if image_path is not None:
