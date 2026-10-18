@@ -94,6 +94,75 @@ def find_dials_prefix() -> Path | None:
     return exe.parent if exe is not None else None
 
 
+def _is_dev_cctbx_path(entry: str) -> bool:
+    """True if *entry* looks like a source CCTBX / libtbx checkout."""
+    low = entry.replace("\\", "/").lower()
+    markers = (
+        "/cctbx_project",
+        "/cctbx_build",
+        "/modules/cctbx_project",
+        "/phenix/modules/cctbx",
+    )
+    if any(m in low for m in markers):
+        return True
+    # Bare source tree: .../libtbx next to load_env.py without a CCP4 prefix.
+    try:
+        p = Path(entry)
+        if (p / "libtbx" / "load_env.py").is_file() and "ccp4" not in low:
+            return True
+        if p.name == "libtbx" and (p / "load_env.py").is_file() and "ccp4" not in low:
+            return True
+    except OSError:
+        pass
+    return False
+
+
+def dials_subprocess_environ(
+    base: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Environment for CCP4/DIALS child processes.
+
+    Strips development ``cctbx_project`` entries from ``PYTHONPATH`` and clears
+    a stale ``LIBTBX_BUILD``. Otherwise CCP4 ``dials.*`` imports the local
+    source ``libtbx`` and dies looking for ``$CCP4/libtbx_env``::
+
+        FileNotFoundError: ... '/Applications/ccp4-9/libtbx_env'
+    """
+    env = dict(os.environ if base is None else base)
+    raw = env.get("PYTHONPATH", "")
+    if raw:
+        kept = [
+            part
+            for part in raw.split(os.pathsep)
+            if part and not _is_dev_cctbx_path(part)
+        ]
+        if kept:
+            env["PYTHONPATH"] = os.pathsep.join(kept)
+        else:
+            env.pop("PYTHONPATH", None)
+    # Empty or pointing at CCP4 without a pickled env breaks libtbx.unpickle.
+    build = (env.get("LIBTBX_BUILD") or "").strip()
+    if not build or _is_dev_cctbx_path(build) or build.rstrip("/").endswith("ccp4-9"):
+        env.pop("LIBTBX_BUILD", None)
+    env.pop("LIBTBX_OPATH", None)
+    return env
+
+
+def dials_shell_env_prefix() -> str:
+    """Shell snippet that applies :func:`dials_subprocess_environ` before a command."""
+    import shlex
+
+    env = dials_subprocess_environ()
+    parts: list[str] = []
+    # Drop inherited PYTHONPATH entirely when cleaned env has none.
+    if "PYTHONPATH" not in env:
+        parts.append("unset PYTHONPATH")
+    else:
+        parts.append(f"export PYTHONPATH={shlex.quote(env['PYTHONPATH'])}")
+    parts.append("unset LIBTBX_BUILD LIBTBX_OPATH")
+    return "; ".join(parts) + "; "
+
+
 @dataclass
 class DialsImageRange:
     """1-based inclusive DialS scan range (image numbers)."""
@@ -544,6 +613,7 @@ def _run_ccp4_python_script(script: str, *args: str) -> str:
         capture_output=True,
         text=True,
         check=False,
+        env=dials_subprocess_environ(),
     )
     if proc.returncode != 0:
         tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-20:]
@@ -725,7 +795,9 @@ class DialsEngine:
         quoted = " ".join(shlex.quote(str(c)) for c in cmd)
         # Line-buffer stdout when redirected to a file so Terminal/Jobs log
         # tailing sees output during long steps (e.g. dials.integrate).
+        env_prefix = dials_shell_env_prefix()
         shell_cmd = (
+            f"{env_prefix}"
             f"echo {shlex.quote('$ ' + display)}; "
             f"if command -v stdbuf >/dev/null 2>&1; then "
             f"stdbuf -oL -eL {quoted}; else {quoted}; fi"
@@ -787,6 +859,7 @@ class DialsEngine:
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            env=dials_subprocess_environ(),
         )
         assert proc.stdout is not None
         try:
@@ -1187,7 +1260,9 @@ class DialsEngine:
             args.append(str(expt))
         if refl.is_file():
             args.append(str(refl))
-        return subprocess.Popen(args, cwd=str(self.work_dir))
+        return subprocess.Popen(
+            args, cwd=str(self.work_dir), env=dials_subprocess_environ()
+        )
 
     def integrate(
         self,

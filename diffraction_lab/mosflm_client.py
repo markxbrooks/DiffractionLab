@@ -1,8 +1,11 @@
-"""Socket client for CCP4 ``ipmosflm`` (MOSFLMSOCKET protocol).
+"""Socket client for CCP4 / F77 ``ipmosflm`` (MOSFLMSOCKET protocol).
 
 Mirrors the launch / command path used by ``src/mosflm.tcl``:
 listen on localhost → start ``ipmosflm MOSFLMSOCKET <port>`` → send
 line-oriented keywords → receive one-line XML responses and ``<done>``.
+
+ProcessingLab's ``IntegrationLab`` does **not** implement MOSFLMSOCKET; see
+:mod:`diffraction_lab.processinglab_client` for CONTROL-script driving.
 """
 
 from __future__ import annotations

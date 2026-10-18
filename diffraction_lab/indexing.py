@@ -16,6 +16,14 @@ from typing import Sequence
 import numpy as np
 
 from diffraction_lab.mosflm_client import MosflmClient, MosflmMessage, find_ipmosflm
+from diffraction_lab.processinglab_client import (
+    build_autoindex_commands as pl_build_autoindex_commands,
+    build_process_commands as pl_build_process_commands,
+    find_integrationlab,
+    prefer_processinglab,
+    run_control_script,
+    spacegroup_for_system,
+)
 from diffraction_lab.spotfile import (
     Spot,
     SpotFileGeometry,
@@ -936,8 +944,72 @@ def _first_xml(messages: Sequence[MosflmMessage], doctype: str) -> ET.Element:
     raise RuntimeError(f"Mosflm did not return {doctype}")
 
 
+def _expand_numbered_template(
+    directory: Path, template: str, image_number: int
+) -> Path | None:
+    """Replace ``#`` runs in a Mosflm template with a zero-padded frame number."""
+    if "#" not in template:
+        path = Path(directory) / template
+        return path if path.is_file() else None
+    # Longest run of # first (e.g. #### then ###).
+    import re
+
+    def repl(match: "re.Match[str]") -> str:
+        width = len(match.group(0))
+        return f"{int(image_number):0{width}d}"
+
+    name = re.sub(r"#+", repl, template, count=1)
+    path = Path(directory) / name
+    return path if path.is_file() else None
+
+
+def resolve_indexing_backend(
+    *,
+    executable: Path | None = None,
+    backend: str | None = None,
+) -> tuple[str, Path]:
+    """Choose ``processinglab`` (IntegrationLab) or ``mosflm`` (F77 ipmosflm).
+
+    Returns ``(backend_name, executable_path)``.
+    """
+    if executable is not None:
+        name = executable.name.lower()
+        if "integrationlab" in name:
+            return "processinglab", Path(executable)
+        return "mosflm", Path(executable)
+
+    want = (backend or "").strip().lower()
+    pl = find_integrationlab()
+    mos = find_ipmosflm()
+
+    if want in {"processinglab", "integrationlab", "pl"}:
+        if pl is None:
+            raise FileNotFoundError(
+                "IntegrationLab not found. Build ProcessingLab (`make cpp`) or set "
+                "INTEGRATIONLAB / PROCESSINGLAB_HOME."
+            )
+        return "processinglab", pl
+    if want in {"mosflm", "ipmosflm", "f77"}:
+        if mos is None:
+            raise FileNotFoundError(
+                "ipmosflm not found. Install CCP4 or set MOSFLM_EXEC / ELMO_IPMOSFLM."
+            )
+        return "mosflm", mos
+
+    if prefer_processinglab() and pl is not None:
+        return "processinglab", pl
+    if mos is not None:
+        return "mosflm", mos
+    if pl is not None:
+        return "processinglab", pl
+    raise FileNotFoundError(
+        "No indexing backend found. Install CCP4 ipmosflm or ProcessingLab "
+        "IntegrationLab (set MOSFLM_EXEC or INTEGRATIONLAB)."
+    )
+
+
 class IndexingEngine:
-    """High-level indexing orchestrator using ``ipmosflm``."""
+    """High-level indexing orchestrator using ``ipmosflm`` or ProcessingLab."""
 
     def __init__(
         self,
@@ -945,15 +1017,15 @@ class IndexingEngine:
         work_dir: Path | None = None,
         settings: IndexingSettings | None = None,
         executable: Path | None = None,
+        backend: str | None = None,
     ) -> None:
         self.settings = settings or IndexingSettings()
         self.work_dir = Path(work_dir or (Path.home() / ".qtmosflm" / "work"))
         self.work_dir.mkdir(parents=True, exist_ok=True)
-        self.executable = executable or find_ipmosflm()
-        if self.executable is None:
-            raise FileNotFoundError(
-                "ipmosflm not found. Install CCP4 or set MOSFLM_EXEC / ELMO_IPMOSFLM."
-            )
+        self.backend, self.executable = resolve_indexing_backend(
+            executable=executable, backend=backend
+        )
+        logger.info("IndexingEngine backend=%s exe=%s", self.backend, self.executable)
 
     def find_spots_from_frames(
         self,
@@ -1057,6 +1129,11 @@ class IndexingEngine:
         phi_scan_end: float | None = None,
     ) -> MosaicityEstimation:
         """Estimate mosaic spread for *solution* (``mosaic estimate``, tutorial §5.6)."""
+        if self.backend == "processinglab":
+            raise RuntimeError(
+                "Mosaicity estimate requires F77 ipmosflm (MOSFLMSOCKET). "
+                "Set DIFFRACTIONLAB_BACKEND=mosflm or MOSFLM_EXEC to use CCP4 Mosflm."
+            )
         geometry, used_placeholder = ensure_indexable_template(geometry, self.work_dir)
         if used_placeholder:
             raise RuntimeError(
@@ -1161,13 +1238,23 @@ class IndexingEngine:
             raise ValueError("Indexing solution has no A-matrix")
         if geometry.is_hdf5_master:
             raise RuntimeError(
-                "Mosflm cannot integrate HDF5 / NeXus masters from DiffractionLab "
-                "(ipmosflm crashes when PROCESS opens the master file). "
-                "Use a native Mosflm image template (.img / .cbf / etc.), "
-                "or run integration in iMosflm on this dataset."
+                "Cannot integrate HDF5 / NeXus masters via Mosflm/ProcessingLab "
+                "from DiffractionLab (PROCESS opens the master file). "
+                "Use the DIALS backend for HDF5, or a native image template."
             )
         mtz_path = Path(mtz_path or (self.work_dir / "qtmosflm_integrate.mtz"))
         mtz_path.parent.mkdir(parents=True, exist_ok=True)
+        if self.backend == "processinglab":
+            return self._integrate_images_processinglab(
+                geometry,
+                solution,
+                image_range,
+                spacegroup=spacegroup,
+                mosaicity_deg=mosaicity_deg,
+                phi_start=phi_start,
+                oscillation_deg=oscillation_deg,
+                mtz_path=mtz_path,
+            )
         with MosflmClient(self.executable, self.work_dir) as client:
             stamp = time_stamp()
             gen = f"mosflm_{stamp}.gen"
@@ -1205,7 +1292,7 @@ class IndexingEngine:
         *,
         refine: bool = True,
     ) -> IndexingResult:
-        """Run Mosflm DPS autoindexing (+ optional refinement of low-penalty solutions)."""
+        """Run DPS autoindexing (+ optional Mosflm refinement of low-penalty solutions)."""
         messages_log: list[str] = []
         geometry, used_placeholder = ensure_indexable_template(geometry, self.work_dir)
         if used_placeholder:
@@ -1223,6 +1310,14 @@ class IndexingEngine:
             if spotfile.resolve() != target.resolve():
                 target.write_bytes(spotfile.read_bytes())
             spotfile = target
+
+        if self.backend == "processinglab":
+            return self._autoindex_processinglab(
+                geometry,
+                spotfile,
+                messages_log=messages_log,
+                used_placeholder=used_placeholder,
+            )
 
         with MosflmClient(self.executable, self.work_dir) as client:
             stamp = time_stamp()
@@ -1308,6 +1403,148 @@ class IndexingEngine:
             uses_placeholder_template=used_placeholder,
         )
 
+    def _autoindex_processinglab(
+        self,
+        geometry: IndexingGeometry,
+        spotfile: Path,
+        *,
+        messages_log: list[str],
+        used_placeholder: bool,
+    ) -> IndexingResult:
+        """DPS AUTOINDEX via ProcessingLab ``IntegrationLab`` CONTROL script."""
+        cmds = pl_build_autoindex_commands(
+            directory=self.work_dir,
+            spotfile=spotfile,
+            distance_mm=float(geometry.distance_mm),
+            wavelength_a=float(geometry.wavelength_a),
+            beam_x_mm=float(geometry.beam_x_mm),
+            beam_y_mm=float(geometry.beam_y_mm),
+            pixel_mm=float(geometry.pixel_size_mm),
+            threshold=float(self.settings.i_sig_i),
+            hkldev=float(self.settings.hkldev_max),
+            nvect=int(self.settings.numvectors),
+            nvref=int(self.settings.numvectors),
+        )
+        run = run_control_script(
+            self.executable,
+            cmds,
+            work_dir=self.work_dir,
+            timeout_s=300.0,
+        )
+        messages_log.extend(run.log_lines[-40:])
+        if run.returncode != 0:
+            raise RuntimeError(
+                f"IntegrationLab AUTOINDEX failed (rc={run.returncode}). "
+                f"See {self.work_dir / 'integrationlab.log'}"
+            )
+        if run.autoindex is None:
+            raise RuntimeError(
+                "IntegrationLab AUTOINDEX produced no CELL/MATRIX dump. "
+                f"See {self.work_dir / 'integrationlab.log'}"
+            )
+        dump = run.autoindex
+        lattice = dump.system or "aP"
+        sg = spacegroup_for_system(lattice)
+        sol = IndexSolution(
+            number=1,
+            kind="reg",
+            penalty=0.0,
+            lattice=lattice,
+            spacegroup=sg,
+            a=dump.cell[0],
+            b=dump.cell[1],
+            c=dump.cell[2],
+            alpha=dump.cell[3],
+            beta=dump.cell[4],
+            gamma=dump.cell[5],
+            matrix=tuple(float(x) for x in dump.matrix),
+            reflections_used=dump.n_spots or None,
+        )
+        messages_log.append(
+            f"ProcessingLab IntegrationLab AUTOINDEX: {lattice} {sg} "
+            f"cell={dump.cell}"
+        )
+        n_spots = count_spots_in_spotfile(spotfile)
+        return IndexingResult(
+            spotfile=spotfile,
+            n_spots=n_spots,
+            suggested_number=1,
+            solutions=[sol],
+            refined=[sol],
+            messages=messages_log,
+            geometry=geometry,
+            uses_placeholder_template=used_placeholder,
+        )
+
+    def _integrate_images_processinglab(
+        self,
+        geometry: IndexingGeometry,
+        solution: IndexSolution,
+        image_range: IntegrationImageRange,
+        *,
+        spacegroup: str,
+        mosaicity_deg: float,
+        phi_start: float,
+        oscillation_deg: float,
+        mtz_path: Path,
+    ) -> IntegrationResult:
+        """PROCESS via ProcessingLab ``IntegrationLab`` CONTROL script."""
+        cmds = pl_build_process_commands(
+            directory=Path(geometry.directory),
+            image_path=None,
+            template=geometry.template,
+            distance_mm=float(geometry.distance_mm),
+            wavelength_a=float(geometry.wavelength_a),
+            beam_x_mm=float(geometry.beam_x_mm),
+            beam_y_mm=float(geometry.beam_y_mm),
+            pixel_mm=float(geometry.pixel_size_mm),
+            cell=solution.cell_tuple,
+            matrix=solution.matrix,
+            symmetry=spacegroup,
+            mosaic_deg=float(mosaicity_deg),
+            process_first=int(image_range.first_image),
+            process_last=int(image_range.last_image),
+            phi_start=float(phi_start),
+            osc_deg=float(oscillation_deg),
+        )
+        # Resolve a concrete image for IntegrationLab ``--image`` when possible.
+        img_override = None
+        if not geometry.is_hdf5_master:
+            img_override = _expand_numbered_template(
+                Path(geometry.directory),
+                geometry.template,
+                int(image_range.first_image),
+            )
+            if img_override is None:
+                stem = geometry.template.split("#")[0]
+                for p in sorted(Path(geometry.directory).glob(stem + "*")):
+                    if p.suffix.lower() in {".cbf", ".img", ".smv", ".mccd"}:
+                        img_override = p
+                        break
+
+        run = run_control_script(
+            self.executable,
+            cmds,
+            work_dir=self.work_dir,
+            hklout=mtz_path,
+            image=img_override,
+            timeout_s=600.0,
+        )
+        if run.returncode != 0 or run.mtz_path is None:
+            raise RuntimeError(
+                f"IntegrationLab PROCESS failed (rc={run.returncode}). "
+                f"See {self.work_dir / 'integrationlab.log'}"
+            )
+        if run.mtz_path.resolve() != mtz_path.resolve():
+            mtz_path.write_bytes(run.mtz_path.read_bytes())
+        n_images = image_range.last_image - image_range.first_image + 1
+        return IntegrationResult(
+            mtz_path=mtz_path,
+            image_range=image_range,
+            n_images=n_images,
+            message="ProcessingLab IntegrationLab PROCESS complete",
+        )
+
     def refine_index_solution(
         self,
         geometry: IndexingGeometry,
@@ -1328,6 +1565,12 @@ class IndexingEngine:
         same socket session before sending ``cell``, ``symmetry``, ``validate``,
         and ``autoindex dps solution …``.
         """
+        if self.backend == "processinglab":
+            raise RuntimeError(
+                "Space-group refine (index2) requires F77 ipmosflm. "
+                "ProcessingLab IntegrationLab returns a single AUTOINDEX solution; "
+                "set DIFFRACTIONLAB_BACKEND=mosflm for Mosflm refinement."
+            )
         geometry, used_placeholder = ensure_indexable_template(geometry, self.work_dir)
         if used_placeholder:
             raise RuntimeError(

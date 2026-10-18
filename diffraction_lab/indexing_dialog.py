@@ -104,6 +104,10 @@ from diffraction_lab.indexing import (
     spots_for_frame,
 )
 from diffraction_lab.mosflm_client import find_ipmosflm
+from diffraction_lab.processinglab_client import (
+    find_integrationlab,
+    prefer_processinglab,
+)
 from diffraction_lab.reflection_viewer_launch import launch_reflection_viewer
 from diffraction_lab.summary_vs_resolution import open_summary_vs_resolution_from_work_dir
 from diffraction_lab.terminal_log_viewer import TerminalLogViewer
@@ -1483,19 +1487,51 @@ class IndexingDialog(QDialog):
                 self.run_button.setEnabled(False)
                 self.full_pipeline_button.setEnabled(True)
         else:
-            self.backend_label.setText("Backend: Mosflm (native image templates).")
-            self.find_spots_button.setText("Find spots")
-            self.run_button.setText("Run DPS indexing")
-            self.integrate_button.setText("Integrate selected wedge")
-            if mosflm is None:
-                self.status_label.setText(
-                    "ipmosflm not found — install CCP4 or set MOSFLM_EXEC."
+            pl = find_integrationlab()
+            use_pl = prefer_processinglab() and pl is not None
+            if use_pl or (mosflm is None and pl is not None):
+                self.backend_label.setText(
+                    "Backend: ProcessingLab IntegrationLab "
+                    "(C++ CONTROL; set DIFFRACTIONLAB_BACKEND=mosflm for F77)."
                 )
+                self.find_spots_button.setText("Find spots")
+                self.run_button.setText("Run DPS indexing (ProcessingLab)")
+                self.integrate_button.setText("Integrate selected wedge")
+                self.status_label.setText(f"Using {pl}")
                 self.run_button.setEnabled(False)
-                self.find_spots_button.setEnabled(False)
+                self.mosaicity_estimate_button.setEnabled(False)
+                self.mosaicity_estimate_button.setToolTip(
+                    "Mosaicity estimate needs F77 ipmosflm (MOSFLMSOCKET)."
+                )
+                self.refine_button.setEnabled(False)
+                self.refine_button.setToolTip(
+                    "index2 refine needs F77 ipmosflm; IntegrationLab returns "
+                    "one AUTOINDEX solution."
+                )
             else:
-                self.status_label.setText(f"Using {mosflm}")
-                self.run_button.setEnabled(False)
+                self.backend_label.setText(
+                    "Backend: Mosflm (native image templates; F77 ipmosflm)."
+                )
+                self.find_spots_button.setText("Find spots")
+                self.run_button.setText("Run DPS indexing")
+                self.integrate_button.setText("Integrate selected wedge")
+                if mosflm is None:
+                    self.status_label.setText(
+                        "ipmosflm / IntegrationLab not found — install CCP4, "
+                        "build ProcessingLab (`make cpp`), or set MOSFLM_EXEC / "
+                        "INTEGRATIONLAB."
+                    )
+                    self.run_button.setEnabled(False)
+                    self.find_spots_button.setEnabled(False)
+                else:
+                    hint = ""
+                    if pl is not None:
+                        hint = (
+                            " (ProcessingLab also found — set "
+                            "DIFFRACTIONLAB_PREFER_PROCESSINGLAB=1 to use it)"
+                        )
+                    self.status_label.setText(f"Using {mosflm}{hint}")
+                    self.run_button.setEnabled(False)
 
         self._apply_dials_chrome(self._use_dials)
         self._reset_pipeline_checklist()
@@ -1943,8 +1979,14 @@ class IndexingDialog(QDialog):
         hklin = self.pointless_hklin_edit.text().strip() or None
         hklout = self.pointless_hklout_edit.text().strip() or None
         log = str(self._last_dials_log) if self._last_dials_log is not None else None
+        if self._use_dials:
+            backend_name = "dials"
+        elif prefer_processinglab() and find_integrationlab() is not None:
+            backend_name = "processinglab"
+        else:
+            backend_name = "mosflm"
         return ProcessingState(
-            backend="dials" if self._use_dials else "mosflm",
+            backend=backend_name,
             master_path=master,
             work_dir=work_dir,
             dials_settings=self._dials_values_from_ui(),

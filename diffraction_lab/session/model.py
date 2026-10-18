@@ -33,7 +33,7 @@ class ViewerState:
 class ProcessingState:
     """Processing dialog state persisted in a Session."""
 
-    backend: str = "mosflm"  # "dials" | "mosflm"
+    backend: str = "mosflm"  # "dials" | "mosflm" | "processinglab"
     master_path: str | None = None
     work_dir: str | None = None
     dials_settings: dict[str, Any] = field(default_factory=dict)

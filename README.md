@@ -4,7 +4,7 @@
 
 **Interactive X-ray diffraction imaging, indexing, and processing with Python and Qt**
 
-DiffractionLab is a PySide6 desktop application for inspecting crystallographic diffraction images and running interactive indexing workflows. It combines the classic **MOSFLM DPS** indexing workflow with **DIALS** processing for HDF5 / NeXus datasets.
+DiffractionLab is a PySide6 desktop application for inspecting crystallographic diffraction images and running interactive indexing workflows. It combines the classic **MOSFLM DPS** indexing workflow (CCP4 F77 `ipmosflm` or **ProcessingLab** `IntegrationLab`) with **DIALS** processing for HDF5 / NeXus datasets.
 
 The repository contains:
 
@@ -69,13 +69,31 @@ Optional dependencies:
 
 | Task | Tool | Notes |
 |---|---|---|
-| MOSFLM DPS indexing | **MOSFLM** (CCP4) | Used for supported non-HDF5 datasets |
+| MOSFLM DPS indexing / integrate | **MOSFLM** (CCP4 `ipmosflm`) or **ProcessingLab** (`IntegrationLab`) | Non-HDF5; see env vars below |
 | HDF5 / NeXus spot finding, indexing, and integration | **DIALS** (CCP4 or standalone) | Used for Eiger and other compatible HDF5 / NeXus datasets |
 | Job history / local queue | **SchedArray** (optional) | Persists CLI jobs; live logs still tailed by the Terminal viewer |
+
+**Backend selection (non-HDF5):**
+
+| Env | Effect |
+|---|---|
+| `DIFFRACTIONLAB_BACKEND=processinglab` | Force ProcessingLab `IntegrationLab` |
+| `DIFFRACTIONLAB_BACKEND=mosflm` | Force F77 `ipmosflm` (MOSFLMSOCKET) |
+| `DIFFRACTIONLAB_PREFER_PROCESSINGLAB=1` | Prefer IntegrationLab when both are installed |
+| `INTEGRATIONLAB` / `PROCESSINGLAB_HOME` | Path to `IntegrationLab` binary or ProcessingLab root |
+| `MOSFLM_EXEC` | Path to F77 `ipmosflm` |
+
+Default: use F77 Mosflm when found; otherwise fall back to IntegrationLab. ProcessingLab does not implement `MOSFLMSOCKET` (mosaicity estimate / index2 refine stay Mosflm-only).
 
 DiffractionLab searches for DIALS commands on `PATH`, under `$DIALS_DIR` or `$CCP4`, and in common CCP4 installation prefixes (for example, `/Applications/ccp4-9`). Spot / prediction overlay export may use CCP4's Python when DIALS cannot be imported in the active virtual environment.
 
 Ensure that CCP4 or a standalone DIALS installation is available in your shell when using indexing or HDF5 processing.
+
+If `dials.import` fails with `FileNotFoundError: .../ccp4-9/libtbx_env` while importing from
+`…/projects/cctbx_project/libtbx/…`, a development CCTBX checkout is on `PYTHONPATH` and is
+shadowing CCP4’s `libtbx`. DiffractionLab strips those paths for DIALS child processes; for a
+manual shell fix: `unset PYTHONPATH LIBTBX_BUILD` (or remove `cctbx_project` from `PYTHONPATH`)
+before running `dials.import`.
 
 ### SchedArray job backend (optional)
 
