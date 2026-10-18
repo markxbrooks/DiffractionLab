@@ -1607,7 +1607,7 @@ class ProcessingWizard(QDialog):
                     self.status_label.setText(
                         "ipmosflm / ProcessingLab not found — install CCP4, "
                         "build ProcessingLab (`make cpp`), or set MOSFLM_EXEC / "
-                        "INTEGRATIONLAB."
+                        "PROCESSINGLAB."
                     )
                     self.run_button.setEnabled(False)
                     self.find_spots_button.setEnabled(False)
@@ -4635,6 +4635,34 @@ class ProcessingWizard(QDialog):
         Named to avoid shadowing :meth:`QDialog.result`.
         """
         return self._result
+
+    def current_mosflm_spotfile(self) -> Path | None:
+        """Path to the Mosflm ``.spt`` from Find spots / indexing, if present."""
+        if self._spotfinding is not None:
+            path = Path(self._spotfinding.spotfile)
+            if path.is_file():
+                return path
+        if self._result is not None:
+            path = Path(self._result.spotfile)
+            if path.is_file():
+                return path
+        return None
+
+    def save_mosflm_spotfile(self, path: Path) -> Path:
+        """Copy the current Mosflm spotfile to ``path`` (``.spt``).
+
+        :raises RuntimeError: if no Mosflm spotfile is available yet
+        :raises OSError: on I/O failure
+        """
+        from diffraction_lab.spotfile import copy_spotfile
+
+        src = self.current_mosflm_spotfile()
+        if src is None:
+            raise RuntimeError(
+                "No Mosflm spot file yet. Open Process…, run Find spots "
+                "(MOSFLM path, not DIALS), then save again."
+            )
+        return copy_spotfile(src, path)
 
     def closeEvent(self, event) -> None:  # noqa: N802
         """Clear the spot overlay when the indexing window closes."""

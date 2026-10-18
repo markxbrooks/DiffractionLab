@@ -736,6 +736,12 @@ class DiffractionLabApp(QMainWindow):
         )
         self._act_save_session_as.triggered.connect(self.save_session_as_action)
 
+        self._act_save_spotfile = QAction("Save Spot &File…", self)
+        self._act_save_spotfile.setStatusTip(
+            "Save the Mosflm spot list (.spt) from Find spots to a chosen path"
+        )
+        self._act_save_spotfile.triggered.connect(self.save_spotfile_action)
+
         self._act_reload = QAction(
             _registry_icon(_icon_key("MDI_REFRESH", _icon_key("REFRESH"))),
             "&Reload",
@@ -878,6 +884,7 @@ class DiffractionLabApp(QMainWindow):
         self._refresh_recent_sessions_menu()
         file_menu.addAction(self._act_save_session)
         file_menu.addAction(self._act_save_session_as)
+        file_menu.addAction(self._act_save_spotfile)
         file_menu.addSeparator()
         file_menu.addAction(self._act_invert)
         file_menu.addAction(self._act_histogram)
@@ -898,6 +905,7 @@ class DiffractionLabApp(QMainWindow):
 
         process_menu = self.menuBar().addMenu("&Process")
         process_menu.addAction(self._act_index)
+        process_menu.addAction(self._act_save_spotfile)
 
     def _refresh_recent_files_menu(self) -> None:
         """Rebuild the Open Recent submenu from persisted paths."""
@@ -1211,6 +1219,40 @@ class DiffractionLabApp(QMainWindow):
         if path.suffix.lower() not in (SESSION_SUFFIX, ".json"):
             path = path.with_suffix(SESSION_SUFFIX)
         self._write_session(path)
+
+    def save_spotfile_action(self) -> None:
+        """Prompt for a path and save the current Mosflm ``.spt`` spot list."""
+        dialog = self._processing_wizard
+        if dialog is None or dialog.current_mosflm_spotfile() is None:
+            QMessageBox.information(
+                self,
+                "Save Spot File",
+                "No Mosflm spot file is available yet.\n\n"
+                "Open Process…, run Find spots on the MOSFLM path "
+                "(not DIALS), then use Save Spot File again.",
+            )
+            return
+        start = ""
+        if self.current_file:
+            start = str(Path(self.current_file).with_suffix(".spt"))
+        else:
+            src = dialog.current_mosflm_spotfile()
+            if src is not None:
+                start = str(src.with_suffix(".spt"))
+        chosen, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Spot File",
+            start,
+            "Mosflm spot list (*.spt);;All files (*)",
+        )
+        if not chosen:
+            return
+        try:
+            saved = dialog.save_mosflm_spotfile(Path(chosen))
+        except Exception as ex:
+            QMessageBox.warning(self, "Save Spot File", str(ex))
+            return
+        self.statusBar().showMessage(f"Saved spot file {saved}", 5000)
 
     def _write_session(self, path: Path) -> None:
         """Serialize the current UI to *path*."""

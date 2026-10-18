@@ -10,7 +10,6 @@ import random
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import cv2
 import numpy as np
 
 
@@ -128,6 +127,22 @@ def new_temp_spotfilename(directory: Path) -> Path:
     raise RuntimeError(f"Could not create temporary spotfile in {directory}")
 
 
+def copy_spotfile(source: Path, destination: Path) -> Path:
+    """Copy a Mosflm ``.spt`` (or temp spotfile) to ``destination``.
+
+    If ``destination`` has no ``.spt`` / ``.tmp`` suffix, ``.spt`` is appended.
+    """
+    source = Path(source)
+    destination = Path(destination)
+    if destination.suffix.lower() not in {".spt", ".tmp"}:
+        destination = destination.with_suffix(".spt")
+    if not source.is_file():
+        raise FileNotFoundError(f"Spot file not found: {source}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(source.read_bytes())
+    return destination
+
+
 def find_spots_in_frame(
     frame: np.ndarray,
     *,
@@ -143,6 +158,8 @@ def find_spots_in_frame(
     indexing from frames already loaded in DiffractionLab (e.g. HDF5). When the
     Mosflm binary can read the images directly, prefer its findspots path.
     """
+    import cv2  # local: keep spotfile I/O usable without OpenCV installed
+
     data = np.asarray(frame, dtype=np.float64)
     if data.ndim != 2:
         raise ValueError(f"Expected 2-D frame, got shape {data.shape}")

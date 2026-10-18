@@ -15,11 +15,11 @@ from diffraction_lab.processinglab_client import (
 def test_parse_autoindex_dump_stdout() -> None:
     text = """
   AUTOINDEX: AUTOINDEX complete
-INTEGRATIONLAB_CELL 78.19 78.19 78.19 90 90 90
-INTEGRATIONLAB_MATRIX -0.01 0 0 0 -0.01 0 0 0 -0.01
-INTEGRATIONLAB_SYSTEM cI
-INTEGRATIONLAB_CHARACTER 12
-INTEGRATIONLAB_NSPOTS 438
+PROCESSINGLAB_CELL 78.19 78.19 78.19 90 90 90
+PROCESSINGLAB_MATRIX -0.01 0 0 0 -0.01 0 0 0 -0.01
+PROCESSINGLAB_SYSTEM cI
+PROCESSINGLAB_CHARACTER 12
+PROCESSINGLAB_NSPOTS 438
 """
     dump = parse_autoindex_dump(text)
     assert dump is not None
@@ -40,7 +40,7 @@ def test_parse_autoindex_dump_sidecar() -> None:
 
 
 def test_parse_autoindex_dump_incomplete() -> None:
-    assert parse_autoindex_dump("INTEGRATIONLAB_CELL 1 2 3 4 5 6\n") is None
+    assert parse_autoindex_dump("PROCESSINGLAB_CELL 1 2 3 4 5 6\n") is None
 
 
 def test_spacegroup_for_system() -> None:

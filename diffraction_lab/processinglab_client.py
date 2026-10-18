@@ -2,7 +2,7 @@
 
 ``ProcessingLab`` does **not** speak ``MOSFLMSOCKET`` (that remains CCP4 /
 F77 ``ipmosflm``). DiffractionLab drives it with CONTROL scripts on stdin and
-parses machine-readable ``INTEGRATIONLAB_*`` lines (or
+parses machine-readable ``PROCESSINGLAB_*`` lines (or
 ``integrationlab_index.txt``) after AUTOINDEX.
 """
 
@@ -22,10 +22,10 @@ logger = logging.getLogger(__name__)
 def find_integrationlab() -> Path | None:
     """Locate ProcessingLab ``ProcessingLab`` (``.exe`` on Windows)."""
     for key in (
-        "INTEGRATIONLAB",
+        "PROCESSINGLAB",
         "PROCESSINGLAB_EXEC",
         "PROCESSINGLAB_BIN",
-        "ELMO_INTEGRATIONLAB",
+        "ELMO_PROCESSINGLAB",
     ):
         value = os.environ.get(key)
         if not value:
@@ -127,7 +127,7 @@ class ProcessingLabRun:
 
 
 def parse_autoindex_dump(text: str) -> AutoIndexDump | None:
-    """Parse ``INTEGRATIONLAB_*`` lines from stdout (or a sidecar file)."""
+    """Parse ``PROCESSINGLAB_*`` lines from stdout (or a sidecar file)."""
     cell: tuple[float, ...] | None = None
     matrix: list[float] = []
     system = ""
@@ -138,20 +138,20 @@ def parse_autoindex_dump(text: str) -> AutoIndexDump | None:
         if not line:
             continue
         # Sidecar format uses CELL / MATRIX without prefix.
-        if line.startswith("INTEGRATIONLAB_CELL ") or line.startswith("CELL "):
+        if line.startswith("PROCESSINGLAB_CELL ") or line.startswith("CELL "):
             parts = line.split()
             vals = [float(x) for x in parts[1:7]]
             if len(vals) == 6:
                 cell = tuple(vals)  # type: ignore[assignment]
             continue
-        if line.startswith("INTEGRATIONLAB_MATRIX ") or line.startswith("MATRIX "):
+        if line.startswith("PROCESSINGLAB_MATRIX ") or line.startswith("MATRIX "):
             parts = line.split()
             matrix = [float(x) for x in parts[1:10]]
             continue
-        if line.startswith("INTEGRATIONLAB_SYSTEM ") or line.startswith("SYSTEM "):
+        if line.startswith("PROCESSINGLAB_SYSTEM ") or line.startswith("SYSTEM "):
             system = line.split(None, 1)[1].strip()
             continue
-        if line.startswith("INTEGRATIONLAB_CHARACTER ") or line.startswith(
+        if line.startswith("PROCESSINGLAB_CHARACTER ") or line.startswith(
             "CHARACTER "
         ):
             try:
@@ -159,7 +159,7 @@ def parse_autoindex_dump(text: str) -> AutoIndexDump | None:
             except (IndexError, ValueError):
                 pass
             continue
-        if line.startswith("INTEGRATIONLAB_NSPOTS ") or line.startswith("NSPOTS "):
+        if line.startswith("PROCESSINGLAB_NSPOTS ") or line.startswith("NSPOTS "):
             try:
                 n_spots = int(line.split()[1])
             except (IndexError, ValueError):
