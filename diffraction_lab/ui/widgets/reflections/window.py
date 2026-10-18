@@ -5,11 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from decologr import Decologr as log
-from picoui.icons import IconRegistry
-from picoui.theme import ThemeManager, ThemeType
-from picoui.widget.viewer_chrome import icon_from_registry, icon_label, standard_zoom_actions
 from PySide6.QtCore import Qt, QSettings, QSize
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtGui import QAction, QActionGroup, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -31,6 +28,102 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+try:
+    from picoui.icons import IconRegistry
+    from picoui.theme import ThemeManager, ThemeType
+    from picoui.widget.viewer_chrome import (
+        icon_from_registry as _picoui_icon_from_registry,
+        icon_label as _picoui_icon_label,
+        standard_zoom_actions as _picoui_standard_zoom_actions,
+    )
+
+    _HAS_PICOUI = True
+except ImportError:  # pragma: no cover - optional when run outside ElMo venv
+    IconRegistry = None  # type: ignore[assignment, misc]
+    ThemeManager = None  # type: ignore[assignment, misc]
+    ThemeType = None  # type: ignore[assignment, misc]
+    _picoui_icon_from_registry = None  # type: ignore[assignment]
+    _picoui_icon_label = None  # type: ignore[assignment]
+    _picoui_standard_zoom_actions = None  # type: ignore[assignment]
+    _HAS_PICOUI = False
+
+
+def _icon_key(attr: str, fallback: str = "") -> str:
+    """Resolve an :class:`IconRegistry` attribute when PicoUI is available."""
+    if not _HAS_PICOUI or IconRegistry is None:
+        return fallback
+    return getattr(IconRegistry, attr, fallback) or fallback
+
+
+def _registry_icon(icon_key: str) -> QIcon:
+    """Return an IconRegistry icon, or an empty icon if PicoUI is unavailable."""
+    if not icon_key:
+        return QIcon()
+    if _HAS_PICOUI and _picoui_icon_from_registry is not None:
+        return _picoui_icon_from_registry(icon_key)
+    if _HAS_PICOUI and IconRegistry is not None:
+        return IconRegistry.get_icon_safe(icon_key)
+    return QIcon()
+
+
+def _icon_label(icon_key: str, text: str) -> tuple[QWidget, QLabel]:
+    """Build an icon + text readout (PicoUI chrome when available)."""
+    if _HAS_PICOUI and _picoui_icon_label is not None:
+        return _picoui_icon_label(icon_key, text, margin_right=8)
+    host = QWidget()
+    row = QHBoxLayout(host)
+    row.setContentsMargins(0, 0, 8, 0)
+    row.setSpacing(4)
+    if icon_key:
+        icon = QLabel()
+        icon.setPixmap(_registry_icon(icon_key).pixmap(16, 16))
+        row.addWidget(icon)
+    label = QLabel(text)
+    row.addWidget(label)
+    return host, label
+
+
+def _standard_zoom_actions(parent: QWidget, **kwargs):
+    """Zoom In / Out / Reset — PicoUI chrome when available."""
+    if _HAS_PICOUI and _picoui_standard_zoom_actions is not None:
+        return _picoui_standard_zoom_actions(parent, **kwargs)
+    zoom_in = QAction("Zoom &In", parent)
+    zoom_in.setShortcut(QKeySequence("Ctrl+="))
+    zoom_in.setStatusTip(kwargs.get("zoom_in_tip", "Zoom in"))
+    zoom_in.triggered.connect(kwargs["on_zoom_in"])
+    zoom_out = QAction("Zoom &Out", parent)
+    zoom_out.setShortcut(QKeySequence("Ctrl+-"))
+    zoom_out.setStatusTip(kwargs.get("zoom_out_tip", "Zoom out"))
+    zoom_out.triggered.connect(kwargs["on_zoom_out"])
+    reset = QAction("&Reset Zoom", parent)
+    reset.setShortcut(QKeySequence("Ctrl+0"))
+    reset.setStatusTip(kwargs.get("reset_tip", "Reset zoom"))
+    reset.triggered.connect(kwargs["on_reset"])
+    if _HAS_PICOUI:
+        zoom_in.setIcon(_registry_icon(_icon_key("ZOOM_IN")))
+        zoom_out.setIcon(_registry_icon(_icon_key("ZOOM_OUT")))
+        reset.setIcon(_registry_icon(_icon_key("FIT_TO_PAGE", _icon_key("RECENTER_VIEW"))))
+    return zoom_in, zoom_out, reset
+
+
+def _theme_colors() -> dict[str, str]:
+    """Return ThemeManager CSS colors, with dark fallbacks when unavailable."""
+    if _HAS_PICOUI and ThemeManager is not None:
+        try:
+            return dict(ThemeManager.css_colors())
+        except Exception:
+            pass
+    return {
+        "base": "#202124",
+        "button": "#3f4042",
+        "window": "#202124",
+        "text": "#e1e5e9",
+        "mid": "#3f4042",
+        "highlight": "#8ab4f7",
+        "highlighted_text": "#202124",
+        "alternate": "#292a2d",
+    }
 
 from molib.xtal.reflections.errors import (
     ReflectionLoadError,
@@ -122,13 +215,16 @@ class ReflectionViewerWindow(QMainWindow):
         self._recent_files = RecentFilesManager()
 
         self._filter = ViewerFilterState(zone=ZoneSpec.from_preset(ZonePreset.HK0))
+        self._current_theme = None
 
-        try:
-            ThemeManager.initialize(ThemeType.AUTO)
-        except Exception as ex:
-            log.warning(f"ThemeManager.initialize failed: {ex}")
+        if _HAS_PICOUI and ThemeManager is not None and ThemeType is not None:
+            try:
+                ThemeManager.initialize(ThemeType.AUTO)
+                self._current_theme = ThemeType.AUTO
+            except Exception as ex:
+                log.warning(f"ThemeManager.initialize failed: {ex}")
 
-        self.setWindowIcon(icon_from_registry(IconRegistry.CHART_SCATTER_PLOT))
+        self.setWindowIcon(_registry_icon(_icon_key("CHART_SCATTER_PLOT")))
         self._build_actions()
         self._build_menus()
         self._build_toolbar()
@@ -141,7 +237,7 @@ class ReflectionViewerWindow(QMainWindow):
     def _build_actions(self) -> None:
         """Create QActions shared by menus and the toolbar."""
         self._act_open = QAction(
-            icon_from_registry(IconRegistry.FOLDER_OPENED),
+            _registry_icon(_icon_key("FOLDER_OPENED")),
             "&Open…",
             self,
         )
@@ -149,7 +245,7 @@ class ReflectionViewerWindow(QMainWindow):
         self._act_open.setStatusTip("Open an MTZ or structure-factor CIF file")
 
         self._act_reload = QAction(
-            icon_from_registry(IconRegistry.MDI_REFRESH),
+            _registry_icon(_icon_key("MDI_REFRESH")),
             "&Reload",
             self,
         )
@@ -160,7 +256,7 @@ class ReflectionViewerWindow(QMainWindow):
             self._act_zoom_in,
             self._act_zoom_out,
             self._act_reset_zoom,
-        ) = standard_zoom_actions(
+        ) = _standard_zoom_actions(
             self,
             on_zoom_in=lambda: self._plot.zoom_in(),
             on_zoom_out=lambda: self._plot.zoom_out(),
@@ -171,7 +267,7 @@ class ReflectionViewerWindow(QMainWindow):
         )
 
         self._act_axes = QAction(
-            icon_from_registry(IconRegistry.AXIS_X_ARROW),
+            _registry_icon(_icon_key("AXIS_X_ARROW")),
             "Show &axes",
             self,
         )
@@ -180,7 +276,7 @@ class ReflectionViewerWindow(QMainWindow):
         self._act_axes.setStatusTip("Toggle reciprocal-space axes")
 
         self._act_symmetry = QAction(
-            icon_from_registry(IconRegistry.AUTO_ROTATE),
+            _registry_icon(_icon_key("AUTO_ROTATE")),
             "Show &symmetry axes",
             self,
         )
@@ -189,7 +285,7 @@ class ReflectionViewerWindow(QMainWindow):
         self._act_symmetry.setStatusTip("Toggle symmetry-axis overlays")
 
         self._act_contours = QAction(
-            icon_from_registry(IconRegistry.CIRCLE_OUTLINE),
+            _registry_icon(_icon_key("CIRCLE_OUTLINE")),
             "Show resolution &contours",
             self,
         )
@@ -198,19 +294,38 @@ class ReflectionViewerWindow(QMainWindow):
         self._act_contours.setStatusTip("Toggle resolution contour rings")
 
         self._act_summary = QAction(
-            icon_from_registry(IconRegistry.INFO),
+            _registry_icon(_icon_key("INFO")),
             "Show Summary &Tab",
             self,
         )
         self._act_summary.setStatusTip("Switch to the Summary tab")
 
         self._act_quit = QAction(
-            icon_from_registry(IconRegistry.EXIT),
+            _registry_icon(_icon_key("EXIT")),
             "&Quit",
             self,
         )
         self._act_quit.setShortcut(QKeySequence.StandardKey.Quit)
         self._act_quit.setStatusTip("Close the Reflection Viewer")
+
+        self._act_theme_auto = QAction("&Auto", self)
+        self._act_theme_auto.setCheckable(True)
+        self._act_theme_auto.setStatusTip("Follow the system light/dark setting")
+        self._act_theme_light = QAction("&Light", self)
+        self._act_theme_light.setCheckable(True)
+        self._act_theme_light.setStatusTip("Use the light theme")
+        self._act_theme_dark = QAction("&Dark", self)
+        self._act_theme_dark.setCheckable(True)
+        self._act_theme_dark.setStatusTip("Use the dark theme")
+        self._theme_group = QActionGroup(self)
+        self._theme_group.setExclusive(True)
+        for action in (
+            self._act_theme_auto,
+            self._act_theme_light,
+            self._act_theme_dark,
+        ):
+            self._theme_group.addAction(action)
+        self._act_theme_auto.setChecked(True)
 
     def _build_menus(self) -> None:
         """Build File / View menus (DiffractionLab-style chrome)."""
@@ -234,6 +349,12 @@ class ReflectionViewerWindow(QMainWindow):
         view_menu.addAction(self._act_contours)
         view_menu.addSeparator()
         view_menu.addAction(self._act_summary)
+        if _HAS_PICOUI:
+            theme_menu = view_menu.addMenu("&Theme")
+            theme_menu.setIcon(_registry_icon(_icon_key("COLOR", _icon_key("PALETTE"))))
+            theme_menu.addAction(self._act_theme_auto)
+            theme_menu.addAction(self._act_theme_light)
+            theme_menu.addAction(self._act_theme_dark)
 
     def _refresh_recent_files_menu(self) -> None:
         """Rebuild the Open Recent submenu from persisted paths."""
@@ -298,20 +419,20 @@ class ReflectionViewerWindow(QMainWindow):
         meta_layout = QVBoxLayout(meta_host)
         meta_layout.setContentsMargins(8, 2, 8, 2)
         meta_layout.setSpacing(2)
-        sg_host, self._meta_space_group = icon_label(
-            IconRegistry.SYMMETRY_MATES_TAB, "Space group: —"
+        sg_host, self._meta_space_group = _icon_label(
+            _icon_key("SYMMETRY_MATES_TAB"), "Space group: —"
         )
-        cell_host, self._meta_unit_cell = icon_label(
-            IconRegistry.CUBE, "Unit cell (file): —"
+        cell_host, self._meta_unit_cell = _icon_label(
+            _icon_key("CUBE"), "Unit cell (file): —"
         )
-        merged_host, self._meta_merged = icon_label(
-            IconRegistry.DATABASE, "Merged/unmerged: —"
+        merged_host, self._meta_merged = _icon_label(
+            _icon_key("DATABASE"), "Merged/unmerged: —"
         )
-        res_h_host, self._meta_res_header = icon_label(
-            IconRegistry.RULER, "Resolution (file header): —"
+        res_h_host, self._meta_res_header = _icon_label(
+            _icon_key("RULER"), "Resolution (file header): —"
         )
-        res_c_host, self._meta_res_computed = icon_label(
-            IconRegistry.MDI_MAGNIFY, "Resolution (computed from indices): —"
+        res_c_host, self._meta_res_computed = _icon_label(
+            _icon_key("MDI_MAGNIFY"), "Resolution (computed from indices): —"
         )
         for host, label in (
             (sg_host, self._meta_space_group),
@@ -400,13 +521,13 @@ class ReflectionViewerWindow(QMainWindow):
         form.addRow("Low-res cutoff (Å)", self._dmax_spin)
 
         self._axes_cb = QCheckBox("Show axes")
-        self._axes_cb.setIcon(icon_from_registry(IconRegistry.AXIS_X_ARROW))
+        self._axes_cb.setIcon(_registry_icon(_icon_key("AXIS_X_ARROW")))
         self._axes_cb.setChecked(True)
         self._symmetry_cb = QCheckBox("Show symmetry axes")
-        self._symmetry_cb.setIcon(icon_from_registry(IconRegistry.AUTO_ROTATE))
+        self._symmetry_cb.setIcon(_registry_icon(_icon_key("AUTO_ROTATE")))
         self._symmetry_cb.setChecked(True)
         self._contours_cb = QCheckBox("Show resolution contours")
-        self._contours_cb.setIcon(icon_from_registry(IconRegistry.CIRCLE_OUTLINE))
+        self._contours_cb.setIcon(_registry_icon(_icon_key("CIRCLE_OUTLINE")))
         self._contours_cb.setChecked(True)
         form.addRow(self._axes_cb)
         form.addRow(self._symmetry_cb)
@@ -425,7 +546,7 @@ class ReflectionViewerWindow(QMainWindow):
         form.addRow("Contrast", self._contrast_spin)
 
         apply_btn = QPushButton("Apply filters")
-        apply_btn.setIcon(icon_from_registry(IconRegistry.FILTER))
+        apply_btn.setIcon(_registry_icon(_icon_key("FILTER")))
         apply_btn.clicked.connect(self._apply_filters)
         form.addRow(apply_btn)
 
@@ -440,7 +561,7 @@ class ReflectionViewerWindow(QMainWindow):
         selection_row.setSpacing(4)
         selection_icon = QLabel()
         selection_icon.setPixmap(
-            icon_from_registry(IconRegistry.PICK_ATOM).pixmap(16, 16)
+            _registry_icon(_icon_key("PICK_ATOM")).pixmap(16, 16)
         )
         selection_row.addWidget(selection_icon)
         selection_row.addWidget(QLabel("Selection"))
@@ -457,14 +578,14 @@ class ReflectionViewerWindow(QMainWindow):
         self._table.setSortingEnabled(False)
         tabs.addTab(
             self._table,
-            icon_from_registry(IconRegistry.TABLE_GRID),
+            _registry_icon(_icon_key("TABLE_GRID")),
             "Reflections",
         )
 
         self._summary = QTextEdit()
         self._summary.setReadOnly(True)
         tabs.addTab(
-            self._summary, icon_from_registry(IconRegistry.INFO), "Summary"
+            self._summary, _registry_icon(_icon_key("INFO")), "Summary"
         )
         self._tabs = tabs
         right_layout.addWidget(tabs, stretch=1)
@@ -477,17 +598,67 @@ class ReflectionViewerWindow(QMainWindow):
         self.setStatusBar(self._status)
 
     def _apply_widget_styles(self) -> None:
-        """Apply ThemeManager colors to the plot host when available."""
-        try:
-            colors = ThemeManager.css_colors()
-        except Exception:
-            return
-        base = colors.get("base", "#1e1e22")
+        """Apply ThemeManager-derived colors to plot, table, and text panes."""
+        colors = _theme_colors()
+        base = colors.get("base", "#202124")
         mid = colors.get("mid", "#3f4042")
         text = colors.get("text", "#e1e5e9")
+        alternate = colors.get("alternate", "#292a2d")
+        button = colors.get("button", "#3f4042")
+        highlight = colors.get("highlight", "#8ab4f7")
+        highlighted_text = colors.get("highlighted_text", "#202124")
+
         self._plot.setStyleSheet(
             f"background-color: {base}; border: 1px solid {mid}; color: {text};"
         )
+        if hasattr(self._plot, "set_background"):
+            try:
+                self._plot.set_background(base)
+            except Exception:
+                pass
+
+        pane_qss = (
+            f"background-color: {base}; color: {text};"
+            f" border: 1px solid {mid}; selection-background-color: {highlight};"
+            f" selection-color: {highlighted_text};"
+        )
+        self._details.setStyleSheet(f"QTextEdit {{ {pane_qss} }}")
+        self._summary.setStyleSheet(f"QTextEdit {{ {pane_qss} }}")
+        self._table.setStyleSheet(
+            f"QTableView {{"
+            f" background-color: {base}; color: {text};"
+            f" alternate-background-color: {alternate};"
+            f" gridline-color: {mid};"
+            f" selection-background-color: {highlight};"
+            f" selection-color: {highlighted_text};"
+            f"}}"
+            f"QHeaderView::section {{"
+            f" background-color: {button}; color: {text};"
+            f" border: 1px solid {mid}; padding: 2px 4px;"
+            f"}}"
+        )
+        self._tabs.setStyleSheet(
+            f"QTabWidget::pane {{ border: 1px solid {mid}; }}"
+            f"QTabBar::tab {{"
+            f" background-color: {button}; color: {text};"
+            f" border: 1px solid {mid}; padding: 4px 10px;"
+            f"}}"
+            f"QTabBar::tab:selected {{ background-color: {base}; }}"
+        )
+
+    def _set_theme(self, theme) -> None:
+        """Apply a ThemeManager theme and refresh local stylesheets."""
+        if not _HAS_PICOUI or ThemeManager is None:
+            return
+        try:
+            ThemeManager.apply_theme(theme)
+            self._current_theme = theme
+        except Exception as ex:
+            log.warning(f"ThemeManager.apply_theme({theme!r}) failed: {ex}")
+            return
+        self._apply_widget_styles()
+        label = getattr(theme, "value", str(theme))
+        self._status.showMessage(f"Theme: {label}", 3000)
 
     def _wire_actions(self) -> None:
         self._act_open.triggered.connect(self.open_file_dialog)
@@ -498,6 +669,17 @@ class ReflectionViewerWindow(QMainWindow):
         self._act_axes.toggled.connect(self._on_axes_action_toggled)
         self._act_symmetry.toggled.connect(self._on_symmetry_action_toggled)
         self._act_contours.toggled.connect(self._on_contours_action_toggled)
+
+        if _HAS_PICOUI and ThemeType is not None:
+            self._act_theme_auto.triggered.connect(
+                lambda: self._set_theme(ThemeType.AUTO)
+            )
+            self._act_theme_light.triggered.connect(
+                lambda: self._set_theme(ThemeType.LIGHT)
+            )
+            self._act_theme_dark.triggered.connect(
+                lambda: self._set_theme(ThemeType.DARK)
+            )
 
         self._plot.reflection_selected.connect(self._on_plot_selected)
         self._table.selectionModel().selectionChanged.connect(self._on_table_selected)

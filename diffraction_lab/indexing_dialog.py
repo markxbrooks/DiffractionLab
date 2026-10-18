@@ -32,7 +32,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-
+from picoui.widget.helper import create_widget_with_items
 from diffraction_lab.dials_engine import (
     DialsBravaisResult,
     DialsBravaisSolution,
@@ -1126,18 +1126,26 @@ class IndexingDialog(QDialog):
         range_row.addWidget(self.auto_integrate_select_button)
         integrate_layout.addLayout(range_row)
 
-        dials_integ_row = QHBoxLayout()
-        dials_integ_row.addWidget(QLabel("Integrate first (1-based)"))
+
         self.integrate_first = QSpinBox()
         self.integrate_first.setRange(1, 999999)
         self.integrate_first.setValue(1)
-        dials_integ_row.addWidget(self.integrate_first)
-        dials_integ_row.addWidget(QLabel("Last"))
+
         self.integrate_last = QSpinBox()
         self.integrate_last.setRange(1, 999999)
         self.integrate_last.setValue(40)
-        dials_integ_row.addWidget(self.integrate_last)
+
+        
+        dials_integ_row_widgets = [QLabel("Integrate first (1-based)"), 
+        self.integrate_first, 
+        QLabel("Last"), 
+        self.integrate_last, 
+        QPushButton("Integrate selected wedge")]
+        dials_integ_row = create_widget_with_items(dials_integ_row_widgets)
+        for widget in dials_integ_row_widgets:
+            dials_integ_row.addWidget(widget)
         dials_integ_row.addStretch(1)
+
         self.dials_integrate_range_row = QWidget()
         self.dials_integrate_range_row.setLayout(dials_integ_row)
         integrate_layout.addWidget(self.dials_integrate_range_row)
