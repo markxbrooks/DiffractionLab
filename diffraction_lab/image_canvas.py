@@ -134,6 +134,8 @@ class DiffractionImageCanvas(ZoomableCanvas if _HAS_ZOOMABLE else QWidget):
         self._show_spots = True
         self._resolution_rings: list[ResolutionRing] = []
         self._show_rings = True
+        self._beam_center: tuple[float, float] | None = None
+        self._show_beam_marker = True
         self._show_crosshair = True
         self._cursor_world: tuple[float, float] | None = None
         self._nearest_spot: tuple[float, float, float] | None = None  # x, y, dist
@@ -196,6 +198,26 @@ class DiffractionImageCanvas(ZoomableCanvas if _HAS_ZOOMABLE else QWidget):
     def set_rings_visible(self, visible: bool) -> None:
         """Show or hide resolution rings without recomputing geometry."""
         self._show_rings = bool(visible)
+        self.update()
+
+    def set_beam_center(
+        self,
+        center: tuple[float, float] | None,
+        *,
+        visible: bool | None = None,
+    ) -> None:
+        """Set the beam-centre marker in image-pixel coordinates."""
+        if center is None:
+            self._beam_center = None
+        else:
+            self._beam_center = (float(center[0]), float(center[1]))
+        if visible is not None:
+            self._show_beam_marker = bool(visible)
+        self.update()
+
+    def set_beam_marker_visible(self, visible: bool) -> None:
+        """Show or hide the yellow beam-centre cross."""
+        self._show_beam_marker = bool(visible)
         self.update()
 
     def set_crosshair_visible(self, visible: bool) -> None:
@@ -266,6 +288,9 @@ class DiffractionImageCanvas(ZoomableCanvas if _HAS_ZOOMABLE else QWidget):
         if self._show_rings and self._resolution_rings:
             self._paint_resolution_rings(painter, transform)
 
+        if self._show_beam_marker and self._beam_center is not None:
+            self._paint_beam_marker(painter, transform)
+
         if self._show_spots and self._spot_overlay:
             half = max(4.0, 6.0 * (transform.scale / max(self.width() / src_w, 1e-6)))
             half = min(half, 14.0)
@@ -284,6 +309,21 @@ class DiffractionImageCanvas(ZoomableCanvas if _HAS_ZOOMABLE else QWidget):
 
         if self._show_crosshair and self._cursor_world is not None:
             self._paint_crosshair(painter, transform)
+
+    def _paint_beam_marker(
+        self, painter: QPainter, transform: ViewTransform
+    ) -> None:
+        """Draw a yellow cross at the beam centre (image-pixel coordinates)."""
+        bx, by = self._beam_center
+        sx, sy = transform.world_to_screen(bx, by)
+        # Scale slightly with zoom so the marker stays readable.
+        src_w = max(self._pixmap.width(), 1)
+        half = max(10.0, 14.0 * (transform.scale / max(self.width() / src_w, 1e-6)))
+        half = min(half, 28.0)
+        pen = QPen(QColor(255, 220, 0, 240), 2)
+        painter.setPen(pen)
+        painter.drawLine(QPointF(sx - half, sy), QPointF(sx + half, sy))
+        painter.drawLine(QPointF(sx, sy - half), QPointF(sx, sy + half))
 
     def _paint_crosshair(
         self, painter: QPainter, transform: ViewTransform

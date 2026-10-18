@@ -46,11 +46,13 @@ from PySide6.QtGui import (
     QPen,
     QPixmap,
 )
-from PySide6.QtCore import Qt, QSettings, QSize
+from PySide6.QtCore import Qt, QPoint, QSettings, QSize
 
+from diffraction_lab.beam import BeamParameters
+from diffraction_lab.detector import DetectorParameters
 from diffraction_lab.image_canvas import DiffractionImageCanvas, build_resolution_rings
 from diffraction_lab.indexing import IndexingGeometry, as_float
-from diffraction_lab.indexing_dialog import ProcessingDialog
+from diffraction_lab.processing_wizard import ProcessingWizard
 from diffraction_lab.session import (
     DiffractionLabSession,
     ViewerState,
@@ -370,7 +372,7 @@ def calculate_two_theta_and_resolution(pixel_x, pixel_y, metadata):
     logging.info(f"Computing theta and resolution for pixel \tx: {pixel_x:.0f}, y: {pixel_y:.0f}")
 
     required_keys = ["beam_centre_x", "beam_centre_y", "detector_distance",
-                     "incident_wavelength", "x_pixel_size"]
+                     "incident_wavelength", "detector_x_pixel_size"]
 
     # Ensure all required keys exist
     for key in required_keys:
@@ -383,7 +385,7 @@ def calculate_two_theta_and_resolution(pixel_x, pixel_y, metadata):
     beam_center_y = metadata["beam_centre_y"]
     detector_distance = metadata["detector_distance"]
     wavelength = metadata["incident_wavelength"]
-    pixel_size = metadata["x_pixel_size"]
+    pixel_size = metadata["detector_x_pixel_size"]
 
     logging.debug("Metadata extracted: Beam Center (%s, %s), Detector Distance: %s mm, Wavelength: %s Å, Pixel Size: %s mm",
                   beam_center_x, beam_center_y, detector_distance, wavelength, pixel_size)
@@ -655,15 +657,12 @@ class RecentSessionsManager:
         self._write([])
 
 
-class IMosflmApp(QMainWindow):
+class DiffractionLabApp(QMainWindow):
+    """DiffractionLab App"""
     def __init__(self):
         super().__init__()
-        self.beam_x = None
-        self.beam_y = None
-        self.detector_distance = 200
-        self.incident_wavelength = None
-        self.x_pixel_size = 0.075
-        self.y_pixel_size = 0.075
+        self.beam_parameters = BeamParameters()
+        self.detector = DetectorParameters()
         self.setWindowTitle("DiffractionLab")
         self.setGeometry(100, 100, 900, 1000)
         self.current_image = None
@@ -675,7 +674,6 @@ class IMosflmApp(QMainWindow):
         self._external_data_paths: dict[str, Path] = {}
         self.num_frames = 0
         self.slice_size = 10  # Number of frames to load at once
-        self.beam_center = None
         self.image_inverted = False
         self.show_rings = True  # Default to showing rings
         self.show_indexing_spots = True
@@ -683,7 +681,7 @@ class IMosflmApp(QMainWindow):
         self._recent_sessions = RecentSessionsManager()
         self._session_path: Path | None = None
         self._session_dirty = False
-        self._indexing_dialog: ProcessingDialog | None = None
+        self._processing_wizard: ProcessingWizard | None = None
         self._indexing_spot_overlay: list[tuple[float, float, bool]] | None = None
         self._indexing_solution = None
 
@@ -1046,8 +1044,8 @@ class IMosflmApp(QMainWindow):
     def gather_session(self) -> DiffractionLabSession:
         """Build a :class:`DiffractionLabSession` from the current UI."""
         processing: ProcessingState | None = None
-        if self._indexing_dialog is not None:
-            processing = self._indexing_dialog.to_processing_state()
+        if self._processing_wizard is not None:
+            processing = self._processing_wizard.to_processing_state()
         return DiffractionLabSession(
             viewer=self.to_viewer_state(),
             processing=processing,
@@ -1075,12 +1073,12 @@ class IMosflmApp(QMainWindow):
 
     def _close_indexing_dialog(self) -> None:
         """Close and discard the Processing dialog if open."""
-        dialog = self._indexing_dialog
+        dialog = self._processing_wizard
         if dialog is None:
             return
         dialog.close()
         dialog.deleteLater()
-        self._indexing_dialog = None
+        self._processing_wizard = None
 
     def _clear_viewer(self) -> None:
         """Unload the current image / HDF5 dataset from the viewer."""
@@ -1092,10 +1090,7 @@ class IMosflmApp(QMainWindow):
         self._h5_data = None
         self._external_data_paths = {}
         self.num_frames = 0
-        self.beam_center = None
-        self.beam_x = None
-        self.beam_y = None
-        self.incident_wavelength = None
+        self.beam_parameters = BeamParameters()
         self._indexing_spot_overlay = None
         self._indexing_solution = None
         self.image_inverted = False
@@ -1107,9 +1102,16 @@ class IMosflmApp(QMainWindow):
             self.frame_slider.setMinimum(0)
             self.frame_slider.setMaximum(0)
             self.frame_slider.setValue(0)
+        if hasattr(self, "detector_distance_label"):
+            self.detector_distance_label.setText("distance: N/A")
+        if hasattr(self, "beam_x_label"):
+            self.beam_x_label.setText("beam_x: N/A")
+        if hasattr(self, "beam_y_label"):
+            self.beam_y_label.setText("beam_y: N/A")
         if hasattr(self, "image_canvas"):
             self.image_canvas.set_spot_overlay(None)
             self.image_canvas.set_resolution_rings(None)
+            self.image_canvas.set_beam_center(None)
             self.image_canvas.set_image_pixmap(QPixmap(), reset_view=True)
             self.image_canvas.set_placeholder("No image loaded")
 
@@ -1160,7 +1162,7 @@ class IMosflmApp(QMainWindow):
                     warnings.extend(self.apply_viewer_state(session.viewer))
             if self.current_image is not None or self.dataset is not None:
                 self.open_indexing_dialog()
-                dialog = self._indexing_dialog
+                dialog = self._processing_wizard
                 if dialog is not None:
                     # Refresh defaults from the loaded image, then overlay session.
                     dialog._populate_defaults()
@@ -1267,6 +1269,10 @@ class IMosflmApp(QMainWindow):
             _icon_key("IMAGE_FILTER_CENTER", _icon_key("RECENTER_VIEW")),
             "beam_y: N/A",
         )
+        distance_host, self.detector_distance_label = _readout_widget(
+            _icon_key("RULER"),
+            "distance: N/A",
+        )
         x_pix_host, self.x_pixel_label = _readout_widget(
             _icon_key("AXIS_X_ARROW", _icon_key("ARROW_RIGHT")),
             "x pixel: N/A",
@@ -1279,13 +1285,19 @@ class IMosflmApp(QMainWindow):
             _icon_key("ANGLE_ACUTE", _icon_key("AUTO_ROTATE")),
             "two theta: N/A degrees",
         )
+        wavelength_host, self.wavelength_label = _readout_widget(
+            _icon_key("WAVELENGTH", "mdi.sine-wave"),
+            "wavelength: N/A Å",
+        )
         for host in (
             res_host,
             beam_x_host,
             beam_y_host,
+            distance_host,
             x_pix_host,
             y_pix_host,
             theta_host,
+            wavelength_host,
         ):
             resolution_layout.addWidget(host)
         resolution_layout.addStretch(1)
@@ -1454,7 +1466,7 @@ class IMosflmApp(QMainWindow):
             self.indexing_spots_checkbox.setChecked(checked)
             self.indexing_spots_checkbox.blockSignals(False)
         self.image_canvas.set_spots_visible(self.show_indexing_spots)
-        dialog = self._indexing_dialog
+        dialog = self._processing_wizard
         if dialog is not None and hasattr(dialog, "show_spots_checkbox"):
             box = dialog.show_spots_checkbox
             if box.isChecked() != self.show_indexing_spots:
@@ -1464,97 +1476,40 @@ class IMosflmApp(QMainWindow):
 
     def show_terminal_viewer(self) -> None:
         """Open the JDXI-style DIALS terminal (via the Processing window)."""
-        if self._indexing_dialog is None:
+        if self._processing_wizard is None:
             self.open_indexing_dialog()
-        dialog = self._indexing_dialog
+        dialog = self._processing_wizard
         if dialog is not None:
             dialog.show_terminal_viewer()
 
     def open_indexing_dialog(self) -> None:
         """Open the Processing dialog for the loaded image / dataset."""
-        # #region agent log
-        import json
-        import time
-
-        _dbg = "/Users/brooks/projects/ElMo/.cursor/debug-677e52.log"
-
-        def _olog(hid: str, msg: str, data: dict | None = None) -> None:
-            try:
-                with open(_dbg, "a", encoding="utf-8") as h:
-                    h.write(
-                        json.dumps(
-                            {
-                                "sessionId": "677e52",
-                                "runId": "pre-fix",
-                                "hypothesisId": hid,
-                                "location": "qtmosflm.py:open_indexing_dialog",
-                                "message": msg,
-                                "data": data or {},
-                                "timestamp": int(time.time() * 1000),
-                            }
-                        )
-                        + "\n"
-                    )
-            except Exception:
-                pass
-
-        # #endregion
         if self.current_image is None and self.dataset is None:
-            # #region agent log
-            _olog("E", "open blocked: no image/dataset")
-            # #endregion
             QMessageBox.information(
                 self,
                 "Process",
                 "Open a diffraction image or HDF5 / NeXus master first.",
             )
             return
-        if self._indexing_dialog is None:
-            # #region agent log
-            _olog("A", "constructing IndexingDialog")
-            # #endregion
+        if self._processing_wizard is None:
             try:
-                self._indexing_dialog = ProcessingDialog(self)
-                self._indexing_dialog.destroyed.connect(
+                self._processing_wizard = ProcessingWizard(self)
+                self._processing_wizard.destroyed.connect(
                     self._on_indexing_dialog_destroyed
                 )
-                # #region agent log
-                _olog(
-                    "A",
-                    "IndexingDialog constructed",
-                    {"visible": self._indexing_dialog.isVisible()},
-                )
-                # #endregion
             except Exception as ex:
-                # #region agent log
-                _olog(
-                    "A",
-                    "IndexingDialog construct FAILED",
-                    {"error": repr(ex), "type": type(ex).__name__},
-                )
-                # #endregion
                 QMessageBox.critical(
                     self,
                     "Process",
                     f"Could not open Processing dialog:\n{ex}",
                 )
                 return
-        self._indexing_dialog.show()
-        self._indexing_dialog.raise_()
-        self._indexing_dialog.activateWindow()
-        # #region agent log
-        _olog(
-            "E",
-            "IndexingDialog shown",
-            {
-                "visible": self._indexing_dialog.isVisible(),
-                "title": self._indexing_dialog.windowTitle(),
-            },
-        )
-        # #endregion
+        self._processing_wizard.show()
+        self._processing_wizard.raise_()
+        self._processing_wizard.activateWindow()
 
     def _on_indexing_dialog_destroyed(self, *_args) -> None:
-        self._indexing_dialog = None
+        self._processing_wizard = None
 
     def set_indexing_spot_overlay(
         self,
@@ -1600,7 +1555,7 @@ class IMosflmApp(QMainWindow):
             self._act_indexing_spots.blockSignals(True)
             self._act_indexing_spots.setChecked(self.show_indexing_spots)
             self._act_indexing_spots.blockSignals(False)
-        dialog = self._indexing_dialog
+        dialog = self._processing_wizard
         if dialog is not None and hasattr(dialog, "show_spots_checkbox"):
             box = dialog.show_spots_checkbox
             if box.isChecked() != self.show_indexing_spots:
@@ -1614,16 +1569,17 @@ class IMosflmApp(QMainWindow):
         """Build :class:`IndexingGeometry` from the currently loaded image."""
         if self.current_file is None:
             raise ValueError("No file loaded")
-        if self.beam_x is None or self.beam_y is None:
+        beam = self.beam_parameters
+        if beam.x is None or beam.y is None:
             raise ValueError("Beam centre not available")
-        if self.incident_wavelength is None:
+        if beam.incident_wavelength is None:
             raise ValueError("Wavelength not available")
 
-        pixel_mm = as_float(self.x_pixel_size)
-        beam_x_px = as_float(self.beam_x)
-        beam_y_px = as_float(self.beam_y)
-        distance_mm = as_float(self.detector_distance)
-        wavelength = as_float(self.incident_wavelength)
+        pixel_mm = as_float(self.detector.x_pixel_size)
+        beam_x_px = as_float(beam.x)
+        beam_y_px = as_float(beam.y)
+        distance_mm = as_float(beam.detector_distance)
+        wavelength = as_float(beam.incident_wavelength)
 
         if self.dataset is not None:
             height = int(self.dataset.shape[-2])
@@ -1793,9 +1749,29 @@ class IMosflmApp(QMainWindow):
             logging.error(f"Error displaying image: {ex}")
 
     def parse_hdf5(self, group, path):
-        """ parse hdf5 file and extract parameters """
+        """Parse HDF5 instrument group and update beam / detector parameters."""
         try:
-            self.beam_x , self.beam_y, self.detector_distance, self.incident_wavelength, self.x_pixel_size, self.y_pixel_size = traverse_hdf5(group, path)
+            (
+                beam_x,
+                beam_y,
+                detector_distance,
+                incident_wavelength,
+                x_pixel_size,
+                y_pixel_size,
+            ) = traverse_hdf5(group, path)
+            beam = self.beam_parameters
+            if beam_x is not None:
+                beam.x = as_float(beam_x)
+            if beam_y is not None:
+                beam.y = as_float(beam_y)
+            if detector_distance is not None:
+                beam.detector_distance = as_float(detector_distance)
+            if incident_wavelength is not None:
+                beam.incident_wavelength = as_float(incident_wavelength)
+            if x_pixel_size is not None:
+                self.detector.x_pixel_size = as_float(x_pixel_size)
+            if y_pixel_size is not None:
+                self.detector.y_pixel_size = as_float(y_pixel_size)
         except Exception as ex:
             logging.error(f"Error parsing hdf5: {ex}")
 
@@ -1817,19 +1793,20 @@ class IMosflmApp(QMainWindow):
             elif isinstance(item, h5py.Dataset):  # If it's a dataset, print its value
                 try:
                     value = item[()]  # Extract dataset value
+                    beam = self.beam_parameters
 
                     if full_path == r"/entry/instrument/detector/beam_centre_x":
-                        self.beam_x = value
+                        beam.x = as_float(value)
                     elif full_path == r"/entry/instrument/detector/beam_centre_y":
-                        self.beam_y = value
+                        beam.y = as_float(value)
                     elif full_path == r"/entry/instrument/detector/detector_distance":
-                        self.detector_distance = value
+                        beam.detector_distance = as_float(value)
                     elif full_path == r"/entry/instrument/beam/incident_wavelength":
-                        self.incident_wavelength = value
+                        beam.incident_wavelength = as_float(value)
                     elif full_path == r"/entry/instrument/detector/x_pixel_size":
-                        self.x_pixel_size = value
+                        self.detector.x_pixel_size = as_float(value)
                     elif full_path == r"/entry/instrument/detector/y_pixel_size":
-                        self.y_pixel_size = value
+                        self.detector.y_pixel_size = as_float(value)
                     logging.info(f"{full_path}: {value}")
 
                 except Exception as e:
@@ -1970,11 +1947,10 @@ class IMosflmApp(QMainWindow):
 
             self._h5_master = h5py.File(master_path, "r")
 
-            if self.beam_x is None or self.beam_y is None:
+            if self.beam_parameters.center is None:
                 raise ValueError(
                     "Beam center coordinates not found in instrument metadata."
                 )
-            self.beam_center = (self.beam_x, self.beam_y)
 
             self.dataset_combo.blockSignals(True)
             self.dataset_combo.clear()
@@ -2038,8 +2014,8 @@ class IMosflmApp(QMainWindow):
             # Update UI
             self.frame_label.setText(f"Frame: {start_index}")
             logging.info(f"Frame {start_index} updated with contrast level {contrast_value}.")
-            if self._indexing_dialog is not None and self._indexing_dialog.isVisible():
-                self._indexing_dialog.refresh_overlay_for_current_frame()
+            if self._processing_wizard is not None and self._processing_wizard.isVisible():
+                self._processing_wizard.refresh_overlay_for_current_frame()
 
     def display_hdf5_image(self, start_index):
         """Display a slice of frames from the HDF5 dataset with improved contrast and no white borders."""
@@ -2119,29 +2095,47 @@ class IMosflmApp(QMainWindow):
             logging.error(f"Error in show_image: {ex}")
 
     def _sync_resolution_rings_to_canvas(self) -> None:
-        """Push current beam/geometry rings onto the zoomable canvas overlay."""
+        """Push beam marker and resolution rings onto the zoomable canvas."""
+        beam = self.beam_parameters
+        center = beam.center
+        self.image_canvas.set_beam_center(center)
+        self._update_beam_geometry_labels()
         rings = []
         try:
             if (
-                self.beam_center is not None
-                and self.incident_wavelength is not None
-                and self.detector_distance is not None
-                and self.x_pixel_size is not None
+                center is not None
+                and beam.incident_wavelength is not None
+                and self.detector.x_pixel_size is not None
             ):
-                distance = self.detector_distance
-                if isinstance(distance, (list, tuple)):
-                    distance = distance[0]
                 rings = build_resolution_rings(
-                    beam_x=float(self.beam_center[0]),
-                    beam_y=float(self.beam_center[1]),
-                    wavelength_a=float(self.incident_wavelength),
-                    distance_mm=float(distance),
-                    pixel_size_mm=float(self.x_pixel_size),
+                    beam_x=float(center[0]),
+                    beam_y=float(center[1]),
+                    wavelength_a=float(beam.incident_wavelength),
+                    distance_mm=float(beam.detector_distance),
+                    pixel_size_mm=float(self.detector.x_pixel_size),
                 )
         except Exception as ex:
             logging.warning("Could not build resolution rings: %s", ex)
             rings = []
         self.image_canvas.set_resolution_rings(rings, visible=self.show_rings)
+
+    def _update_beam_geometry_labels(self) -> None:
+        """Refresh beam centre and detector-distance readouts from current parameters."""
+        beam = self.beam_parameters
+        if hasattr(self, "beam_x_label"):
+            if beam.x is not None:
+                self.beam_x_label.setText(f"beam_x: {beam.x:.0f}")
+            else:
+                self.beam_x_label.setText("beam_x: N/A")
+        if hasattr(self, "beam_y_label"):
+            if beam.y is not None:
+                self.beam_y_label.setText(f"beam_y: {beam.y:.0f}")
+            else:
+                self.beam_y_label.setText("beam_y: N/A")
+        if hasattr(self, "detector_distance_label"):
+            self.detector_distance_label.setText(
+                f"distance: {beam.detector_distance:.1f} mm"
+            )
 
     def _zoom_in(self) -> None:
         self.image_canvas.zoom_in()
@@ -2166,16 +2160,28 @@ class IMosflmApp(QMainWindow):
                 font.setPointSize(60)
                 painter.setFont(font)
 
+                beam = self.beam_parameters
+                beam_center = beam.center
+                if (
+                    beam_center is None
+                    or beam.incident_wavelength is None
+                ):
+                    painter.end()
+                    return
+
                 # Calculate radii for resolution rings
                 resolutions = [1.0, 2.0, 3.0]  # Ångströms
                 radii = []
                 for resolution in resolutions:
-                    radius_pixels = calculate_radius_pixels(resolution, incident_wavelength, detector_distance,
-                                                            x_pixel_size)
+                    radius_pixels = calculate_radius_pixels(
+                        resolution,
+                        beam.incident_wavelength,
+                        beam.detector_distance,
+                        self.detector.x_pixel_size,
+                    )
                     radii.append(radius_pixels)
 
-                # Use beam center for resolution rings
-                center = QPoint(int(self.beam_center[0]), int(self.beam_center[1]))
+                center = QPoint(int(beam_center[0]), int(beam_center[1]))
 
                 for i, radius in enumerate(radii):
                     painter.drawEllipse(center, int(radius), int(radius))
@@ -2312,25 +2318,25 @@ class IMosflmApp(QMainWindow):
 
     def _on_image_cursor_moved(self, x_dataset: float, y_dataset: float) -> None:
         """Update pixel / resolution readouts and status bar from the canvas cursor."""
-        if self.current_image is None or self.beam_center is None:
+        beam = self.beam_parameters
+        center = beam.center
+        if self.current_image is None or center is None:
             return
         self.x_pixel_label.setText(f"x pixel: {x_dataset:.0f}")
         self.y_pixel_label.setText(f"y pixel: {y_dataset:.0f}")
-        if self.beam_x is not None:
-            self.beam_x_label.setText(f"beam_x: {self.beam_x:.0f}")
-        if self.beam_y is not None:
-            self.beam_y_label.setText(f"beam_y: {self.beam_y:.0f}")
+        self._update_beam_geometry_labels()
         metadata = {
-            "beam_centre_x": self.beam_center[0],
-            "beam_centre_y": self.beam_center[1],
-            "detector_distance": self.detector_distance[0],
-            "incident_wavelength": self.incident_wavelength,
-            "x_pixel_size": self.x_pixel_size,
+            "beam_centre_x": center[0],
+            "beam_centre_y": center[1],
+            "detector_distance": beam.detector_distance,
+            "incident_wavelength": beam.incident_wavelength,
+            "detector_x_pixel_size": self.detector.x_pixel_size,
         }
         two_theta, resolution = calculate_two_theta_and_resolution(
             x_dataset, y_dataset, metadata
         )
         self.two_theta_label.setText(f"two theta: {two_theta:0.2f} °")
+        self.wavelength_label.setText(f"wavelength: {beam.incident_wavelength:0.2f} Ang.")
         self.resolution_label.setText(f"Resolution: {resolution:0.2f} Å")
 
         mode = "hand" if self.image_canvas.is_panning() else "crosshair"
@@ -2469,7 +2475,7 @@ def main():
             "picoui not installed — running without ThemeManager / IconRegistry"
         )
 
-    window = IMosflmApp()
+    window = DiffractionLabApp()
     window.show()
     sys.exit(app.exec())
 

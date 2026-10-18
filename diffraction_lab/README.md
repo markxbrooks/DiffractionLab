@@ -12,7 +12,7 @@ DiffractionLab opens crystallographic images (**CBF**, **HDF5 / NeXus**, **TIFF*
 From the repository root (with dependencies installed):
 
 ```sh
-python imosflm/qtmosflm.py
+python imosflm/main.py
 ```
 
 Optional flags:
@@ -124,7 +124,7 @@ Discovery order for DIALS: `$DIALS_DIR`, `$CCP4`, `PATH`, then common install pr
 
 ```sh
 source /Applications/ccp4-9/bin/ccp4.setup-sh
-python imosflm/qtmosflm.py
+python imosflm/main.py
 ```
 
 ## Package layout

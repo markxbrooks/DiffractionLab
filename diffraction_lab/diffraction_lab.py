@@ -15,7 +15,7 @@ _HERE = Path(__file__).resolve().parent
 
 def main() -> None:
     """Run the DiffractionLab / qtMosflm GUI."""
-    runpy.run_path(str(_HERE / "qtmosflm.py"), run_name="__main__")
+    runpy.run_path(str(_HERE / "main.py"), run_name="__main__")
 
 
 if __name__ == "__main__":

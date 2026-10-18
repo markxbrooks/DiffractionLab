@@ -124,43 +124,6 @@ def _hrow(items: list[QWidget], *, end_stretch: bool = True) -> QWidget:
     return host
 
 
-# #region agent log
-_DEBUG_LOG_PATH = "/Users/brooks/projects/ElMo/.cursor/debug-677e52.log"
-
-
-def _agent_log(
-    hypothesis_id: str,
-    location: str,
-    message: str,
-    data: dict | None = None,
-    *,
-    run_id: str = "pre-fix",
-) -> None:
-    """Append one NDJSON debug line for session 677e52."""
-    import json
-    import time
-
-    try:
-        with open(_DEBUG_LOG_PATH, "a", encoding="utf-8") as handle:
-            handle.write(
-                json.dumps(
-                    {
-                        "sessionId": "677e52",
-                        "runId": run_id,
-                        "hypothesisId": hypothesis_id,
-                        "location": location,
-                        "message": message,
-                        "data": data or {},
-                        "timestamp": int(time.time() * 1000),
-                    }
-                )
-                + "\n"
-            )
-    except Exception:
-        pass
-
-
-# #endregion
 from diffraction_lab.indexing import (
     IndexSolution,
     IndexingEngine,
@@ -834,8 +797,8 @@ class _PointlessWorker(QObject):
             self.failed.emit(str(ex))
 
 
-class ProcessingDialog(QDialog):
-    """Processing dialog: find spots → index → integrate → MTZ → Symmetry."""
+class ProcessingWizard(QDialog):
+    """Processing Wizard: find spots → index → integrate → MTZ → Symmetry."""
 
     solutionSelected = Signal(object)  # IndexSolution | None
 
@@ -880,42 +843,7 @@ class ProcessingDialog(QDialog):
         self._busy_cancel_requested = False
         self._terminal_viewer: TerminalLogViewer | None = None
         self._jobs_tab: JobsTab | None = None
-        # #region agent log
-        _agent_log(
-            "A",
-            "indexing_dialog.py:__init__",
-            "IndexingDialog init before _build_ui",
-            {
-                "has_spec_editor": _HAS_SPEC_EDITOR,
-                "has_create_widget": _HAS_CREATE_WIDGET,
-            },
-        )
-        # #endregion
-        try:
-            self._build_ui()
-            # #region agent log
-            _agent_log(
-                "A",
-                "indexing_dialog.py:__init__",
-                "IndexingDialog _build_ui ok",
-                {
-                    "has_mosflm_spec": getattr(self, "_mosflm_spec_editor", None)
-                    is not None,
-                    "has_integrate_row": hasattr(self, "dials_integrate_range_row"),
-                    "has_spot_sigma_attr": hasattr(self, "spot_sigma"),
-                },
-            )
-            # #endregion
-        except Exception as ex:
-            # #region agent log
-            _agent_log(
-                "A",
-                "indexing_dialog.py:__init__",
-                "IndexingDialog _build_ui FAILED",
-                {"error": repr(ex), "type": type(ex).__name__},
-            )
-            # #endregion
-            raise
+        self._build_ui()
         self._populate_defaults()
 
     def showEvent(self, event) -> None:  # noqa: N802
@@ -1090,23 +1018,8 @@ class ProcessingDialog(QDialog):
                 )
                 self._mosflm_spec_editor.set_values(mosflm_settings_defaults())
                 form.addRow(self._mosflm_spec_editor)
-                # #region agent log
-                _agent_log(
-                    "B",
-                    "indexing_dialog.py:_build_ui",
-                    "Mosflm SpecEditor created",
-                    {"fields": [f.name for f in mosflm_settings_fields()]},
-                )
-                # #endregion
             except Exception as ex:
-                # #region agent log
-                _agent_log(
-                    "B",
-                    "indexing_dialog.py:_build_ui",
-                    "Mosflm SpecEditor FAILED",
-                    {"error": repr(ex)},
-                )
-                # #endregion
+                logger.warning("Mosflm SpecEditor unavailable: %s", ex)
                 self._mosflm_spec_editor = None
         if self._mosflm_spec_editor is None:
             self.spot_sigma = QDoubleSpinBox()
@@ -1315,17 +1228,6 @@ class ProcessingDialog(QDialog):
                 self.integrate_last,
             ]
         )
-        # #region agent log
-        _agent_log(
-            "D",
-            "indexing_dialog.py:_build_ui",
-            "integrate range row built",
-            {
-                "via_create_widget": _HAS_CREATE_WIDGET,
-                "row_type": type(self.dials_integrate_range_row).__name__,
-            },
-        )
-        # #endregion
         integrate_layout.addWidget(self.dials_integrate_range_row)
 
         self.integrate_button = QPushButton("Integrate selected wedge")

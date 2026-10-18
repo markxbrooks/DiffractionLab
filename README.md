@@ -142,7 +142,7 @@ source /Applications/ccp4-9/bin/ccp4.setup-sh
 From the repository root, run:
 
 ```sh
-python imosflm/qtmosflm.py
+python imosflm/main.py
 ```
 
 Optional command-line flags:
