@@ -968,7 +968,7 @@ def resolve_indexing_backend(
     executable: Path | None = None,
     backend: str | None = None,
 ) -> tuple[str, Path]:
-    """Choose ``processinglab`` (IntegrationLab) or ``mosflm`` (F77 ipmosflm).
+    """Choose ``processinglab`` (ProcessingLab) or ``mosflm`` (F77 ipmosflm).
 
     Returns ``(backend_name, executable_path)``.
     """
@@ -985,7 +985,7 @@ def resolve_indexing_backend(
     if want in {"processinglab", "integrationlab", "pl"}:
         if pl is None:
             raise FileNotFoundError(
-                "IntegrationLab not found. Build ProcessingLab (`make cpp`) or set "
+                "ProcessingLab not found. Build ProcessingLab (`make cpp`) or set "
                 "INTEGRATIONLAB / PROCESSINGLAB_HOME."
             )
         return "processinglab", pl
@@ -1004,7 +1004,7 @@ def resolve_indexing_backend(
         return "processinglab", pl
     raise FileNotFoundError(
         "No indexing backend found. Install CCP4 ipmosflm or ProcessingLab "
-        "IntegrationLab (set MOSFLM_EXEC or INTEGRATIONLAB)."
+        "ProcessingLab (set MOSFLM_EXEC or INTEGRATIONLAB)."
     )
 
 
@@ -1411,7 +1411,7 @@ class IndexingEngine:
         messages_log: list[str],
         used_placeholder: bool,
     ) -> IndexingResult:
-        """DPS AUTOINDEX via ProcessingLab ``IntegrationLab`` CONTROL script."""
+        """DPS AUTOINDEX via ProcessingLab ``ProcessingLab`` CONTROL script."""
         cmds = pl_build_autoindex_commands(
             directory=self.work_dir,
             spotfile=spotfile,
@@ -1434,12 +1434,12 @@ class IndexingEngine:
         messages_log.extend(run.log_lines[-40:])
         if run.returncode != 0:
             raise RuntimeError(
-                f"IntegrationLab AUTOINDEX failed (rc={run.returncode}). "
+                f"ProcessingLab AUTOINDEX failed (rc={run.returncode}). "
                 f"See {self.work_dir / 'integrationlab.log'}"
             )
         if run.autoindex is None:
             raise RuntimeError(
-                "IntegrationLab AUTOINDEX produced no CELL/MATRIX dump. "
+                "ProcessingLab AUTOINDEX produced no CELL/MATRIX dump. "
                 f"See {self.work_dir / 'integrationlab.log'}"
             )
         dump = run.autoindex
@@ -1461,7 +1461,7 @@ class IndexingEngine:
             reflections_used=dump.n_spots or None,
         )
         messages_log.append(
-            f"ProcessingLab IntegrationLab AUTOINDEX: {lattice} {sg} "
+            f"ProcessingLab ProcessingLab AUTOINDEX: {lattice} {sg} "
             f"cell={dump.cell}"
         )
         n_spots = count_spots_in_spotfile(spotfile)
@@ -1488,7 +1488,7 @@ class IndexingEngine:
         oscillation_deg: float,
         mtz_path: Path,
     ) -> IntegrationResult:
-        """PROCESS via ProcessingLab ``IntegrationLab`` CONTROL script."""
+        """PROCESS via ProcessingLab ``ProcessingLab`` CONTROL script."""
         cmds = pl_build_process_commands(
             directory=Path(geometry.directory),
             image_path=None,
@@ -1507,7 +1507,7 @@ class IndexingEngine:
             phi_start=float(phi_start),
             osc_deg=float(oscillation_deg),
         )
-        # Resolve a concrete image for IntegrationLab ``--image`` when possible.
+        # Resolve a concrete image for ProcessingLab ``--image`` when possible.
         img_override = None
         if not geometry.is_hdf5_master:
             img_override = _expand_numbered_template(
@@ -1532,7 +1532,7 @@ class IndexingEngine:
         )
         if run.returncode != 0 or run.mtz_path is None:
             raise RuntimeError(
-                f"IntegrationLab PROCESS failed (rc={run.returncode}). "
+                f"ProcessingLab PROCESS failed (rc={run.returncode}). "
                 f"See {self.work_dir / 'integrationlab.log'}"
             )
         if run.mtz_path.resolve() != mtz_path.resolve():
@@ -1542,7 +1542,7 @@ class IndexingEngine:
             mtz_path=mtz_path,
             image_range=image_range,
             n_images=n_images,
-            message="ProcessingLab IntegrationLab PROCESS complete",
+            message="ProcessingLab ProcessingLab PROCESS complete",
         )
 
     def refine_index_solution(
@@ -1568,7 +1568,7 @@ class IndexingEngine:
         if self.backend == "processinglab":
             raise RuntimeError(
                 "Space-group refine (index2) requires F77 ipmosflm. "
-                "ProcessingLab IntegrationLab returns a single AUTOINDEX solution; "
+                "ProcessingLab ProcessingLab returns a single AUTOINDEX solution; "
                 "set DIFFRACTIONLAB_BACKEND=mosflm for Mosflm refinement."
             )
         geometry, used_placeholder = ensure_indexable_template(geometry, self.work_dir)

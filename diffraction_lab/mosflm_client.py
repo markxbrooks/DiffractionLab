@@ -4,7 +4,7 @@ Mirrors the launch / command path used by ``src/mosflm.tcl``:
 listen on localhost → start ``ipmosflm MOSFLMSOCKET <port>`` → send
 line-oriented keywords → receive one-line XML responses and ``<done>``.
 
-ProcessingLab's ``IntegrationLab`` does **not** implement MOSFLMSOCKET; see
+ProcessingLab's ``ProcessingLab`` does **not** implement MOSFLMSOCKET; see
 :mod:`diffraction_lab.processinglab_client` for CONTROL-script driving.
 """
 

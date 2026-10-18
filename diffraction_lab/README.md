@@ -4,7 +4,7 @@ PySide6 diffraction-image viewer and interactive indexer, inspired by **iMosflm*
 
 DiffractionLab opens crystallographic images (**CBF**, **HDF5 / NeXus**, **TIFF**, and common raster formats), supports zoom/pan and resolution-ring overlays, and runs indexing from an Index window:
 
-- **Mosflm DPS** (F77 ``ipmosflm``) or **ProcessingLab** (`IntegrationLab`) for formats Mosflm can process
+- **Mosflm DPS** (F77 ``ipmosflm``) or **ProcessingLab** (`ProcessingLab`) for formats Mosflm can process
 - **DIALS** automatically for **Eiger / HDF5 masters** that Mosflm cannot process
 
 ## Run

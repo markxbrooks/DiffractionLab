@@ -1579,7 +1579,7 @@ class ProcessingWizard(QDialog):
             use_pl = prefer_processinglab() and pl is not None
             if use_pl or (mosflm is None and pl is not None):
                 self.backend_label.setText(
-                    "Backend: ProcessingLab IntegrationLab "
+                    "Backend: ProcessingLab ProcessingLab "
                     "(C++ CONTROL; set DIFFRACTIONLAB_BACKEND=mosflm for F77)."
                 )
                 self.find_spots_button.setText("Find spots")
@@ -1593,7 +1593,7 @@ class ProcessingWizard(QDialog):
                 )
                 self.refine_button.setEnabled(False)
                 self.refine_button.setToolTip(
-                    "index2 refine needs F77 ipmosflm; IntegrationLab returns "
+                    "index2 refine needs F77 ipmosflm; ProcessingLab returns "
                     "one AUTOINDEX solution."
                 )
             else:
@@ -1605,7 +1605,7 @@ class ProcessingWizard(QDialog):
                 self.integrate_button.setText("Integrate selected wedge")
                 if mosflm is None:
                     self.status_label.setText(
-                        "ipmosflm / IntegrationLab not found — install CCP4, "
+                        "ipmosflm / ProcessingLab not found — install CCP4, "
                         "build ProcessingLab (`make cpp`), or set MOSFLM_EXEC / "
                         "INTEGRATIONLAB."
                     )

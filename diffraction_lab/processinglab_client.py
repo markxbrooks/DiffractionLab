@@ -1,6 +1,6 @@
-"""Client for ProcessingLab ``IntegrationLab`` (C++ CONTROL driver).
+"""Client for ProcessingLab ``ProcessingLab`` (C++ CONTROL driver).
 
-``IntegrationLab`` does **not** speak ``MOSFLMSOCKET`` (that remains CCP4 /
+``ProcessingLab`` does **not** speak ``MOSFLMSOCKET`` (that remains CCP4 /
 F77 ``ipmosflm``). DiffractionLab drives it with CONTROL scripts on stdin and
 parses machine-readable ``INTEGRATIONLAB_*`` lines (or
 ``integrationlab_index.txt``) after AUTOINDEX.
@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 def find_integrationlab() -> Path | None:
-    """Locate ProcessingLab ``IntegrationLab`` (``.exe`` on Windows)."""
+    """Locate ProcessingLab ``ProcessingLab`` (``.exe`` on Windows)."""
     for key in (
         "INTEGRATIONLAB",
         "PROCESSINGLAB_EXEC",
@@ -32,14 +32,14 @@ def find_integrationlab() -> Path | None:
             continue
         path = Path(value).expanduser()
         if path.is_dir():
-            for name in ("IntegrationLab", "IntegrationLab.exe"):
+            for name in ("ProcessingLab", "ProcessingLab.exe"):
                 cand = path / name
                 if cand.is_file():
                     return cand.resolve()
         elif path.is_file():
             return path.resolve()
 
-    for name in ("IntegrationLab", "IntegrationLab.exe"):
+    for name in ("ProcessingLab", "ProcessingLab.exe"):
         which = shutil.which(name)
         if which:
             return Path(which).resolve()
@@ -51,10 +51,10 @@ def find_integrationlab() -> Path | None:
     for root in (here.parents[2], here.parents[1], Path.cwd(), home / "projects"):
         candidates.extend(
             [
-                root / "ProcessingLab" / "bin" / "IntegrationLab",
-                root / "ProcessingLab" / "bin" / "IntegrationLab.exe",
-                root / "ProcessingLab" / "mosflm-cpp" / "build" / "IntegrationLab",
-                root / "ProcessingLab" / "mosflm-cpp" / "build" / "IntegrationLab.exe",
+                root / "ProcessingLab" / "bin" / "ProcessingLab",
+                root / "ProcessingLab" / "bin" / "ProcessingLab.exe",
+                root / "ProcessingLab" / "mosflm-cpp" / "build" / "ProcessingLab",
+                root / "ProcessingLab" / "mosflm-cpp" / "build" / "ProcessingLab.exe",
             ]
         )
     env_root = os.environ.get("PROCESSINGLAB_HOME") or os.environ.get(
@@ -64,9 +64,9 @@ def find_integrationlab() -> Path | None:
         root = Path(env_root).expanduser()
         candidates.extend(
             [
-                root / "bin" / "IntegrationLab",
-                root / "bin" / "IntegrationLab.exe",
-                root / "mosflm-cpp" / "build" / "IntegrationLab",
+                root / "bin" / "ProcessingLab",
+                root / "bin" / "ProcessingLab.exe",
+                root / "mosflm-cpp" / "build" / "ProcessingLab",
             ]
         )
 
@@ -80,7 +80,7 @@ def find_integrationlab() -> Path | None:
 
 
 def prefer_processinglab() -> bool:
-    """True when DiffractionLab should prefer IntegrationLab over F77 ipmosflm."""
+    """True when DiffractionLab should prefer ProcessingLab over F77 ipmosflm."""
     flag = (os.environ.get("DIFFRACTIONLAB_BACKEND") or "").strip().lower()
     if flag in {"processinglab", "integrationlab", "pl"}:
         return True
@@ -104,7 +104,7 @@ def _find_ipmosflm_silent() -> Path | None:
 
 @dataclass
 class AutoIndexDump:
-    """Parsed IntegrationLab AUTOINDEX dump."""
+    """Parsed ProcessingLab AUTOINDEX dump."""
 
     cell: tuple[float, float, float, float, float, float]
     matrix: tuple[float, ...]
@@ -115,7 +115,7 @@ class AutoIndexDump:
 
 @dataclass
 class ProcessingLabRun:
-    """Result of one IntegrationLab CONTROL invocation."""
+    """Result of one ProcessingLab CONTROL invocation."""
 
     returncode: int
     stdout: str
@@ -207,7 +207,7 @@ def run_control_script(
     image: Path | None = None,
     timeout_s: float = 600.0,
 ) -> ProcessingLabRun:
-    """Run IntegrationLab with a CONTROL script written under *work_dir*."""
+    """Run ProcessingLab with a CONTROL script written under *work_dir*."""
     work_dir = Path(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
     script = work_dir / "integrationlab_control.in"
@@ -245,7 +245,7 @@ def run_control_script(
     if hklout is not None and Path(hklout).is_file() and Path(hklout).stat().st_size > 0:
         mtz = Path(hklout)
     else:
-        # IntegrationLab may write session.state().hklout default process.mtz
+        # ProcessingLab may write session.state().hklout default process.mtz
         for cand in (work_dir / "process.mtz", work_dir / "integrationlab.mtz"):
             if cand.is_file() and cand.stat().st_size > 0:
                 mtz = cand
@@ -280,7 +280,7 @@ def build_autoindex_commands(
     prefer_system: str | None = None,
     extra: Iterable[str] | None = None,
 ) -> list[str]:
-    """CONTROL lines for IntegrationLab AUTOINDEX from a ``.spt`` file."""
+    """CONTROL lines for ProcessingLab AUTOINDEX from a ``.spt`` file."""
     spot = Path(spotfile)
     spot_arg = spot.name if spot.parent.resolve() == Path(directory).resolve() else str(spot)
     auto = (
@@ -325,7 +325,7 @@ def build_process_commands(
     osc_deg: float = 1.0,
     separation_mm: float = 0.57,
 ) -> list[str]:
-    """CONTROL lines for IntegrationLab PROCESS with known CELL/MATRIX."""
+    """CONTROL lines for ProcessingLab PROCESS with known CELL/MATRIX."""
     if len(cell) != 6:
         raise ValueError("cell needs 6 values")
     if len(matrix) != 9:

@@ -1,4 +1,4 @@
-"""Unit tests for ProcessingLab IntegrationLab discovery and dump parsing."""
+"""Unit tests for ProcessingLab ProcessingLab discovery and dump parsing."""
 
 from __future__ import annotations
 

@@ -4,7 +4,7 @@
 
 **Interactive X-ray diffraction imaging, indexing, and processing with Python and Qt**
 
-DiffractionLab is a PySide6 desktop application for inspecting crystallographic diffraction images and running interactive indexing workflows. It combines the classic **MOSFLM DPS** indexing workflow (CCP4 F77 `ipmosflm` or **ProcessingLab** `IntegrationLab`) with **DIALS** processing for HDF5 / NeXus datasets.
+DiffractionLab is a PySide6 desktop application for inspecting crystallographic diffraction images and running interactive indexing workflows. It combines the classic **MOSFLM DPS** indexing workflow (CCP4 F77 `ipmosflm` or **ProcessingLab** `ProcessingLab`) with **DIALS** processing for HDF5 / NeXus datasets.
 
 The repository contains:
 
@@ -69,7 +69,7 @@ Optional dependencies:
 
 | Task | Tool | Notes |
 |---|---|---|
-| MOSFLM DPS indexing / integrate | **MOSFLM** (CCP4 `ipmosflm`) or **ProcessingLab** (`IntegrationLab`) | Non-HDF5; see env vars below |
+| MOSFLM DPS indexing / integrate | **MOSFLM** (CCP4 `ipmosflm`) or **ProcessingLab** (`ProcessingLab`) | Non-HDF5; see env vars below |
 | HDF5 / NeXus spot finding, indexing, and integration | **DIALS** (CCP4 or standalone) | Used for Eiger and other compatible HDF5 / NeXus datasets |
 | Job history / local queue | **SchedArray** (optional) | Persists CLI jobs; live logs still tailed by the Terminal viewer |
 
@@ -77,13 +77,13 @@ Optional dependencies:
 
 | Env | Effect |
 |---|---|
-| `DIFFRACTIONLAB_BACKEND=processinglab` | Force ProcessingLab `IntegrationLab` |
+| `DIFFRACTIONLAB_BACKEND=processinglab` | Force ProcessingLab `ProcessingLab` |
 | `DIFFRACTIONLAB_BACKEND=mosflm` | Force F77 `ipmosflm` (MOSFLMSOCKET) |
-| `DIFFRACTIONLAB_PREFER_PROCESSINGLAB=1` | Prefer IntegrationLab when both are installed |
-| `INTEGRATIONLAB` / `PROCESSINGLAB_HOME` | Path to `IntegrationLab` binary or ProcessingLab root |
+| `DIFFRACTIONLAB_PREFER_PROCESSINGLAB=1` | Prefer ProcessingLab when both are installed |
+| `INTEGRATIONLAB` / `PROCESSINGLAB_HOME` | Path to `ProcessingLab` binary or ProcessingLab root |
 | `MOSFLM_EXEC` | Path to F77 `ipmosflm` |
 
-Default: use F77 Mosflm when found; otherwise fall back to IntegrationLab. ProcessingLab does not implement `MOSFLMSOCKET` (mosaicity estimate / index2 refine stay Mosflm-only).
+Default: use F77 Mosflm when found; otherwise fall back to ProcessingLab. ProcessingLab does not implement `MOSFLMSOCKET` (mosaicity estimate / index2 refine stay Mosflm-only).
 
 DiffractionLab searches for DIALS commands on `PATH`, under `$DIALS_DIR` or `$CCP4`, and in common CCP4 installation prefixes (for example, `/Applications/ccp4-9`). Spot / prediction overlay export may use CCP4's Python when DIALS cannot be imported in the active virtual environment.
 
