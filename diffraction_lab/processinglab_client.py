@@ -319,18 +319,24 @@ def build_findspots_commands(
     template: str | None = None,
     spot_file: str = "spots.spt",
     threshold: float = 5.0,
-    max_spots: int = 500,
+    max_spots: int = 1500,
     find_image: int = 1,
     range_first: int | None = None,
     range_last: int | None = None,
     multiframe: bool = False,
+    for_indexing: bool = False,
     distance_mm: float | None = None,
     wavelength_a: float | None = None,
     beam_x_mm: float | None = None,
     beam_y_mm: float | None = None,
     pixel_mm: float | None = None,
 ) -> list[str]:
-    """CONTROL lines for ProcessingLab FINDSPOTS (optional MULTIFRAME COLSPOT)."""
+    """CONTROL lines for ProcessingLab FINDSPOTS (optional MULTIFRAME COLSPOT).
+
+    When ``for_indexing`` is True (or ``multiframe`` / an explicit range is
+    set), emit a multi-frame COLSPOT wedge so DPS sees 3D RLP coverage.
+    Default wedge is ``FIND`` … ``FIND+49`` with ``MAXSPOTS 1500``.
+    """
     cmds: list[str] = [f"DIRECTORY {directory}"]
     if template:
         cmds.append(f"TEMPLATE {template}")
@@ -344,16 +350,27 @@ def build_findspots_commands(
         cmds.append(f"PIXEL {pixel_mm:.6f} {pixel_mm:.6f}")
     if beam_x_mm is not None and beam_y_mm is not None:
         cmds.append(f"BEAM {beam_x_mm:.4f} {beam_y_mm:.4f}")
-    fs = (
-        f"FINDSPOTS THRESHOLD {threshold:g} MAXSPOTS {max_spots} "
-        f"FIND {find_image} FILE {spot_file}"
+    use_multi = (
+        for_indexing
+        or multiframe
+        or (
+            range_first is not None
+            and range_last is not None
+            and range_last > (range_first or 0)
+        )
     )
-    use_multi = multiframe or (
-        range_first is not None and range_last is not None and range_last > (range_first or 0)
+    spots_cap = max(max_spots, 1500) if for_indexing else max_spots
+    fs = (
+        f"FINDSPOTS THRESHOLD {threshold:g} MAXSPOTS {spots_cap} "
+        f"FIND {find_image} FILE {spot_file}"
     )
     if use_multi:
         first = int(range_first if range_first is not None else find_image)
-        last = int(range_last if range_last is not None else first)
+        last = int(
+            range_last
+            if range_last is not None
+            else (first + 49 if for_indexing or multiframe else first)
+        )
         fs += f" MULTIFRAME RANGE {first} {last}"
     cmds.extend([fs, "GO"])
     return cmds

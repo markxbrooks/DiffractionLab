@@ -188,7 +188,7 @@ class IndexingSettings:
     sigma_cutoff: float = 2.50
     max_penalty_to_refine: float = 50.0
     spot_threshold_sigma: float = 5.0
-    max_spots_per_frame: int = 400
+    max_spots_per_frame: int = 1500
     mosaic_block_size: float = 100.0
     min_spots_to_index: int = 12
 

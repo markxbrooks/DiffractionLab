@@ -96,6 +96,19 @@ def test_build_findspots_multiframe(tmp_path: Path) -> None:
     assert "FINDSPOTS" in joined
     assert "MULTIFRAME" in joined
     assert "RANGE 1 10" in joined
+    assert "MAXSPOTS 1500" in joined
+
+
+def test_build_findspots_for_indexing(tmp_path: Path) -> None:
+    cmds = build_findspots_commands(
+        directory=tmp_path,
+        template="img_####.cbf",
+        for_indexing=True,
+    )
+    joined = "\n".join(cmds)
+    assert "MULTIFRAME" in joined
+    assert "RANGE 1 50" in joined
+    assert "MAXSPOTS 1500" in joined
 
 
 def test_build_process_commands_xds_wrap(tmp_path: Path) -> None:
