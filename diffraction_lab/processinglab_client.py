@@ -53,8 +53,8 @@ def find_integrationlab() -> Path | None:
             [
                 root / "ProcessingLab" / "bin" / "ProcessingLab",
                 root / "ProcessingLab" / "bin" / "ProcessingLab.exe",
-                root / "ProcessingLab" / "diffraction-lab" / "build" / "ProcessingLab",
-                root / "ProcessingLab" / "diffraction-lab" / "build" / "ProcessingLab.exe",
+                root / "ProcessingLab" / "processing-lab" / "build" / "ProcessingLab",
+                root / "ProcessingLab" / "processing-lab" / "build" / "ProcessingLab.exe",
             ]
         )
     env_root = os.environ.get("PROCESSINGLAB_HOME") or os.environ.get(
@@ -66,7 +66,7 @@ def find_integrationlab() -> Path | None:
             [
                 root / "bin" / "ProcessingLab",
                 root / "bin" / "ProcessingLab.exe",
-                root / "diffraction-lab" / "build" / "ProcessingLab",
+                root / "processing-lab" / "build" / "ProcessingLab",
             ]
         )
 
