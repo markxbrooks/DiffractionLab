@@ -6,11 +6,13 @@ import logging
 import math
 from dataclasses import dataclass
 
+import numpy as np
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import (
     QColor,
     QCursor,
     QFont,
+    QImage,
     QMouseEvent,
     QPainter,
     QPen,
@@ -132,6 +134,8 @@ class DiffractionImageCanvas(ZoomableCanvas if _HAS_ZOOMABLE else QWidget):
         self._pixmap = QPixmap()
         self._spot_overlay: SpotOverlay | None = None
         self._show_spots = True
+        self._pixel_mask = QImage()
+        self._show_pixel_mask = True
         self._resolution_rings: list[ResolutionRing] = []
         self._show_rings = True
         self._beam_center: tuple[float, float] | None = None
@@ -182,6 +186,41 @@ class DiffractionImageCanvas(ZoomableCanvas if _HAS_ZOOMABLE else QWidget):
         """Show or hide indexing spot markers."""
         self._show_spots = bool(visible)
         self.update()
+
+    def set_pixel_mask(
+        self,
+        mask: np.ndarray | None,
+        *,
+        color: tuple[int, int, int, int] = (255, 0, 255, 140),
+        visible: bool | None = None,
+    ) -> None:
+        """Tint the pixels where *mask* is true (e.g. those DEFPIX ignores).
+
+        :param mask: Boolean array, ``(height, width)`` of the image; drawn
+            only while the image has that size. ``None`` clears it.
+        :param color: RGBA tint.
+        :param visible: Show or hide it (``None``: unchanged).
+        """
+        if mask is None:
+            self._pixel_mask = QImage()
+        else:
+            mask = np.asarray(mask, dtype=bool)
+            rgba = np.zeros((*mask.shape, 4), dtype=np.uint8)
+            rgba[mask] = color
+            h, w = mask.shape
+            self._pixel_mask = QImage(rgba.data, w, h, 4 * w, QImage.Format.Format_RGBA8888).copy()
+        if visible is not None:
+            self._show_pixel_mask = bool(visible)
+        self.update()
+
+    def set_pixel_mask_visible(self, visible: bool) -> None:
+        """Show or hide the pixel mask without rebuilding it."""
+        self._show_pixel_mask = bool(visible)
+        self.update()
+
+    def has_pixel_mask(self) -> bool:
+        """Whether a pixel mask is set."""
+        return not self._pixel_mask.isNull()
 
     def set_resolution_rings(
         self,
@@ -284,6 +323,15 @@ class DiffractionImageCanvas(ZoomableCanvas if _HAS_ZOOMABLE else QWidget):
             self._pixmap,
             QRectF(0.0, 0.0, float(src_w), float(src_h)),
         )
+        if (self._show_pixel_mask and not self._pixel_mask.isNull()
+                and self._pixel_mask.size() == self._pixmap.size()):
+            # Unsmoothed, so single pixels stay visible when zoomed out.
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
+            painter.drawImage(
+                QRectF(min(x0, x1), min(y0, y1), dest_w, dest_h),
+                self._pixel_mask,
+                QRectF(0.0, 0.0, float(src_w), float(src_h)),
+            )
 
         if self._show_rings and self._resolution_rings:
             self._paint_resolution_rings(painter, transform)

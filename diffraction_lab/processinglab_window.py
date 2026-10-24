@@ -12,14 +12,18 @@ DIALS / MOSFLM Processing window (:mod:`diffraction_lab.processing_wizard`):
    from the solution; re-integration from the refined cell and detector
    parameters (``--from``). The average spot profile and the resolution
    bins are charted live, after every batch of frames
-   (:mod:`diffraction_lab.processinglab_charts`).
+   (:mod:`diffraction_lab.processinglab_charts`). Untrusted regions and
+   resolution ranges for DEFPIX can be added, and the pixels it ignored
+   (``defpix.cbf``) shown on the image.
 5. **Symmetry**: CCP4 Pointless (Laue / space group, reindexing, L-test for
    twinning).
 6. **Scale**: CCP4 Aimless (scale and merge).
+7. **Dimple**: CCP4 Dimple refines a known model against the merged data
+   and finds unmodelled blobs (:mod:`diffraction_lab.dimple_tab`).
 
 Each stage is a ProcessingLab run in the session folder
 (:mod:`diffraction_lab.processinglab_stages`); Pointless and Aimless write
-into its ``04-ccp4`` folder.
+into its ``04-ccp4`` folder, Dimple into ``05-dimple``.
 """
 
 from __future__ import annotations
@@ -58,6 +62,7 @@ from PySide6.QtWidgets import (
 )
 
 from diffraction_lab.aimless_runner import AimlessRunResult, AimlessSummary, find_aimless, run_aimless
+from diffraction_lab.dimple_tab import DimpleTab
 from diffraction_lab.pointless_runner import (
     PointlessRunResult,
     find_pointless,
@@ -78,12 +83,14 @@ from diffraction_lab.processinglab_format import (
 from diffraction_lab.processinglab_run import (
     REFINABLE_PARAMETERS,
     JobQueue,
+    PixelExclusions,
     RunRecord,
     rerun_options,
     run_processinglab,
 )
 from diffraction_lab.processinglab_stages import (
     STAGE_CCP4,
+    STAGE_DIMPLE,
     STAGE_INTEGRATE,
     IndexResult,
     LatticeSolution,
@@ -183,6 +190,18 @@ class _Session:
     aimless: AimlessRunResult | None = None
 
 
+@dataclass
+class SpotDefaults:
+    first = 1
+    last = 999999
+    threshold_value = 5
+    threshold_low_value = 1
+    threshold_high_value = 100
+    to_find_max_value = 20_000
+    to_find_range_low_value = 50
+    to_find_range_high_value = 100_000
+
+
 class ProcessingLabWindow(ProcessingWindowBase):
     """Processing with ProcessingLab, Pointless and Aimless only
     (:attr:`ProcessingEngine.PROCESSINGLAB`)."""
@@ -192,6 +211,7 @@ class ProcessingLabWindow(ProcessingWindowBase):
         self._sweep: ProcessingSweep | None = None
         self._s = _Session()
         self._overlay_shown = False  # whether this window drew the spot overlay
+        self._defpix_shown: Path | None = None  # defpix.cbf this window shows
         self._jobs_service: JobService | None = None
         self._terminal: TerminalLogViewer | None = None
         self._slider_connected = False
@@ -222,6 +242,7 @@ class ProcessingLabWindow(ProcessingWindowBase):
         self._build_integrate_tab()
         self._build_symmetry_tab()
         self._build_scale_tab()
+        self._build_dimple_tab()
         self._build_jobs_tab()
 
     def _build_setup_tab(self) -> None:
@@ -280,6 +301,7 @@ class ProcessingLabWindow(ProcessingWindowBase):
         self.tabs.addTab(page, "1. Setup")
 
     def _build_spots_tab(self) -> None:
+        spot_defaults = SpotDefaults()
         page = QWidget()
         v = QVBoxLayout(page)
         box = QGroupBox("Spot finding (ProcessingLab FINDSPOTS)")
@@ -287,15 +309,15 @@ class ProcessingLabWindow(ProcessingWindowBase):
         self.spot_first = QSpinBox()
         self.spot_last = QSpinBox()
         for spin in (self.spot_first, self.spot_last):
-            spin.setRange(1, 999999)
+            spin.setRange(spot_defaults.first, spot_defaults.last)
         form.addRow("Frames", _row(self.spot_first, QLabel("to"), self.spot_last))
         self.spot_threshold = QDoubleSpinBox()
-        self.spot_threshold.setRange(1.0, 100.0)
-        self.spot_threshold.setValue(5.0)
+        self.spot_threshold.setRange(spot_defaults.threshold_low_value, spot_defaults.threshold_high_value)
+        self.spot_threshold.setValue(spot_defaults.threshold_value)
         form.addRow("Threshold (σ)", self.spot_threshold)
         self.spot_max = QSpinBox()
-        self.spot_max.setRange(50, 100000)
-        self.spot_max.setValue(1500)
+        self.spot_max.setRange(spot_defaults.to_find_range_low_value, spot_defaults.to_find_range_high_value)
+        self.spot_max.setValue(spot_defaults.to_find_max_value)
         form.addRow("Maximum spots", self.spot_max)
         self.find_spots_btn = QPushButton("Find spots")
         self.find_spots_btn.clicked.connect(self._on_find_spots)
@@ -362,6 +384,25 @@ class ProcessingLabWindow(ProcessingWindowBase):
         form.addRow(self.integrate_btn)
         v.addWidget(box)
 
+        defpix = QGroupBox("Ignored pixels (DEFPIX)")
+        dform = QFormLayout(defpix)
+        note = QLabel("Shaded (beamstop), defective and hot pixels are found automatically. "
+                      "Add regions and resolution ranges to ignore as well:")
+        note.setWordWrap(True)
+        dform.addRow(note)
+        self.untrusted_edit = QPlainTextEdit()
+        self.untrusted_edit.setPlaceholderText("One per line, XDS pixels (x along fast, from 1), e.g.\n"
+                                               "RECTANGLE 1200 1300 1150 1250\n"
+                                               "ELLIPSE x1 x2 y1 y2   ·   QUADRILATERAL x1 y1 … x4 y4")
+        self.untrusted_edit.setMaximumHeight(72)
+        dform.addRow("Untrusted regions", self.untrusted_edit)
+        self.exclude_res_edit = QLineEdit()
+        self.exclude_res_edit.setPlaceholderText("e.g. 3.93 3.87, 2.70 2.64 (Å)")
+        dform.addRow("Exclude resolution", self.exclude_res_edit)
+        self.exclude_ice_check = QCheckBox("Exclude the usual ice-ring ranges")
+        dform.addRow(self.exclude_ice_check)
+        v.addWidget(defpix)
+
         result = QGroupBox("Result")
         rv = QVBoxLayout(result)
         self.integrate_label = QLabel("Not integrated yet.")
@@ -375,6 +416,10 @@ class ProcessingLabWindow(ProcessingWindowBase):
         self.mtz_view_btn.clicked.connect(lambda: self._view_mtz(self._s.integrated.mtz
                                                                 if self._s.integrated else None))
         rv.addLayout(_row(self.report_btn, self.mtz_view_btn))
+        self.show_defpix_check = QCheckBox("Show the ignored pixels on the image (magenta)")
+        self.show_defpix_check.setToolTip("DEFPIX's control image, defpix.cbf, over the main window's image")
+        self.show_defpix_check.toggled.connect(self._update_defpix_overlay)
+        rv.addWidget(self.show_defpix_check)
         v.addWidget(result)
 
         rerun = QGroupBox("Re-integrate with the refined unit cell and detector parameters")
@@ -467,6 +512,18 @@ class ProcessingLabWindow(ProcessingWindowBase):
         v.addStretch(1)
         self.tabs.addTab(page, "6. Scale")
 
+    def _build_dimple_tab(self) -> None:
+        self.dimple_tab = DimpleTab(
+            self,
+            mtz_provider=lambda: self._s.aimless.hklout if self._s.aimless else None,
+            folder_provider=lambda: self._s.folder / STAGE_DIMPLE if self._s.folder else None,
+            job_service_provider=self._job_service,
+            session_id_provider=lambda: (queue.session_id if (queue := self._job_queue()) else None),
+            view_mtz=self._view_mtz,
+            show_log=False,  # Dimple's output goes to the window's log
+        )
+        self.tabs.addTab(self.dimple_tab, "7. Dimple")
+
     def _build_jobs_tab(self) -> None:
         """SchedArray history of this dataset's ProcessingLab, Pointless and Aimless jobs."""
         self.jobs_tab = JobsTab(
@@ -474,7 +531,7 @@ class ProcessingLabWindow(ProcessingWindowBase):
             service_provider=self._job_service,
             work_dir_provider=lambda: self._s.folder,
             tool_filters=(("All", None), ("ProcessingLab", "processinglab"), ("Pointless", "pointless"),
-                          ("Aimless", "aimless")),
+                          ("Aimless", "aimless"), ("Dimple", "dimple")),
         )
         self.jobs_tab.work_dir_only.setText("This session only")
         self.jobs_tab.open_log_requested.connect(self._show_job_log)
@@ -583,10 +640,13 @@ class ProcessingLabWindow(ProcessingWindowBase):
         space_group = self.space_group_combo.currentText().strip()
         if index is None or not space_group:
             return
+        exclusions = self._exclusions()
+        if exclusions is None:
+            return
         sweep, session, frames = self._sweep, self._session(), self._integrate_frames()
         self._start(f"Integrating frames {frames} in {space_group}…",
                     lambda emit, jobs=self._job_queue(): integrate(sweep, session, index, space_group, frames=frames,
-                                                                   on_line=emit, jobs=jobs),
+                                                                   on_line=emit, jobs=jobs, exclusions=exclusions),
                     self._integrate_done, charts=True)
 
     def _on_reintegrate(self) -> None:
@@ -594,11 +654,15 @@ class ProcessingLabWindow(ProcessingWindowBase):
         if record is None:
             return
         refine = tuple(n for n, box in self.refine_checks.items() if box.isChecked())
+        exclusions = self._exclusions()
+        if exclusions is None:
+            return
         try:
             options = rerun_options(record, refine=refine,
                                     space_group=self.rerun_space_group.text().strip() or None,
                                     cell=parse_cell_text(self.rerun_cell.text()),
-                                    output_dir=stage_dir(self._session(), STAGE_INTEGRATE))
+                                    output_dir=stage_dir(self._session(), STAGE_INTEGRATE),
+                                    exclusions=exclusions)
         except ValueError as ex:
             QMessageBox.warning(self, "Re-integrate", str(ex))
             return
@@ -652,6 +716,9 @@ class ProcessingLabWindow(ProcessingWindowBase):
         threshold, max_spots = self.spot_threshold.value(), self.spot_max.value()
         ix_threshold, dmax = self.index_threshold.value(), self.index_dmax.value() or None
         dmin, anomalous = self.aimless_dmin.value() or None, self.aimless_anomalous.isChecked()
+        exclusions = self._exclusions()
+        if exclusions is None:
+            return
         jobs = self._job_queue()
         service = jobs.service if jobs else None
 
@@ -667,7 +734,7 @@ class ProcessingLabWindow(ProcessingWindowBase):
             space_group = chosen.space_groups[0] if chosen and chosen.space_groups else "1"
             emit(f"=== Integrate in {space_group}")
             s.integrated = integrate(sweep, session, s.index, space_group, frames=frames, on_line=emit,
-                                     jobs=jobs)
+                                     jobs=jobs, exclusions=exclusions)
             if s.integrated.mtz is not None and find_pointless() is not None:
                 out = stage_dir(session, STAGE_CCP4)
                 emit("=== Pointless")
@@ -760,7 +827,38 @@ class ProcessingLabWindow(ProcessingWindowBase):
             label, text = self.pipeline_labels[key]
             label.setText(f"{'●' if done else '○'} {text}" + (f" — {detail}" if done and detail else ""))
         self._update_spot_overlay()
+        self._update_defpix_overlay()
         self._update_enabled()
+
+    def _exclusions(self) -> PixelExclusions | None:
+        """The DEFPIX regions and ranges entered, or ``None`` (after a warning) if they don't parse."""
+        try:
+            return PixelExclusions.parse(self.untrusted_edit.toPlainText(), self.exclude_res_edit.text(),
+                                         ice=self.exclude_ice_check.isChecked())
+        except ValueError as ex:
+            QMessageBox.warning(self, "Ignored pixels", str(ex))
+            self.tabs.setCurrentIndex(3)
+            return None
+
+    def _update_defpix_overlay(self, *_args: Any) -> None:
+        """Show the latest integration's ``defpix.cbf`` on the main window's image, or clear it."""
+        record = self._s.integrated
+        wanted = record.defpix_image if record is not None and self.show_defpix_check.isChecked() else None
+        if wanted == self._defpix_shown:
+            return
+        viewer = self.viewer()
+        if viewer is None or not hasattr(viewer, "set_defpix_overlay"):
+            return
+        try:
+            n = viewer.set_defpix_overlay(wanted)
+        except (OSError, ValueError) as ex:
+            self.status_label.setText(f"Cannot show the ignored pixels: {ex}")
+            viewer.set_defpix_overlay(None)
+            self._defpix_shown = None
+            return
+        self._defpix_shown = wanted
+        if wanted is not None:
+            self.status_label.setText(f"{n:,} ignored pixels shown in magenta ({wanted}).")
 
     def _show_solutions(self) -> None:
         index = self._s.index
@@ -923,6 +1021,14 @@ class ProcessingLabWindow(ProcessingWindowBase):
             super().clear_spot_overlay()
             self._overlay_shown = False
 
+    def closeEvent(self, event) -> None:  # noqa: N802
+        """Also clear the ignored-pixel overlay."""
+        viewer = self.viewer()
+        if self._defpix_shown is not None and viewer is not None:
+            viewer.set_defpix_overlay(None)
+            self._defpix_shown = None
+        super().closeEvent(event)
+
     def _update_tools(self) -> None:
         for name, path in (("ProcessingLab", find_integrationlab()), ("Pointless", find_pointless()),
                            ("Aimless", find_aimless())):
@@ -943,6 +1049,7 @@ class ProcessingLabWindow(ProcessingWindowBase):
         self.rerun_btn.setEnabled(not busy and have_pl and s.integrated is not None and s.integrated.can_rerun)
         self.report_btn.setEnabled(s.integrated is not None)
         self.mtz_view_btn.setEnabled(s.integrated is not None and s.integrated.mtz is not None)
+        self.show_defpix_check.setEnabled(s.integrated is not None and s.integrated.defpix_image is not None)
         self.pointless_btn.setEnabled(not busy and have_pointless and s.integrated is not None
                                       and s.integrated.mtz is not None)
         p = s.pointless
@@ -951,6 +1058,7 @@ class ProcessingLabWindow(ProcessingWindowBase):
         self.pointless_log_btn.setEnabled(p is not None)
         self.aimless_btn.setEnabled(not busy and have_aimless and p is not None)
         self.merged_view_btn.setEnabled(s.aimless is not None)
+        self.dimple_tab.update_enabled()
         self.aimless_log_btn.setEnabled(s.aimless is not None)
 
     def _view_mtz(self, mtz: Path | None) -> None:

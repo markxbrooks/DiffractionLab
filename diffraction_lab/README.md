@@ -137,6 +137,7 @@ python imosflm/main.py
 | `indexing_dialog.py` | Processing UI (Mosflm + DIALS HDF5→MTZ + Pointless Symmetry) |
 | `dials_engine.py` | DIALS CLI pipeline (incl. Bravais/reindex, symmetry/scale/merge, report) |
 | `pointless_runner.py` | MxLib PointlessCommand wrapper + log parse |
+| `dimple_runner.py` / `dimple_tab.py` | CCP4 Dimple runner + `dimple.log` parse; Dimple tab of both Processing windows |
 | `pointless_spec.py` | SpecEditor fields for Pointless keywords |
 | `terminal_log_viewer.py` | JDXI-style dark terminal that tails DIALS logs |
 | `jobs/` | SchedArray JobService, poller, and MxPanDDA-style Jobs tab |

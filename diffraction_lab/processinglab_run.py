@@ -41,6 +41,74 @@ REFINABLE_PARAMETERS: tuple[str, ...] = (
 
 _OUTPUT_DIR_LINE = re.compile(r"^\s*Output directory:\s*(.+?)\s*$")
 
+#: ``--untrusted`` shapes and how many values each takes (XDS pixels).
+UNTRUSTED_SHAPES: dict[str, int] = {"RECTANGLE": 4, "ELLIPSE": 4, "QUADRILATERAL": 8}
+
+
+@dataclass(frozen=True)
+class PixelExclusions:
+    """Detector regions and resolution ranges ProcessingLab's DEFPIX ignores.
+
+    :param untrusted: ``(shape, values)`` per region, in XDS pixels (1-based,
+        x along fast): ``RECTANGLE``/``ELLIPSE`` take ``x1 x2 y1 y2``,
+        ``QUADRILATERAL`` takes ``x1 y1 … x4 y4``.
+    :param resolution: Resolution ranges (Å, either order).
+    :param ice: Also ignore the usual ice-ring ranges.
+    """
+
+    untrusted: tuple[tuple[str, tuple[float, ...]], ...] = ()
+    resolution: tuple[tuple[float, float], ...] = ()
+    ice: bool = False
+
+    @classmethod
+    def parse(cls, regions: str = "", resolution: str = "", *, ice: bool = False) -> PixelExclusions:
+        """Read regions (one per line, ``RECTANGLE 1 10 1 20``) and ranges (``3.93 3.87, 2.70 2.64``).
+
+        :raises ValueError: Naming the line or range that is wrong.
+        """
+        untrusted = []
+        for n, line in enumerate(regions.splitlines(), start=1):
+            words = line.replace(",", " ").split()
+            if not words or words[0].startswith(("#", "!")):
+                continue
+            shape = next((s for s in UNTRUSTED_SHAPES if s.startswith(words[0].upper()[:4])), None)
+            if shape is None:
+                raise ValueError(f"region line {n}: '{words[0]}' is not RECTANGLE, ELLIPSE or QUADRILATERAL")
+            try:
+                values = tuple(float(w) for w in words[1:])
+            except ValueError:
+                raise ValueError(f"region line {n}: values must be numbers") from None
+            if len(values) != UNTRUSTED_SHAPES[shape]:
+                raise ValueError(f"region line {n}: {shape} needs {UNTRUSTED_SHAPES[shape]} values")
+            untrusted.append((shape, values))
+        ranges = []
+        for part in resolution.replace(";", ",").split(","):
+            if not part.strip():
+                continue
+            try:
+                d1, d2 = (float(w) for w in part.replace("-", " ").split())
+            except ValueError:
+                raise ValueError(f"resolution range '{part.strip()}' needs two values in Å") from None
+            if d1 <= 0 or d2 <= 0:
+                raise ValueError(f"resolution range '{part.strip()}' must be positive")
+            ranges.append((d1, d2))
+        return cls(tuple(untrusted), tuple(ranges), ice)
+
+    @property
+    def argv(self) -> list[str]:
+        """``--untrusted`` / ``--exclude-resolution`` / ``--exclude-ice`` arguments."""
+        args: list[str] = []
+        for shape, values in self.untrusted:
+            args += ["--untrusted", shape, *(f"{v:g}" for v in values)]
+        for d1, d2 in self.resolution:
+            args += ["--exclude-resolution", f"{d1:g}", f"{d2:g}"]
+        if self.ice:
+            args.append("--exclude-ice")
+        return args
+
+    def __bool__(self) -> bool:
+        return bool(self.untrusted or self.resolution or self.ice)
+
 
 @dataclass(frozen=True)
 class RunOptions:
@@ -64,6 +132,7 @@ class RunOptions:
     :param xds_inp: ``--xds-inp`` path, or ``None``.
     :param xparm: ``--xparm`` (an XPARM.XDS / GXPARM.XDS with orientation),
         or ``None``.
+    :param exclusions: Pixels for DEFPIX to ignore, or ``None``.
     """
 
     image: Path | None = None
@@ -76,6 +145,7 @@ class RunOptions:
     refine: tuple[str, ...] | None = None
     xds_inp: Path | None = None
     xparm: Path | None = None
+    exclusions: PixelExclusions | None = None
 
 
 @dataclass(frozen=True)
@@ -104,6 +174,13 @@ class RunRecord:
     integrated_reflections: int | None = None
     quality_total: dict[str, Any] = field(default_factory=dict)
     outputs: dict[str, Path] = field(default_factory=dict)
+    #: DEFPIX pixel counts (``trusted``, ``shaded``, ``defective``, …).
+    defpix_pixels: dict[str, int] = field(default_factory=dict)
+
+    @property
+    def defpix_image(self) -> Path | None:
+        """DEFPIX's control image (``defpix.cbf``: −3 = ignored), if written."""
+        return self.outputs.get("defpix_image")
 
     @property
     def completed(self) -> bool:
@@ -173,6 +250,8 @@ def build_run_argv(executable: Path, options: RunOptions) -> list[str]:
         if unknown:
             raise ValueError(f"unknown refine parameter(s): {', '.join(unknown)}")
         argv += ["--refine", ",".join(options.refine) if options.refine else "none"]
+    if options.exclusions:
+        argv += options.exclusions.argv
     if options.output_dir is not None:
         argv += ["--output-dir", str(options.output_dir)]
     return argv
@@ -252,6 +331,7 @@ def load_run_record(run_dir: Path | str) -> RunRecord:
     integration = process.get("integration") or {}
     counts = integration.get("counts") or {}
     integrated = counts.get("integrated_reflections", integration.get("reflections"))
+    defpix = (integration.get("defpix") or {}).get("pixels") or {}
     quality = process.get("quality") or {}
 
     outputs: dict[str, Path] = {}
@@ -280,6 +360,7 @@ def load_run_record(run_dir: Path | str) -> RunRecord:
         integrated_reflections=int(integrated) if isinstance(integrated, int) else None,
         quality_total=dict(quality.get("total") or {}),
         outputs=outputs,
+        defpix_pixels={k: int(v) for k, v in defpix.items() if isinstance(v, int)},
     )
 
 
@@ -493,6 +574,7 @@ def rerun_options(
     space_group: str | None = None,
     cell: tuple[float, float, float, float, float, float] | None = None,
     output_dir: Path | None = None,
+    exclusions: PixelExclusions | None = None,
 ) -> RunOptions:
     """Options to re-process *record* from its refined model (``--from``).
 
@@ -506,6 +588,8 @@ def rerun_options(
     :param cell: Override the cell, or ``None``.
     :param output_dir: New output directory, or ``None`` for a timestamped
         one beside the original run.
+    :param exclusions: Pixels for DEFPIX to ignore (``--from`` does not
+        carry the earlier run's), or ``None``.
     :returns: The options.
     :raises ValueError: If the run cannot seed a re-run.
     """
@@ -518,6 +602,7 @@ def rerun_options(
         space_group=space_group,
         cell=cell,
         refine=tuple(refine) if refine is not None else None,
+        exclusions=exclusions,
     )
 
 

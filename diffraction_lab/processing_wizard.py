@@ -145,6 +145,7 @@ from diffraction_lab.processinglab_client import (
     find_integrationlab,
     prefer_processinglab,
 )
+from diffraction_lab.dimple_tab import DimpleTab
 from diffraction_lab.processing_window_base import ProcessingEngine, ProcessingWindowBase
 from diffraction_lab.reflection_viewer_launch import launch_reflection_viewer
 from diffraction_lab.summary_vs_resolution import open_summary_vs_resolution_from_work_dir
@@ -1442,6 +1443,16 @@ class ProcessingWizard(ProcessingWindowBase):
         scale_layout.addStretch(1)
         self._scale_tab_index = self.pipeline_tabs.addTab(scale_page, "7. Scale")
 
+        # ----- Tab: Dimple (refine a known model against the merged data) -----
+        self._dimple_tab = DimpleTab(
+            self,
+            mtz_provider=self._dimple_mtz,
+            folder_provider=self._dimple_folder,
+            job_service_provider=self._dimple_job_service,
+            view_mtz=launch_reflection_viewer,
+        )
+        self._dimple_tab_index = self.pipeline_tabs.addTab(self._dimple_tab, "8. Dimple")
+
         # ----- Tab: Jobs (SchedArray history) -----
         if JobsTab is not None:
             self._jobs_tab = JobsTab(
@@ -2733,6 +2744,31 @@ class ProcessingWizard(ProcessingWindowBase):
         self._last_dials_log = Path(log_path)
         self.open_log_button.setEnabled(True)
         self._refresh_jobs_tab()
+
+    def _dimple_mtz(self) -> Path | None:
+        """The merged MTZ from the Scale tab (dials.merge), for Dimple."""
+        scale = self._dials_scale
+        mtz = scale.merged_mtz if scale is not None else None
+        return mtz if mtz is not None and mtz.is_file() else None
+
+    def _dimple_folder(self) -> Path | None:
+        """``<work dir>/dimple``: where Dimple runs go (each in its own folder)."""
+        text = self.dials_work_dir_edit.text().strip()
+        work = Path(text).expanduser() if text else self._dials_work_dir
+        return work / "dimple" if work else None
+
+    def _dimple_job_service(self):
+        """The SchedArray service of this work dir, so Dimple is listed in Jobs (``None``: run directly)."""
+        try:
+            from diffraction_lab.jobs.service import get_job_service, use_schedarray
+
+            if not use_schedarray():
+                return None
+            self._prepare_schedarray_service()
+            return get_job_service()
+        except Exception as ex:  # noqa: BLE001
+            logger.warning("Dimple runs without SchedArray: %s", ex)
+            return None
 
     def _jobs_work_dir(self) -> Path | None:
         """Work directory used to filter the Jobs tab (current DIALS run)."""

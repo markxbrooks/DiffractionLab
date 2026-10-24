@@ -84,6 +84,13 @@ def format_record(record: RunRecord) -> str:
         rows.append(("Held fixed", ", ".join(fixed) or "nothing"))
     if record.integrated_reflections is not None:
         rows.append(("Integrated", f"{record.integrated_reflections} reflections"))
+    if record.defpix_pixels:
+        d = record.defpix_pixels
+        ignored = [f"{d[k]:,} {label}" for k, label in (
+            ("shaded", "shaded"), ("defective", "defective"), ("hot", "hot"),
+            ("untrusted_region", "in untrusted regions"), ("excluded_resolution", "in excluded resolution"),
+        ) if d.get(k)]
+        rows.append(("Ignored pixels", ", ".join(ignored) or "none (besides the detector's gaps)"))
     q = record.quality_total
     if q:
         rows.append((

@@ -798,6 +798,13 @@ class DiffractionLabApp(QMainWindow):
         self._act_indexing_spots.toggled.connect(
             self._on_indexing_spots_action_toggled
         )
+        self._act_defpix = QAction("Show pixels ignored by &DEFPIX", self)
+        self._act_defpix.setCheckable(True)
+        self._act_defpix.setEnabled(False)
+        self._act_defpix.setStatusTip(
+            "Tint the pixels ProcessingLab's DEFPIX ignored (shown from the ProcessingLab window)"
+        )
+        self._act_defpix.toggled.connect(lambda on: self.image_canvas.set_pixel_mask_visible(on))
 
         self._act_index = QAction(
             _registry_icon(
@@ -918,6 +925,7 @@ class DiffractionLabApp(QMainWindow):
         view_menu.addSeparator()
         view_menu.addAction(self._act_rings)
         view_menu.addAction(self._act_indexing_spots)
+        view_menu.addAction(self._act_defpix)
         view_menu.addSeparator()
         view_menu.addAction(self._act_terminal)
 
@@ -1625,6 +1633,33 @@ class DiffractionLabApp(QMainWindow):
                 + ("" if self.show_indexing_spots else " (hidden)"),
                 5000,
             )
+
+    def set_defpix_overlay(self, path: Path | None) -> int:
+        """Tint the pixels a ProcessingLab DEFPIX control image ignores.
+
+        :param path: ``defpix.cbf`` (ignored pixels are −3), or ``None`` to
+            clear the overlay.
+        :returns: How many pixels are tinted.
+        :raises OSError: If the file cannot be read.
+        :raises ValueError: If it is not the size of the image shown.
+        """
+        if path is None:
+            self.image_canvas.set_pixel_mask(None)
+            self._act_defpix.setEnabled(False)
+            return 0
+        mask = np.asarray(fabio.open(str(path)).data) == -3
+        width, height = self.image_canvas.image_size()
+        if self.image_canvas.has_image() and mask.shape != (height, width):
+            raise ValueError(f"{Path(path).name} is {mask.shape[1]}×{mask.shape[0]} pixels, "
+                             f"the image {width}×{height}")
+        self.image_canvas.set_pixel_mask(mask, visible=True)
+        self._act_defpix.setEnabled(True)
+        self._act_defpix.blockSignals(True)
+        self._act_defpix.setChecked(True)
+        self._act_defpix.blockSignals(False)
+        n = int(mask.sum())
+        self.statusBar().showMessage(f"DEFPIX: {n:,} ignored pixels shown in magenta ({Path(path).name})", 5000)
+        return n
 
     def toggle_indexing_spots(self, state) -> None:
         """Toggle visibility of indexing spot markers."""

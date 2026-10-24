@@ -27,6 +27,7 @@ from typing import Callable, Sequence
 from diffraction_lab.processing_sweep import Frames, ProcessingSweep
 from diffraction_lab.processinglab_run import (
     JobQueue,
+    PixelExclusions,
     RunOptions,
     RunRecord,
     run_control_stage,
@@ -37,6 +38,7 @@ STAGE_FINDSPOTS = "01-findspots"
 STAGE_INDEX = "02-index"
 STAGE_INTEGRATE = "03-integrate"
 STAGE_CCP4 = "04-ccp4"
+STAGE_DIMPLE = "05-dimple"
 
 
 @dataclass(frozen=True)
@@ -175,20 +177,23 @@ def autoindex(sweep: ProcessingSweep, session: Path, spot_file: Path, *, thresho
 
 def integrate(sweep: ProcessingSweep, session: Path, index: IndexResult, space_group: str, *,
               frames: Frames | None = None, refine: Sequence[str] | None = None,
-              on_line: Callable[[str], None] | None = None, jobs: JobQueue | None = None) -> RunRecord:
+              on_line: Callable[[str], None] | None = None, jobs: JobQueue | None = None,
+              exclusions: PixelExclusions | None = None) -> RunRecord:
     """Stage 3: integrate *frames* (default: the whole sweep) in *space_group*.
 
     Runs ``ProcessingLab run --xparm <index>/XPARM.XDS --spacegroup …
     --range start:end``: the indexing cell is constrained to the space group
     (CELLFIX) and everything is refined unless *refine* says otherwise. The
     frames are always passed explicitly. The run also writes the ``xds/``,
-    ``xia2/`` and ``mosflm/`` repeat inputs.
+    ``xia2/`` and ``mosflm/`` repeat inputs. DEFPIX ignores *exclusions* as
+    well as the shaded, defective and hot pixels it finds.
     """
     out = stage_dir(session, STAGE_INTEGRATE)
     options = RunOptions(image=sweep.image, frames=frames or sweep.frames, parent_dir=session, output_dir=out,
                          space_group=space_group, xparm=index.xparm,
                          refine=tuple(refine) if refine is not None else
-                         ("orientation", "cell", "distance", "beam", "tilt_twist", "mosaicity"))
+                         ("orientation", "cell", "distance", "beam", "tilt_twist", "mosaicity"),
+                         exclusions=exclusions)
     return run_processinglab(options, on_line=on_line, jobs=jobs, step="integrate")
 
 

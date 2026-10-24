@@ -209,9 +209,10 @@ The current application code remains under `imosflm/`:
 | `processing_sweep.py` | `ProcessingSweep` (image, `frames`, HDF5 data files) and `Frames` (`start`, `end`): the sweep ProcessingLab processes |
 | `processinglab_stages.py` | ProcessingLab step by step: find spots, index (all lattice solutions), integrate |
 | `processing_window_base.py` | `ProcessingWindowBase` (shared by both Processing windows: engine title, viewer, spot overlay, background jobs) and `ProcessingEngine` (`DIALS`, `MOSFLM`, `PROCESSINGLAB`) |
-| `processinglab_window.py` | The ProcessingLab Processing window (spots → index → integrate → Pointless → Aimless) |
+| `processinglab_window.py` | The ProcessingLab Processing window (spots → index → integrate → Pointless → Aimless → Dimple) |
 | `processinglab_charts.py` | Live integration charts: streaming `PROFILE_MAP` / `RESOLUTION_BINS` parser, Qt signals, matplotlib canvases |
 | `pointless_runner.py`, `aimless_runner.py` | CCP4 Pointless and Aimless runners and log parsers |
+| `dimple_runner.py`, `dimple_tab.py` | CCP4 Dimple (refine a known model, find unmodelled blobs): runner, `dimple.log` parser, and the Dimple tab both Processing windows show after Scale |
 | `mosflm_client.py` | MOSFLM process I/O |
 | `spotfile.py` | MOSFLM spot-file I/O and peak finding |
 | `indexing.py` | Geometry helpers shared by indexing workflows |
