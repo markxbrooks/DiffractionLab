@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from diffraction_lab.processing_sweep import Frames
 from diffraction_lab.processinglab_client import find_integrationlab
 from diffraction_lab.processinglab_run import (
     ProcessingLabError,
@@ -59,7 +60,7 @@ def _write_run(directory: Path, *, status: str = "completed", version: int = 2) 
 
 
 def test_build_run_argv_first_run() -> None:
-    argv = build_run_argv(EXE, RunOptions(image=Path("/d/x_master.h5"), frame_range=(1, 100),
+    argv = build_run_argv(EXE, RunOptions(image=Path("/d/x_master.h5"), frames=Frames(1, 100),
                                           space_group="P41212", cell=(57.9, 57.9, 150.2, 90, 90, 90)))
     assert argv == [str(EXE), "run", "--image", "/d/x_master.h5", "--range", "1:100",
                     "--spacegroup", "P41212", "--cell", "57.9", "57.9", "150.2", "90", "90", "90"]
@@ -92,7 +93,7 @@ def test_load_run_record_schema2(tmp_path: Path) -> None:
     assert rec.refinement == {"orientation": "refined", "unit_cell": "fixed"}
     assert rec.integrated_reflections == 60881
     assert rec.quality_total["r_meas_pct"] == 17.9
-    assert rec.image == Path("/data/t_master.h5") and rec.frame_range == (1, 100)
+    assert rec.image == Path("/data/t_master.h5") and rec.frames == Frames(1, 100)
     # Output paths are relative to the run directory in the record.
     assert rec.mtz == tmp_path / "run" / "process.mtz"
     assert rec.outputs["xds_inp"] == tmp_path / "run" / "xds" / "XDS.INP"

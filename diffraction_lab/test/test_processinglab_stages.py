@@ -26,6 +26,7 @@ from diffraction_lab.processinglab_stages import (
     spot_overlay,
     stage_dir,
 )
+from diffraction_lab.processing_sweep import Frames, ProcessingSweep
 
 INSULIN = Path(os.environ.get("CCP4", "/Applications/ccp4-9")) / "examples" / "data" / "insulin_1_001.img"
 
@@ -42,7 +43,7 @@ SPT = """        4148        4362 0.07500000    1.000000  270.000000
 
 
 def test_commands() -> None:
-    assert findspots_commands(1, 50, threshold=4, max_spots=2000) == [
+    assert findspots_commands(Frames(1, 50), threshold=4, max_spots=2000) == [
         "FINDSPOTS THRESHOLD 4 MAXSPOTS 2000 FIND 1 FILE spots.spt MULTIFRAME RANGE 1 50", "GO", "EXIT"]
     lines = autoindex_commands(Path("/s/spots.spt"), threshold=10, dmax=320, character=32)
     assert lines[0] == "DMAX 320"
@@ -120,15 +121,18 @@ def test_load_index_result_and_scan(tmp_path: Path) -> None:
                     reason="needs ProcessingLab and the CCP4 insulin example")
 def test_stages_insulin(tmp_path: Path) -> None:
     session = new_session_dir(tmp_path)
-    spots = find_spots(INSULIN, session, 1, 1)
+    sweep = ProcessingSweep.from_image(INSULIN)
+    assert sweep is not None and sweep.frames == Frames(1, 1)
+    spots = find_spots(sweep, session)  # default wedge: the sweep's first 50 frames
     assert spots.outputs["spot_list"].is_file()
-    index = autoindex(INSULIN, session, spots.outputs["spot_list"])
+    index = autoindex(sweep, session, spots.outputs["spot_list"])
     assert index.selected is not None and len(index.solutions) == 44
     # Choosing another lattice by character re-indexes in it.
     other = next(s for s in index.solutions if s.lattice == "aP")
-    again = autoindex(INSULIN, session, spots.outputs["spot_list"], character=other.character)
+    again = autoindex(sweep, session, spots.outputs["spot_list"], character=other.character)
     assert again.selected is not None and again.selected.lattice == "aP"
     assert again.record.directory.name == "02-index-2"
-    run = integrate(INSULIN, session, index, index.selected.space_groups[0])
+    run = integrate(sweep, session, index, index.selected.space_groups[0])
+    assert run.frames == Frames(1, 1)  # the whole sweep, passed explicitly
     assert run.completed and run.mtz is not None and run.mtz.is_file()
     assert run.refinement["unit_cell"] == "refined"  # a first integration refines everything

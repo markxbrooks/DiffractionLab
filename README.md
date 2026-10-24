@@ -58,6 +58,7 @@ Working files default to `~/.qtmosflm/dials/<dataset_stem>/`. Spot/prediction ov
 4. **Integrate:** ProcessingLab integration in an **initial space group** chosen from the solution's groups, refining everything.
    - **Result:** the refined cell, detector, mosaicity and statistics, and the report.
    - **Re-integrate:** re-integration from the refined unit cell and detector parameters, choosing what is refined again. It can also take a space group (filled in from Pointless when that's safe) or a cell.
+   - **Live charts:** while it integrates, the tab charts the **average spot profile** (one panel per φ slice) and the **resolution bins**: completeness and I/σ, and CC½ and R<sub>meas</sub>, against d. Both update after every batch of frames (25 by default). They are drawn from the `PROFILE_MAP` and `RESOLUTION_BINS` blocks in ProcessingLab's output, the same blocks ProcessingLab's `doc/read_profile_maps.py` and `doc/resolution_bins.py` plot.
 5. **Symmetry:** CCP4 Pointless on the integrated reflections.
    - **Results:** the Laue and space group with their confidences and the reindex operator, and the **L-test for twinning** (⟨|L|⟩, ⟨L²⟩, twin fraction and verdict).
    - **When it can't decide:** it says when only the point group could be determined.
@@ -215,8 +216,10 @@ The current application code remains under `imosflm/`:
 | `dials_engine.py` | DIALS subprocess pipeline and `.npz` caches |
 | `processinglab_run.py` | `ProcessingLab run` / `--from` command lines, live log, `input.json` / `process.json` records |
 | `processinglab_panel.py` | ProcessingLab tab: run → Pointless / Aimless → re-run from refined values |
+| `processing_sweep.py` | `ProcessingSweep` (image, `frames`, HDF5 data files) and `Frames` (`start`, `end`): the sweep ProcessingLab processes |
 | `processinglab_stages.py` | ProcessingLab step by step: find spots, index (all lattice solutions), integrate |
 | `processinglab_window.py` | The ProcessingLab Processing window (spots → index → integrate → Pointless → Aimless) |
+| `processinglab_charts.py` | Live integration charts: streaming `PROFILE_MAP` / `RESOLUTION_BINS` parser, Qt signals, matplotlib canvases |
 | `pointless_runner.py`, `aimless_runner.py` | CCP4 Pointless and Aimless runners and log parsers |
 | `mosflm_client.py` | MOSFLM process I/O |
 | `spotfile.py` | MOSFLM spot-file I/O and peak finding |

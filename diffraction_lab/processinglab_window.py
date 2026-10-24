@@ -10,7 +10,9 @@ DIALS / MOSFLM Processing window (:mod:`diffraction_lab.processing_wizard`):
    penalty, cell and possible space groups. Another solution can be chosen.
 4. **Integrate**: ProcessingLab integration in an initial space group chosen
    from the solution; re-integration from the refined cell and detector
-   parameters (``--from``).
+   parameters (``--from``). The average spot profile and the resolution
+   bins are charted live, after every batch of frames
+   (:mod:`diffraction_lab.processinglab_charts`).
 5. **Symmetry**: CCP4 Pointless (Laue / space group, reindexing, L-test for
    twinning).
 6. **Scale**: CCP4 Aimless (scale and merge).
@@ -46,6 +48,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QSplitter,
     QTableWidget,
@@ -62,6 +65,8 @@ from diffraction_lab.pointless_runner import (
     is_identity_reindex,
     run_pointless,
 )
+from diffraction_lab.processing_sweep import Frames, ProcessingSweep
+from diffraction_lab.processinglab_charts import IntegrationChartsWidget
 from diffraction_lab.processinglab_client import find_integrationlab
 from diffraction_lab.processinglab_panel import (
     CallWorker,
@@ -178,8 +183,7 @@ class ProcessingLabWindow(QDialog):
         self.setWindowTitle("Processing — ProcessingLab")
         self.setMinimumSize(860, 640)
         self.setModal(False)
-        self._image: Path | None = None
-        self._n_frames = 0
+        self._sweep: ProcessingSweep | None = None
         self._s = _Session()
         self._thread: QThread | None = None
         self._worker: CallWorker | None = None
@@ -226,6 +230,8 @@ class ProcessingLabWindow(QDialog):
         for spin in (self.sweep_first, self.sweep_last):
             spin.setRange(1, 999999)
         form.addRow("Frames to process", _row(self.sweep_first, QLabel("to"), self.sweep_last))
+        self.sweep_label = QLabel("")
+        form.addRow("Sweep on disk", self.sweep_label)
         self.work_edit = QLineEdit()
         self.work_edit.setToolTip("Sessions are created here as session_YYYYMMDD_HHMMSS")
         browse = QPushButton("Browse…")
@@ -335,8 +341,8 @@ class ProcessingLabWindow(QDialog):
         self.tabs.addTab(page, "3. Index")
 
     def _build_integrate_tab(self) -> None:
-        page = QWidget()
-        v = QVBoxLayout(page)
+        controls = QWidget()
+        v = QVBoxLayout(controls)
         box = QGroupBox("Integration (ProcessingLab)")
         form = QFormLayout(box)
         self.space_group_combo = QComboBox()
@@ -389,6 +395,16 @@ class ProcessingLabWindow(QDialog):
         rr.addWidget(self.rerun_btn)
         v.addWidget(rerun)
         v.addStretch(1)
+
+        # Controls above, live charts (profile, resolution bins) below.
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(controls)
+        self.charts = IntegrationChartsWidget()
+        page = QSplitter(Qt.Orientation.Vertical)
+        page.addWidget(scroll)
+        page.addWidget(self.charts)
+        page.setSizes([300, 380])
         self.tabs.addTab(page, "4. Integrate")
 
     def _build_symmetry_tab(self) -> None:
@@ -450,44 +466,59 @@ class ProcessingLabWindow(QDialog):
         """Read the open image and frame count from the main window."""
         app = self.parentWidget()
         current = getattr(app, "current_file", None) if app is not None else None
-        n_frames = int(getattr(app, "num_frames", 0) or 0) if app is not None else 0
-        self.set_dataset(Path(current) if current else None, n_frames)
+        self.set_dataset(Path(current) if current else None)
         slider = getattr(app, "frame_slider", None)
         if slider is not None and not self._slider_connected:
             slider.valueChanged.connect(self._update_spot_overlay)
             self._slider_connected = True
 
-    def set_dataset(self, image: Path | None, n_frames: int) -> None:
+    def set_dataset(self, image: Path | None) -> None:
         """Point the window at a sweep (any frame, or an HDF5 master).
 
+        The frame range is the whole sweep as ProcessingLab sees it (every
+        data file of a master; the image viewer counts one at a time).
+
         :param image: The image, or ``None``.
-        :param n_frames: Frames in the sweep (0 if unknown).
         """
         new = Path(image).expanduser().resolve() if image else None
-        changed = new != self._image or max(int(n_frames), 1) != self._n_frames
-        self._image = new
-        self._n_frames = max(int(n_frames), 1)
         self.image_label.setText(str(new) if new else "(no image loaded)")
-        if changed:
+        if new != (self._sweep.image if self._sweep else None):
             # A different sweep: a fresh session, ranges over the whole sweep.
+            self._sweep = ProcessingSweep.from_image(new) if new else None
+            if new is not None and self._sweep is None:
+                self._sweep = ProcessingSweep(new, Frames(1, 1))  # unreadable master: let ProcessingLab report it
+            frames = self._sweep.frames if self._sweep else Frames(1, 1)
+            for spin in (self.sweep_first, self.sweep_last, self.spot_first, self.spot_last):
+                spin.setRange(frames.start, frames.end)
+            self._show_frames(frames, self._sweep.spot_wedge() if self._sweep else frames)
+            self.sweep_label.setText(f"frames {frames} ({frames.count} images)"
+                                     + (f" in {len(self._sweep.data_files)} data files"
+                                        if self._sweep and self._sweep.data_files else ""))
             self._s = _Session()
-            self.sweep_first.setValue(1)
-            self.sweep_last.setValue(self._n_frames)
-            self.spot_first.setValue(1)
-            self.spot_last.setValue(min(50, self._n_frames))
             self._show_all()
         if new is not None and not self.work_edit.text().strip():
             self.work_edit.setText(str(default_work_parent(new)))
         self._update_tools()
         self._update_enabled()
 
-    def _sweep_range(self) -> tuple[int, int] | None:
-        first, last = self.sweep_first.value(), self.sweep_last.value()
-        return None if (first, last) == (1, self._n_frames) else (first, last)
+    def _show_frames(self, integrate: Frames, spots: Frames) -> None:
+        """Put frames into the Setup and Find-spots range boxes."""
+        self.sweep_first.setValue(integrate.start)
+        self.sweep_last.setValue(integrate.end)
+        self.spot_first.setValue(spots.start)
+        self.spot_last.setValue(spots.end)
+
+    def _integrate_frames(self) -> Frames:
+        """The frames to integrate (Setup), always passed explicitly (``--range``)."""
+        return Frames.between(self.sweep_first.value(), self.sweep_last.value())
+
+    def _spot_frames(self) -> Frames:
+        """The spot-search wedge (Find spots)."""
+        return Frames.between(self.spot_first.value(), self.spot_last.value())
 
     def _session(self) -> Path:
         if self._s.folder is None:
-            parent = Path(self.work_edit.text().strip() or default_work_parent(self._image))
+            parent = Path(self.work_edit.text().strip() or default_work_parent(self._sweep.image))
             self._s.folder = new_session_dir(parent)
             self.session_label.setText(str(self._s.folder))
         return self._s.folder
@@ -505,10 +536,9 @@ class ProcessingLabWindow(QDialog):
         self._show_all()
 
     def _on_find_spots(self) -> None:
-        image, session = self._image, self._session()
-        first, last = self.spot_first.value(), self.spot_last.value()
+        sweep, session, wedge = self._sweep, self._session(), self._spot_frames()
         threshold, max_spots = self.spot_threshold.value(), self.spot_max.value()
-        self._start("Finding spots…", lambda emit: find_spots(image, session, first, last, threshold=threshold,
+        self._start("Finding spots…", lambda emit: find_spots(sweep, session, wedge, threshold=threshold,
                                                               max_spots=max_spots, on_line=emit),
                     self._spots_done)
 
@@ -516,12 +546,12 @@ class ProcessingLabWindow(QDialog):
         spots = self._s.spots
         if spots is None or "spot_list" not in spots.outputs:
             return
-        image, session = self._image, self._session()
+        sweep, session = self._sweep, self._session()
         threshold = self.index_threshold.value()
         dmax = self.index_dmax.value() or None
         spt = spots.outputs["spot_list"]
         what = "Indexing…" if character is None else f"Re-indexing with lattice character {character}…"
-        self._start(what, lambda emit: autoindex(image, session, spt, threshold=threshold, dmax=dmax,
+        self._start(what, lambda emit: autoindex(sweep, session, spt, threshold=threshold, dmax=dmax,
                                                  character=character, on_line=emit), self._index_done)
 
     def _on_reindex_selected(self) -> None:
@@ -534,10 +564,10 @@ class ProcessingLabWindow(QDialog):
         space_group = self.space_group_combo.currentText().strip()
         if index is None or not space_group:
             return
-        image, session, frames = self._image, self._session(), self._sweep_range()
-        self._start(f"Integrating in {space_group}…",
-                    lambda emit: integrate(image, session, index, space_group, frame_range=frames, on_line=emit),
-                    self._integrate_done)
+        sweep, session, frames = self._sweep, self._session(), self._integrate_frames()
+        self._start(f"Integrating frames {frames} in {space_group}…",
+                    lambda emit: integrate(sweep, session, index, space_group, frames=frames, on_line=emit),
+                    self._integrate_done, charts=True)
 
     def _on_reintegrate(self) -> None:
         record = self._s.integrated
@@ -553,7 +583,7 @@ class ProcessingLabWindow(QDialog):
             QMessageBox.warning(self, "Re-integrate", str(ex))
             return
         self._start(f"Re-integrating from {record.directory.name} (refining {', '.join(refine) or 'nothing'})…",
-                    lambda emit: run_processinglab(options, on_line=emit), self._integrate_done)
+                    lambda emit: run_processinglab(options, on_line=emit), self._integrate_done, charts=True)
 
     def _on_pointless(self) -> None:
         record = self._s.integrated
@@ -594,8 +624,8 @@ class ProcessingLabWindow(QDialog):
 
     def _on_run_all(self) -> None:
         """Every step with the current settings, each solution / group as suggested."""
-        image, session, frames = self._image, self._session(), self._sweep_range()
-        first, last = self.spot_first.value(), self.spot_last.value()
+        sweep, session = self._sweep, self._session()
+        frames, wedge = self._integrate_frames(), self._spot_frames()
         threshold, max_spots = self.spot_threshold.value(), self.spot_max.value()
         ix_threshold, dmax = self.index_threshold.value(), self.index_dmax.value() or None
         dmin, anomalous = self.aimless_dmin.value() or None, self.aimless_anomalous.isChecked()
@@ -603,15 +633,15 @@ class ProcessingLabWindow(QDialog):
         def task(emit: Callable[[str], None]) -> _Session:
             s = _Session(folder=session)
             emit("=== Find spots")
-            s.spots = find_spots(image, session, first, last, threshold=threshold, max_spots=max_spots,
+            s.spots = find_spots(sweep, session, wedge, threshold=threshold, max_spots=max_spots,
                                  on_line=emit)
             emit("=== Index")
-            s.index = autoindex(image, session, s.spots.outputs["spot_list"], threshold=ix_threshold, dmax=dmax,
+            s.index = autoindex(sweep, session, s.spots.outputs["spot_list"], threshold=ix_threshold, dmax=dmax,
                                 on_line=emit)
             chosen = s.index.selected
             space_group = chosen.space_groups[0] if chosen and chosen.space_groups else "1"
             emit(f"=== Integrate in {space_group}")
-            s.integrated = integrate(image, session, s.index, space_group, frame_range=frames, on_line=emit)
+            s.integrated = integrate(sweep, session, s.index, space_group, frames=frames, on_line=emit)
             if s.integrated.mtz is not None and find_pointless() is not None:
                 out = stage_dir(session, STAGE_CCP4)
                 emit("=== Pointless")
@@ -622,7 +652,7 @@ class ProcessingLabWindow(QDialog):
                                             resolution_high=dmin, anomalous=anomalous)
             return s
 
-        self._start("Running all steps…", task, self._all_done)
+        self._start("Running all steps…", task, self._all_done, charts=True)
 
     # ========================================================= results
 
@@ -639,6 +669,7 @@ class ProcessingLabWindow(QDialog):
         self.status_label.setText("Indexed: check the solution, choose an initial space group, integrate.")
 
     def _integrate_done(self, record: RunRecord) -> None:
+        self.charts.load_log(record.directory / "process.log")  # the final batch's charts
         self._s.integrated, self._s.pointless, self._s.aimless = record, None, None
         self._show_all()
         self.tabs.setCurrentIndex(3)
@@ -657,6 +688,8 @@ class ProcessingLabWindow(QDialog):
         self.status_label.setText(f"Merged: {result.hklout}")
 
     def _all_done(self, session: _Session) -> None:
+        if session.integrated is not None:
+            self.charts.load_log(session.integrated.directory / "process.log")
         self._s = session
         self._show_all()
         self.tabs.setCurrentIndex(5 if session.aimless else 3)
@@ -769,11 +802,16 @@ class ProcessingLabWindow(QDialog):
         self._overlay_shown = True
 
     def _displayed_frame(self, first_frame: int) -> int:
-        """The frame number the main window shows (HDF5: slider; CBF/SMV: the file)."""
+        """The sweep frame the main window shows.
+
+        HDF5: the slider counts within the data file shown, so add the frames
+        of the data files before it. CBF/SMV: the frame number of the file.
+        """
         app = self.parentWidget()
         slider = getattr(app, "frame_slider", None)
-        if self._image is not None and self._image.suffix.lower() in {".h5", ".nxs"} and slider is not None:
-            return int(slider.value()) + 1
+        if self._sweep is not None and self._sweep.is_hdf5 and slider is not None:
+            combo = getattr(app, "dataset_combo", None)
+            return self._sweep.sweep_frame(int(slider.value()), combo.currentText() if combo is not None else None)
         digits = "".join(ch if ch.isdigit() else " " for ch in Path(getattr(app, "current_file", "") or "").stem)
         numbers = digits.split()
         return int(numbers[-1]) if numbers else first_frame
@@ -781,11 +819,14 @@ class ProcessingLabWindow(QDialog):
     # ========================================================= plumbing
 
     def _start(self, message: str, fn: Callable[[Callable[[str], None]], Any],
-               on_finished: Callable[[Any], None]) -> None:
+               on_finished: Callable[[Any], None], *, charts: bool = False) -> None:
+        """Run *fn* in a worker thread; its output lines go to the log (and,
+        with *charts*, to the live integration charts, which redraw after each
+        batch of frames)."""
         if self._busy():
             QMessageBox.information(self, "ProcessingLab", "A step is already running.")
             return
-        if self._image is None:
+        if self._sweep is None:
             QMessageBox.warning(self, "ProcessingLab", "Open an image first.")
             return
         self.status_label.setText(message)
@@ -795,6 +836,10 @@ class ProcessingLabWindow(QDialog):
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.line.connect(self.log_view.appendPlainText)
+        if charts:
+            self.charts.reset()
+            self._worker.line.connect(self.charts.feed)
+            self.tabs.setCurrentIndex(3)
         self._worker.finished.connect(on_finished)
         self._worker.failed.connect(self._on_failed)
         self._worker.finished.connect(self._thread.quit)
@@ -820,7 +865,7 @@ class ProcessingLabWindow(QDialog):
     def _update_enabled(self) -> None:
         busy, s = self._busy(), self._s
         have_pl = find_integrationlab() is not None
-        have_image = self._image is not None
+        have_image = self._sweep is not None
         have_pointless, have_aimless = find_pointless() is not None, find_aimless() is not None
         self.find_spots_btn.setEnabled(not busy and have_pl and have_image)
         self.run_all_btn.setEnabled(not busy and have_pl and have_image)

@@ -51,6 +51,7 @@ from diffraction_lab.processinglab_run import (
     rerun_options,
     run_processinglab,
 )
+from diffraction_lab.processing_sweep import Frames, ProcessingSweep
 
 logger = logging.getLogger(__name__)
 
@@ -205,7 +206,6 @@ class ProcessingLabPanel(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._image: Path | None = None
-        self._n_frames = 0
         self._record: RunRecord | None = None
         self._scaling: ScaleMergeResult | None = None
         self._thread: QThread | None = None
@@ -332,11 +332,14 @@ class ProcessingLabPanel(QWidget):
         """
         self._image = Path(image).expanduser().resolve() if image else None
         self.image_label.setText(str(self._image) if self._image else "(no image loaded)")
-        self._n_frames = int(n_frames)
-        last = max(self._n_frames, 1)
-        self.first_frame.setValue(1)
-        self.last_frame.setMaximum(max(last, self.last_frame.maximum()))
-        self.last_frame.setValue(last)
+        # The whole sweep as ProcessingLab sees it (the viewer's frame count
+        # is per HDF5 data file); n_frames is the fallback.
+        sweep = ProcessingSweep.from_image(self._image) if self._image else None
+        frames = sweep.frames if sweep else Frames(1, max(int(n_frames), 1))
+        for spin in (self.first_frame, self.last_frame):
+            spin.setRange(frames.start, frames.end)
+        self.first_frame.setValue(frames.start)
+        self.last_frame.setValue(frames.end)
         if self._image is not None and not self.work_edit.text().strip():
             parent = default_work_parent(self._image)
             self.work_edit.setText(str(parent))
@@ -369,7 +372,7 @@ class ProcessingLabPanel(QWidget):
         try:
             options = RunOptions(
                 image=self._image,
-                frame_range=self._frame_range(),
+                frames=self._frames(),
                 parent_dir=Path(self.work_edit.text().strip() or default_work_parent(self._image)),
                 space_group=self.space_group_edit.text().strip() or None,
                 cell=parse_cell_text(self.cell_edit.text()),
@@ -380,10 +383,9 @@ class ProcessingLabPanel(QWidget):
         self._start("Running ProcessingLab…",
                     lambda emit: run_processinglab(options, on_line=emit), self._on_run_finished)
 
-    def _frame_range(self) -> tuple[int, int] | None:
-        """The ``--range``, or ``None`` for the whole sweep (whatever its first frame number)."""
-        first, last = self.first_frame.value(), self.last_frame.value()
-        return None if (first, last) == (1, max(self._n_frames, 1)) else (first, last)
+    def _frames(self) -> Frames:
+        """The ``--range``: always explicit, so what is shown is what is processed."""
+        return Frames.between(self.first_frame.value(), self.last_frame.value())
 
     def _on_rerun(self) -> None:
         if self._record is None:

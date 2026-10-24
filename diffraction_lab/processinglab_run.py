@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
+from diffraction_lab.processing_sweep import Frames
 from diffraction_lab.processinglab_client import find_integrationlab
 
 logger = logging.getLogger(__name__)
@@ -44,8 +45,8 @@ class RunOptions:
 
     :param image: HDF5/NeXus master or one frame of a CBF/SMV sweep.
         Optional with ``from_run`` (its images are reused).
-    :param frame_range: Inclusive ``(first, last)`` frames, or ``None`` for
-        every frame (or the previous run's range with ``from_run``).
+    :param frames: Frames to process (``--range``), or ``None`` for every
+        frame (or the previous run's frames with ``from_run``).
     :param output_dir: New directory for the run (must not exist), or
         ``None`` to let ProcessingLab create ``processing_YYYYMMDD_HHMMSS``
         under ``parent_dir``.
@@ -63,7 +64,7 @@ class RunOptions:
     """
 
     image: Path | None = None
-    frame_range: tuple[int, int] | None = None
+    frames: Frames | None = None
     output_dir: Path | None = None
     parent_dir: Path | None = None
     from_run: Path | None = None
@@ -87,7 +88,7 @@ class RunRecord:
     error: str | None
     schema_version: int
     image: Path | None
-    frame_range: tuple[int, int] | None
+    frames: Frames | None
     space_group_number: int | None
     space_group_symbol: str | None
     cell: tuple[float, float, float, float, float, float] | None
@@ -145,9 +146,8 @@ def build_run_argv(executable: Path, options: RunOptions) -> list[str]:
         argv += ["--xds-inp", str(options.xds_inp)]
     if options.xparm is not None:
         argv += ["--xparm", str(options.xparm)]
-    if options.frame_range is not None:
-        first, last = options.frame_range
-        argv += ["--range", f"{int(first)}:{int(last)}"]
+    if options.frames is not None:
+        argv += ["--range", options.frames.range_argument]
     if options.space_group:
         argv += ["--spacegroup", str(options.space_group).strip()]
     if options.cell is not None:
@@ -199,10 +199,10 @@ def load_run_record(run_dir: Path | str) -> RunRecord:
     images = (inputs.get("inputs") or {}).get("images") or []
     if images and images[0].get("path"):
         image = Path(images[0]["path"])
-    frame_range: tuple[int, int] | None = None
+    frames: Frames | None = None
     fr = ((inputs.get("experiment") or {}).get("frame_range") or {}).get("value")
     if isinstance(fr, dict) and "first" in fr and "last" in fr:
-        frame_range = (int(fr["first"]), int(fr["last"]))
+        frames = Frames(int(fr["first"]), int(fr["last"]))
 
     experiment = process.get("experiment") or {}
     refinement = process.get("refinement") or {}
@@ -251,7 +251,7 @@ def load_run_record(run_dir: Path | str) -> RunRecord:
         error=process.get("error"),
         schema_version=int(process.get("schema_version") or 1),
         image=image,
-        frame_range=frame_range,
+        frames=frames,
         space_group_number=sg_number,
         space_group_symbol=sg_symbol,
         cell=cell,

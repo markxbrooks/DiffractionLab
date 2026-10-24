@@ -1,7 +1,8 @@
 """ProcessingLab stage by stage: find spots → index → integrate.
 
-Each stage is its own ProcessingLab run in a session folder, so each has its
-own records (``input.json``, ``process.json``) and log::
+Each stage takes the :class:`~diffraction_lab.processing_sweep.ProcessingSweep`
+and :class:`~diffraction_lab.processing_sweep.Frames` to work on. Each is its
+own ProcessingLab run in a session folder, so each has its own records (``input.json``, ``process.json``) and log::
 
     <session>/
       01-findspots/        FINDSPOTS → spots.spt
@@ -23,6 +24,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Sequence
 
+from diffraction_lab.processing_sweep import Frames, ProcessingSweep
 from diffraction_lab.processinglab_run import (
     RunOptions,
     RunRecord,
@@ -119,12 +121,11 @@ def stage_dir(session: Path, stage: str) -> Path:
     return candidate
 
 
-def findspots_commands(first: int, last: int, *, threshold: float = 5.0,
-                       max_spots: int = 1500) -> list[str]:
-    """CONTROL for a multi-frame spot search over frames *first*–*last*."""
+def findspots_commands(frames: Frames, *, threshold: float = 5.0, max_spots: int = 1500) -> list[str]:
+    """CONTROL for a multi-frame spot search over *frames*."""
     return [
-        f"FINDSPOTS THRESHOLD {threshold:g} MAXSPOTS {int(max_spots)} FIND {int(first)} "
-        f"FILE spots.spt MULTIFRAME RANGE {int(first)} {int(last)}",
+        f"FINDSPOTS THRESHOLD {threshold:g} MAXSPOTS {int(max_spots)} FIND {frames.start} "
+        f"FILE spots.spt MULTIFRAME RANGE {frames.start} {frames.end}",
         "GO",
         "EXIT",
     ]
@@ -147,37 +148,39 @@ def autoindex_commands(spot_file: Path, *, threshold: float = 15.0, dmax: float 
     return [*lines, line, "GO", "EXIT"]
 
 
-def find_spots(image: Path, session: Path, first: int, last: int, *, threshold: float = 5.0,
+def find_spots(sweep: ProcessingSweep, session: Path, frames: Frames | None = None, *, threshold: float = 5.0,
                max_spots: int = 1500, on_line: Callable[[str], None] | None = None) -> RunRecord:
-    """Stage 1: spot search over frames *first*–*last* into a new stage folder."""
+    """Stage 1: spot search over *frames* (default: the sweep's first 50) into a new stage folder."""
     out = stage_dir(session, STAGE_FINDSPOTS)
-    return run_control_stage(image, findspots_commands(first, last, threshold=threshold, max_spots=max_spots),
+    wedge = frames or sweep.spot_wedge()
+    return run_control_stage(sweep.image, findspots_commands(wedge, threshold=threshold, max_spots=max_spots),
                              out, on_line=on_line)
 
 
-def autoindex(image: Path, session: Path, spot_file: Path, *, threshold: float = 15.0,
+def autoindex(sweep: ProcessingSweep, session: Path, spot_file: Path, *, threshold: float = 15.0,
               dmax: float | None = None, character: int | None = None,
               on_line: Callable[[str], None] | None = None) -> IndexResult:
     """Stage 2: autoindex *spot_file* (optionally forcing one lattice solution)."""
     out = stage_dir(session, STAGE_INDEX)
     record = run_control_stage(
-        image, autoindex_commands(spot_file, threshold=threshold, dmax=dmax, character=character), out,
+        sweep.image, autoindex_commands(spot_file, threshold=threshold, dmax=dmax, character=character), out,
         on_line=on_line)
     return load_index_result(record)
 
 
-def integrate(image: Path, session: Path, index: IndexResult, space_group: str, *,
-              frame_range: tuple[int, int] | None = None, refine: Sequence[str] | None = None,
+def integrate(sweep: ProcessingSweep, session: Path, index: IndexResult, space_group: str, *,
+              frames: Frames | None = None, refine: Sequence[str] | None = None,
               on_line: Callable[[str], None] | None = None) -> RunRecord:
-    """Stage 3: integrate with the indexing orientation in *space_group*.
+    """Stage 3: integrate *frames* (default: the whole sweep) in *space_group*.
 
-    Runs ``ProcessingLab run --xparm <index>/XPARM.XDS --spacegroup …``: the
-    indexing cell is constrained to the space group (CELLFIX) and everything
-    is refined unless *refine* says otherwise. The run also writes the
-    ``xds/``, ``xia2/`` and ``mosflm/`` repeat inputs.
+    Runs ``ProcessingLab run --xparm <index>/XPARM.XDS --spacegroup …
+    --range start:end``: the indexing cell is constrained to the space group
+    (CELLFIX) and everything is refined unless *refine* says otherwise. The
+    frames are always passed explicitly. The run also writes the ``xds/``,
+    ``xia2/`` and ``mosflm/`` repeat inputs.
     """
     out = stage_dir(session, STAGE_INTEGRATE)
-    options = RunOptions(image=image, frame_range=frame_range, parent_dir=session, output_dir=out,
+    options = RunOptions(image=sweep.image, frames=frames or sweep.frames, parent_dir=session, output_dir=out,
                          space_group=space_group, xparm=index.xparm,
                          refine=tuple(refine) if refine is not None else
                          ("orientation", "cell", "distance", "beam", "tilt_twist", "mosaicity"))
