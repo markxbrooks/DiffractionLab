@@ -30,13 +30,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from PySide6.QtCore import Qt, QThread, QUrl
+from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QDesktopServices, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QComboBox,
-    QDialog,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -68,8 +67,8 @@ from diffraction_lab.pointless_runner import (
 from diffraction_lab.processing_sweep import Frames, ProcessingSweep
 from diffraction_lab.processinglab_charts import IntegrationChartsWidget
 from diffraction_lab.processinglab_client import find_integrationlab
+from diffraction_lab.processing_window_base import ProcessingEngine, ProcessingWindowBase
 from diffraction_lab.processinglab_panel import (
-    CallWorker,
     default_work_parent,
     format_record,
     parse_cell_text,
@@ -175,18 +174,14 @@ class _Session:
     aimless: AimlessRunResult | None = None
 
 
-class ProcessingLabWindow(QDialog):
-    """Processing with ProcessingLab, Pointless and Aimless only."""
+class ProcessingLabWindow(ProcessingWindowBase):
+    """Processing with ProcessingLab, Pointless and Aimless only
+    (:attr:`ProcessingEngine.PROCESSINGLAB`)."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Processing — ProcessingLab")
-        self.setMinimumSize(860, 640)
-        self.setModal(False)
+        super().__init__(parent, ProcessingEngine.PROCESSINGLAB, minimum_size=(860, 640))
         self._sweep: ProcessingSweep | None = None
         self._s = _Session()
-        self._thread: QThread | None = None
-        self._worker: CallWorker | None = None
         self._overlay_shown = False  # whether this window drew the spot overlay
         self._slider_connected = False
         self._build_ui()
@@ -464,9 +459,8 @@ class ProcessingLabWindow(QDialog):
 
     def refresh_dataset(self) -> None:
         """Read the open image and frame count from the main window."""
-        app = self.parentWidget()
-        current = getattr(app, "current_file", None) if app is not None else None
-        self.set_dataset(Path(current) if current else None)
+        app = self.viewer() or self.parentWidget()
+        self.set_dataset(self.current_image_path())
         slider = getattr(app, "frame_slider", None)
         if slider is not None and not self._slider_connected:
             slider.valueChanged.connect(self._update_spot_overlay)
@@ -779,14 +773,12 @@ class ProcessingLabWindow(QDialog):
         return next((s for s in index.solutions if s.character == character), None)
 
     def _update_spot_overlay(self, *_args: Any) -> None:
-        app = self.parentWidget()
+        app = self.viewer()
         if app is None or not hasattr(app, "set_indexing_spot_overlay"):
             return
         spots = self._s.spots
         if not self.show_spots_check.isChecked() or spots is None or "spot_list" not in spots.outputs:
-            if self._overlay_shown:  # clear only what this window drew
-                app.set_indexing_spot_overlay(None)
-                self._overlay_shown = False
+            self.clear_spot_overlay()  # only what this window drew
             return
         scan = scan_of(spots)
         try:
@@ -807,7 +799,7 @@ class ProcessingLabWindow(QDialog):
         HDF5: the slider counts within the data file shown, so add the frames
         of the data files before it. CBF/SMV: the frame number of the file.
         """
-        app = self.parentWidget()
+        app = self.viewer()
         slider = getattr(app, "frame_slider", None)
         if self._sweep is not None and self._sweep.is_hdf5 and slider is not None:
             combo = getattr(app, "dataset_combo", None)
@@ -820,42 +812,41 @@ class ProcessingLabWindow(QDialog):
 
     def _start(self, message: str, fn: Callable[[Callable[[str], None]], Any],
                on_finished: Callable[[Any], None], *, charts: bool = False) -> None:
-        """Run *fn* in a worker thread; its output lines go to the log (and,
-        with *charts*, to the live integration charts, which redraw after each
-        batch of frames)."""
-        if self._busy():
-            QMessageBox.information(self, "ProcessingLab", "A step is already running.")
-            return
+        """Run *fn* as a background job (:meth:`start_job`); its output lines go to
+        the log (and, with *charts*, to the live integration charts, which
+        redraw after each batch of frames)."""
         if self._sweep is None:
-            QMessageBox.warning(self, "ProcessingLab", "Open an image first.")
+            QMessageBox.warning(self, self.engine.label, "Open an image first.")
             return
-        self.status_label.setText(message)
+        if self.job_running():
+            QMessageBox.information(self, self.engine.label, "A step is already running.")
+            return  # before resetting the charts of the running job
         self.log_view.appendPlainText(f"\n=== {datetime.now():%H:%M:%S} {message}")
-        self._thread = QThread(self)
-        self._worker = CallWorker(fn)
-        self._worker.moveToThread(self._thread)
-        self._thread.started.connect(self._worker.run)
-        self._worker.line.connect(self.log_view.appendPlainText)
         if charts:
             self.charts.reset()
-            self._worker.line.connect(self.charts.feed)
             self.tabs.setCurrentIndex(3)
-        self._worker.finished.connect(on_finished)
-        self._worker.failed.connect(self._on_failed)
-        self._worker.finished.connect(self._thread.quit)
-        self._worker.failed.connect(self._thread.quit)
-        self._thread.finished.connect(self._worker.deleteLater)
-        self._thread.finished.connect(self._update_enabled)
-        self._thread.start()
+        if self.start_job(message, fn, on_finished, on_line=self.charts.feed if charts else None):
+            self._update_enabled()
+
+    # ----- ProcessingWindowBase hooks
+
+    def report_status(self, text: str) -> None:
+        """Status line under the tabs."""
+        self.status_label.setText(text)
+
+    def append_log(self, text: str) -> None:
+        """The log pane."""
+        self.log_view.appendPlainText(text)
+
+    def on_job_ended(self) -> None:
+        """Re-enable the buttons."""
         self._update_enabled()
 
-    def _on_failed(self, message: str) -> None:
-        self.status_label.setText(f"Failed: {message}")
-        self.log_view.appendPlainText(f"FAILED: {message}")
-        QMessageBox.warning(self, "ProcessingLab", message)
-
-    def _busy(self) -> bool:
-        return self._thread is not None and self._thread.isRunning()
+    def clear_spot_overlay(self) -> None:
+        """Clear the overlay only if this window drew it."""
+        if self._overlay_shown:
+            super().clear_spot_overlay()
+            self._overlay_shown = False
 
     def _update_tools(self) -> None:
         for name, path in (("ProcessingLab", find_integrationlab()), ("Pointless", find_pointless()),
@@ -863,7 +854,7 @@ class ProcessingLabWindow(QDialog):
             self.tool_labels[name].setText(str(path) if path else "<span style='color:#b00'>not found</span>")
 
     def _update_enabled(self) -> None:
-        busy, s = self._busy(), self._s
+        busy, s = self.job_running(), self._s
         have_pl = find_integrationlab() is not None
         have_image = self._sweep is not None
         have_pointless, have_aimless = find_pointless() is not None, find_aimless() is not None

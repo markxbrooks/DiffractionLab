@@ -12,7 +12,6 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QComboBox,
-    QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
     QFileDialog,
@@ -146,6 +145,7 @@ from diffraction_lab.processinglab_client import (
     find_integrationlab,
     prefer_processinglab,
 )
+from diffraction_lab.processing_window_base import ProcessingEngine, ProcessingWindowBase
 from diffraction_lab.processinglab_panel import ProcessingLabPanel
 from diffraction_lab.reflection_viewer_launch import launch_reflection_viewer
 from diffraction_lab.summary_vs_resolution import open_summary_vs_resolution_from_work_dir
@@ -798,16 +798,18 @@ class _PointlessWorker(QObject):
             self.failed.emit(str(ex))
 
 
-class ProcessingWizard(QDialog):
-    """Processing Wizard: find spots → index → integrate → MTZ → Symmetry."""
+class ProcessingWizard(ProcessingWindowBase):
+    """Processing Wizard: find spots → index → integrate → MTZ → Symmetry.
+
+    DIALS for HDF5 / NeXus masters, MOSFLM otherwise: the engine
+    (:attr:`ProcessingEngine.DIALS` / :attr:`ProcessingEngine.MOSFLM`) is the
+    window title.
+    """
 
     solutionSelected = Signal(object)  # IndexSolution | None
 
     def __init__(self, parent: QWidget) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Processing")
-        self.setMinimumSize(780, 560)
-        self.setModal(False)
+        super().__init__(parent, ProcessingEngine.MOSFLM, minimum_size=(780, 560))
         self._result: IndexingResult | None = None
         self._table_solutions: list[IndexSolution] = []
         self._thread: QThread | None = None
@@ -1765,10 +1767,10 @@ class ProcessingWizard(QDialog):
         if hasattr(self, "_scale_tab_index"):
             self.pipeline_tabs.setTabEnabled(self._scale_tab_index, use_dials)
         if use_dials:
-            self.setWindowTitle("Processing — DIALS (HDF5 → MTZ)")
+            self.set_engine(ProcessingEngine.DIALS)
             self.setMinimumSize(820, 720)
         else:
-            self.setWindowTitle("Processing — Mosflm DPS")
+            self.set_engine(ProcessingEngine.MOSFLM)
 
     def _update_dials_range_hint(self) -> None:
         if not self._use_dials:
@@ -3786,12 +3788,7 @@ class ProcessingWizard(QDialog):
 
     def _viewer(self) -> QWidget | None:
         """Return the DiffractionLab main window that owns this dialog."""
-        widget = self.parentWidget()
-        while widget is not None:
-            if hasattr(widget, "set_indexing_spot_overlay"):
-                return widget
-            widget = widget.parentWidget()
-        return None
+        return self.viewer()
 
     def _ensure_dials_predictions_cache(self) -> Path | None:
         """Return the predictions ``.npz`` path, exporting from indexed/refined.refl if needed."""
@@ -4675,9 +4672,6 @@ class ProcessingWizard(QDialog):
         return copy_spotfile(src, path)
 
     def closeEvent(self, event) -> None:  # noqa: N802
-        """Clear the spot overlay when the indexing window closes."""
+        """Deselect the solution; the base clears the spot overlay."""
         self.solutionSelected.emit(None)
-        app = self.parent()
-        if app is not None and hasattr(app, "set_indexing_spot_overlay"):
-            app.set_indexing_spot_overlay(None)
         super().closeEvent(event)

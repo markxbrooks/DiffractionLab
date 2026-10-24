@@ -21,7 +21,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from PySide6.QtCore import QObject, Qt, QThread, QUrl, Signal
+from PySide6.QtCore import Qt, QThread, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -52,6 +52,7 @@ from diffraction_lab.processinglab_run import (
     run_processinglab,
 )
 from diffraction_lab.processing_sweep import Frames, ProcessingSweep
+from diffraction_lab.processing_window_base import CallWorker
 
 logger = logging.getLogger(__name__)
 
@@ -179,25 +180,6 @@ def format_scaling(result: ScaleMergeResult) -> str:
     if (cc := s.resolution_estimates.get("half-dataset correlation CC(1/2) >  0.30")) is not None:
         lines.append(f"Resolution estimate (CC½ &gt; 0.3): {cc:.2f} Å")
     return "<br>".join(lines)
-
-
-class CallWorker(QObject):
-    """Run one callable in a thread; ``line`` relays its log output."""
-
-    finished = Signal(object)
-    failed = Signal(str)
-    line = Signal(str)
-
-    def __init__(self, fn: Callable[[Callable[[str], None]], Any]) -> None:
-        super().__init__()
-        self._fn = fn
-
-    def run(self) -> None:
-        try:
-            self.finished.emit(self._fn(self.line.emit))
-        except Exception as ex:  # noqa: BLE001 - surfaced in the panel
-            logger.exception("ProcessingLab panel task failed")
-            self.failed.emit(str(ex))
 
 
 class ProcessingLabPanel(QWidget):

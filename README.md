@@ -48,7 +48,7 @@ Working files default to `~/.qtmosflm/dials/<dataset_stem>/`. Spot/prediction ov
 
 ### The ProcessingLab Processing window (ProcessingLab → Pointless → Aimless)
 
-**Process → Process with ProcessingLab…** (`Ctrl+Shift+I`) opens a processing window that uses only ProcessingLab and CCP4, for any image format. The DIALS / MOSFLM Processing window (**Process…**, `Ctrl+I`) is unchanged. The tabs:
+**Process → Process with ProcessingLab…** (`Ctrl+Shift+I`) opens a processing window that uses only ProcessingLab and CCP4, for any image format. Its title is `ProcessingEngine.PROCESSINGLAB`. The DIALS / MOSFLM Processing window (**Process…**, `Ctrl+I`) is unchanged; its title is `ProcessingEngine.DIALS` for HDF5 / NeXus masters and `ProcessingEngine.MOSFLM` otherwise. Both windows share a base class, `ProcessingWindowBase`. The tabs:
 
 1. **Setup:** the sweep and the frames to process, the work folder, which programs were found, and a pipeline checklist. **Run all steps** chains the steps below, each with its suggested choice.
 2. **Find spots:** ProcessingLab FINDSPOTS over a frame wedge (default: the first 50 frames), with a σ threshold and spot limit. **Show spots on the image** overlays the spots on whichever frame the main window shows.
@@ -218,6 +218,7 @@ The current application code remains under `imosflm/`:
 | `processinglab_panel.py` | ProcessingLab tab: run → Pointless / Aimless → re-run from refined values |
 | `processing_sweep.py` | `ProcessingSweep` (image, `frames`, HDF5 data files) and `Frames` (`start`, `end`): the sweep ProcessingLab processes |
 | `processinglab_stages.py` | ProcessingLab step by step: find spots, index (all lattice solutions), integrate |
+| `processing_window_base.py` | `ProcessingWindowBase` (shared by both Processing windows: engine title, viewer, spot overlay, background jobs) and `ProcessingEngine` (`DIALS`, `MOSFLM`, `PROCESSINGLAB`) |
 | `processinglab_window.py` | The ProcessingLab Processing window (spots → index → integrate → Pointless → Aimless) |
 | `processinglab_charts.py` | Live integration charts: streaming `PROFILE_MAP` / `RESOLUTION_BINS` parser, Qt signals, matplotlib canvases |
 | `pointless_runner.py`, `aimless_runner.py` | CCP4 Pointless and Aimless runners and log parsers |
