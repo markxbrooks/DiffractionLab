@@ -96,7 +96,8 @@ def test_window_formatters_and_construct(tmp_path: Path) -> None:
     assert (window.sweep_first.value(), window.sweep_last.value()) == (1, 1400)
     assert window.spot_last.value() == 50
     assert [window.tabs.tabText(i) for i in range(window.tabs.count())] == [
-        "1. Setup", "2. Find spots", "3. Index", "4. Integrate", "5. Symmetry", "6. Scale", "7. Dimple", "Jobs"]
+        "1. Setup", "2. Find spots", "3. Index", "4. Strategy", "5. Integrate", "6. Symmetry", "7. Scale",
+        "8. Dimple", "Jobs"]
     assert [b.text() for b in window.jobs_tab._filter_buttons.values()] == [
         "All", "ProcessingLab", "Pointless", "Aimless", "Dimple"]
     assert not window.index_btn.isEnabled() and not window.pointless_btn.isEnabled()
@@ -108,3 +109,20 @@ def test_window_formatters_and_construct(tmp_path: Path) -> None:
     window.sweep_last.setValue(100)
     window.set_dataset(image)  # same sweep: the edited range is kept
     assert window.sweep_last.value() == 100
+
+    # Strategy works within Setup's frames to process, not every frame on disk.
+    import diffraction_lab.processinglab_window as module
+    from diffraction_lab.processinglab_stages import IndexResult
+
+    asked: dict = {}
+    window._s.index = IndexResult(record=None, solutions=(), lastgood_rank=0, indexed_fraction=None,
+                                  rmsd_hkl=None)
+    window.strategy_sg_combo.setEditText("P41212")
+    window.sweep_last.setValue(367)
+    window.start_job = lambda message, fn, done, on_line=None: asked.setdefault("message", message) and False
+    window._on_strategy()
+    assert "within frames 1–367" in asked["message"]
+    window.strategy_within.setChecked(False)
+    asked.clear()
+    window._on_strategy()
+    assert "a full turn" in asked["message"]

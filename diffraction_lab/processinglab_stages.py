@@ -1,4 +1,4 @@
-"""ProcessingLab stage by stage: find spots → index → integrate.
+"""ProcessingLab stage by stage: find spots → index → strategy → integrate.
 
 Each stage takes the :class:`~diffraction_lab.processing_sweep.ProcessingSweep`
 and :class:`~diffraction_lab.processing_sweep.Frames` to work on. Each is its
@@ -7,6 +7,7 @@ own ProcessingLab run in a session folder, so each has its own records (``input.
     <session>/
       01-findspots/        FINDSPOTS → spots.spt
       02-index/            AUTOINDEX → XPARM.XDS, index.log, lattice solutions
+      02-strategy/         STRATEGY → the rotation (frames) for a target completeness
       03-integrate/        ProcessingLab run --xparm … --spacegroup N → process.mtz
       04-ccp4/             Pointless → pointless.mtz, Aimless → aimless.mtz
 
@@ -33,9 +34,11 @@ from diffraction_lab.processinglab_run import (
     run_control_stage,
     run_processinglab,
 )
+from diffraction_lab.run_step import RunStep
 
 STAGE_FINDSPOTS = "01-findspots"
 STAGE_INDEX = "02-index"
+STAGE_STRATEGY = "02-strategy"
 STAGE_INTEGRATE = "03-integrate"
 STAGE_CCP4 = "04-ccp4"
 STAGE_DIMPLE = "05-dimple"
@@ -161,7 +164,7 @@ def find_spots(sweep: ProcessingSweep, session: Path, frames: Frames | None = No
     out = stage_dir(session, STAGE_FINDSPOTS)
     wedge = frames or sweep.spot_wedge()
     return run_control_stage(sweep.image, findspots_commands(wedge, threshold=threshold, max_spots=max_spots),
-                             out, on_line=on_line, jobs=jobs, step="findspots")
+                             out, on_line=on_line, jobs=jobs, step=RunStep.FIND_SPOTS.value)
 
 
 def autoindex(sweep: ProcessingSweep, session: Path, spot_file: Path, *, threshold: float = 15.0,
@@ -171,7 +174,7 @@ def autoindex(sweep: ProcessingSweep, session: Path, spot_file: Path, *, thresho
     out = stage_dir(session, STAGE_INDEX)
     record = run_control_stage(
         sweep.image, autoindex_commands(spot_file, threshold=threshold, dmax=dmax, character=character), out,
-        on_line=on_line, jobs=jobs, step="index")
+        on_line=on_line, jobs=jobs, step=RunStep.INDEXING.value)
     return load_index_result(record)
 
 
@@ -194,7 +197,159 @@ def integrate(sweep: ProcessingSweep, session: Path, index: IndexResult, space_g
                          refine=tuple(refine) if refine is not None else
                          ("orientation", "cell", "distance", "beam", "tilt_twist", "mosaicity"),
                          exclusions=exclusions)
-    return run_processinglab(options, on_line=on_line, jobs=jobs, step="integrate")
+    return run_processinglab(options, on_line=on_line, jobs=jobs, step=RunStep.INTEGRATE.value)
+
+
+@dataclass(frozen=True)
+class StrategySegment:
+    """A rotation range and what it records (``process.json`` ``strategy.target``).
+
+    :param start_deg: φ at its start (°).
+    :param end_deg: φ at its end (°).
+    :param rotation_deg: Its width (°).
+    :param images: How many images that is.
+    :param frames: The collected frames it covers, when chosen within them.
+    :param completeness_pct: Unique reflections recorded (%).
+    :param anomalous_completeness_pct: Acentric Friedel pairs with both mates (%).
+    :param multiplicity: Observations per recorded unique reflection.
+    :param shells: Per resolution shell: ``d_low_angstrom``, ``d_high_angstrom``,
+        ``possible``, ``observed``, ``completeness_pct``, ``multiplicity``,
+        ``anomalous_completeness_pct``.
+    """
+
+    start_deg: float
+    end_deg: float
+    rotation_deg: float
+    images: int
+    frames: Frames | None
+    completeness_pct: float
+    anomalous_completeness_pct: float
+    multiplicity: float
+    shells: tuple[dict, ...] = ()
+
+    @classmethod
+    def from_json(cls, seg: dict | None) -> StrategySegment | None:
+        """Read one segment (``None`` stays ``None``)."""
+        if not seg:
+            return None
+        f = seg.get("frames") or None
+        return cls(
+            start_deg=float(seg["start_deg"]), end_deg=float(seg["end_deg"]),
+            rotation_deg=float(seg["rotation_deg"]), images=int(seg["images"]),
+            frames=Frames(int(f["first"]), int(f["last"])) if f else None,
+            completeness_pct=float(seg["completeness_pct"]),
+            anomalous_completeness_pct=float(seg["anomalous_completeness_pct"]),
+            multiplicity=float(seg["multiplicity"]),
+            shells=tuple(seg.get("shells") or ()),
+        )
+
+
+@dataclass(frozen=True)
+class StrategyPlan:
+    """A STRATEGY stage (``RunStep.STRATEGY``): which rotation records the target completeness.
+
+    :param record: The stage's run record.
+    :param target_completeness_pct: The completeness asked for (%).
+    :param anomalous: Whether the target is anomalous completeness.
+    :param oscillation_deg: Image width (°).
+    :param frames_collected: The frames it chose within, or ``None`` (a full turn).
+    :param resolution: ``(low, high)`` resolution (Å).
+    :param unique_possible: Unique reflections to that resolution.
+    :param max_completeness_pct: The most any rotation records (%).
+    :param max_anomalous_completeness_pct: Likewise for Friedel pairs (%).
+    :param target: The smallest rotation reaching the target, or ``None``.
+    :param curve: ``(rotation_deg, start_deg, completeness_pct, anomalous_pct)``
+        for each rotation: the best start for it.
+    """
+
+    record: RunRecord
+    target_completeness_pct: float
+    anomalous: bool
+    oscillation_deg: float
+    frames_collected: Frames | None
+    resolution: tuple[float, float]
+    unique_possible: int
+    max_completeness_pct: float
+    max_anomalous_completeness_pct: float
+    target: StrategySegment | None
+    curve: tuple[tuple[float, float, float, float], ...]
+
+
+def compact_space_group(space_group: str) -> str:
+    """``"P 41 21 2"`` → ``"P41212"`` (CONTROL ``SYMMETRY`` takes one word); numbers unchanged."""
+    return "".join(str(space_group).split())
+
+
+def strategy_commands(xparm: Path, space_group: str, *, completeness_pct: float = 99.0, anomalous: bool = False,
+                      within: Frames | None = None, resolution: float | None = None,
+                      rotation: float | None = None) -> list[str]:
+    """CONTROL for STRATEGY from an indexing solution.
+
+    :param xparm: The indexing ``XPARM.XDS`` (cell, orientation, geometry).
+    :param space_group: Space group (number or symbol).
+    :param completeness_pct: Completeness wanted (%).
+    :param anomalous: Aim for anomalous completeness (Friedel pairs).
+    :param within: Choose within these collected frames, or ``None`` to plan
+        on a full turn.
+    :param resolution: High-resolution limit (Å), or ``None`` for the
+        detector edge.
+    :param rotation: Also report the best start for this rotation (°).
+    """
+    line = f"STRATEGY COMPLETENESS {completeness_pct:g}"
+    if anomalous:
+        line += " ANOMALOUS"
+    line += f" FRAMES {within.start} {within.end}" if within is not None else " FULL"
+    if resolution:
+        line += f" RESOLUTION {resolution:g}"
+    if rotation:
+        line += f" ROTATE {rotation:g}"
+    return [f"XPARM {Path(xparm).resolve()}", f"SYMMETRY {compact_space_group(space_group)}", line, "GO", "EXIT"]
+
+
+def strategy(sweep: ProcessingSweep, session: Path, index: IndexResult, space_group: str, *,
+             completeness_pct: float = 99.0, anomalous: bool = False, within: Frames | None = None,
+             resolution: float | None = None, rotation: float | None = None,
+             on_line: Callable[[str], None] | None = None, jobs: JobQueue | None = None) -> StrategyPlan:
+    """Strategy stage (``RunStep.STRATEGY``): the smallest rotation recording *completeness_pct*.
+
+    With *within* (the collected frames), the rotation is chosen inside them
+    and the plan gives the frames to integrate; without, it plans a
+    collection on a full turn.
+    """
+    out = stage_dir(session, STAGE_STRATEGY)
+    record = run_control_stage(
+        sweep.image,
+        strategy_commands(index.xparm, space_group, completeness_pct=completeness_pct, anomalous=anomalous,
+                          within=within, resolution=resolution, rotation=rotation),
+        out, on_line=on_line, jobs=jobs, step=RunStep.STRATEGY.value)
+    return load_strategy(record)
+
+
+def load_strategy(record: RunRecord) -> StrategyPlan:
+    """Read a STRATEGY stage's plan from its ``process.json``.
+
+    :raises ValueError: If the run has no ``strategy`` block.
+    """
+    process = json.loads((record.directory / "process.json").read_text(encoding="utf-8"))
+    s = process.get("strategy")
+    if not s:
+        raise ValueError(f"{record.directory} has no strategy (ProcessingLab too old?)")
+    collected = s.get("frames_collected") or None
+    res = s.get("resolution_angstrom") or {}
+    return StrategyPlan(
+        record=record,
+        target_completeness_pct=float(s["target_completeness_pct"]),
+        anomalous=bool(s.get("anomalous")),
+        oscillation_deg=float(s.get("oscillation_deg") or 0.0),
+        frames_collected=Frames(int(collected["first"]), int(collected["last"])) if collected else None,
+        resolution=(float(res.get("low") or 0.0), float(res.get("high") or 0.0)),
+        unique_possible=int(s.get("unique_possible") or 0),
+        max_completeness_pct=float(s.get("max_completeness_pct") or 0.0),
+        max_anomalous_completeness_pct=float(s.get("max_anomalous_completeness_pct") or 0.0),
+        target=StrategySegment.from_json(s.get("target")),
+        curve=tuple((float(p["rotation_deg"]), float(p["start_deg"]), float(p["completeness_pct"]),
+                     float(p["anomalous_completeness_pct"])) for p in s.get("curve") or ()),
+    )
 
 
 def load_index_result(record: RunRecord) -> IndexResult:

@@ -20,12 +20,16 @@ from diffraction_lab.processinglab_stages import (
     findspots_commands,
     integrate,
     load_index_result,
+    load_strategy,
     new_session_dir,
     read_spt,
     scan_of,
     spot_overlay,
     stage_dir,
+    strategy,
+    strategy_commands,
 )
+from diffraction_lab.run_step import RunStep
 from diffraction_lab.processing_sweep import Frames, ProcessingSweep
 
 INSULIN = Path(os.environ.get("CCP4", "/Applications/ccp4-9")) / "examples" / "data" / "insulin_1_001.img"
@@ -50,6 +54,37 @@ def test_commands() -> None:
     assert lines[1].startswith("AUTOINDEX DPS THRESHOLD 10 CHARACTER 32 FILE ")
     assert lines[-2:] == ["GO", "EXIT"]
     assert "CHARACTER" not in autoindex_commands(Path("s.spt"))[0]
+
+
+def test_strategy_commands_and_plan(tmp_path: Path) -> None:
+    from diffraction_lab.processinglab_run import load_run_record
+
+    cmds = strategy_commands(Path("/r/XPARM.XDS"), "P 41 21 2", completeness_pct=99.5, anomalous=True,
+                             within=Frames(1, 900), resolution=1.8, rotation=60)
+    assert cmds == ["XPARM /r/XPARM.XDS", "SYMMETRY P41212",
+                    "STRATEGY COMPLETENESS 99.5 ANOMALOUS FRAMES 1 900 RESOLUTION 1.8 ROTATE 60", "GO", "EXIT"]
+    assert strategy_commands(Path("/r/X"), "92")[2] == "STRATEGY COMPLETENESS 99 FULL"
+    run = tmp_path / "02-strategy"
+    run.mkdir()
+    (run / "input.json").write_text("{}")
+    shell = {"d_low_angstrom": 40.0, "d_high_angstrom": 2.0, "possible": 100, "observed": 97,
+             "completeness_pct": 97.0, "multiplicity": 3.1, "anomalous_completeness_pct": 80.0}
+    (run / "process.json").write_text(json.dumps({
+        "schema_version": 3, "status": "completed",
+        "stages": [{"name": "strategy", "status": "completed"}],
+        "strategy": {"target_completeness_pct": 95.0, "anomalous": False, "oscillation_deg": 0.1,
+                     "frames_collected": {"first": 1, "last": 1800}, "resolution_angstrom": {"low": 40.0, "high": 2.0},
+                     "unique_possible": 100, "max_completeness_pct": 99.0, "max_anomalous_completeness_pct": 90.0,
+                     "target": {"start_deg": 12.0, "end_deg": 102.0, "rotation_deg": 90.0, "images": 900,
+                                "frames": {"first": 121, "last": 1020}, "completeness_pct": 97.0,
+                                "anomalous_completeness_pct": 80.0, "multiplicity": 3.1, "shells": [shell]},
+                     "rotation": None,
+                     "curve": [{"rotation_deg": 1.0, "start_deg": 5.0, "completeness_pct": 2.0,
+                                "anomalous_completeness_pct": 0.0}]}}))
+    plan = load_strategy(load_run_record(run))
+    assert plan.target.frames == Frames(121, 1020) and plan.target.images == 900
+    assert plan.frames_collected == Frames(1, 1800) and plan.resolution == (40.0, 2.0)
+    assert plan.curve == ((1.0, 5.0, 2.0, 0.0),) and plan.target.shells[0]["observed"] == 97
 
 
 def test_xparm_option() -> None:
@@ -132,6 +167,17 @@ def test_stages_insulin(tmp_path: Path) -> None:
     again = autoindex(sweep, session, spots.outputs["spot_list"], character=other.character)
     assert again.selected is not None and again.selected.lattice == "aP"
     assert again.record.directory.name == "02-index-2"
+    # RunStep.STRATEGY: planning on a full turn in the lattice's highest symmetry.
+    plan = strategy(sweep, session, index, index.selected.space_groups[-1], completeness_pct=95.0)
+    assert plan.frames_collected is None and plan.unique_possible > 0
+    assert plan.target is not None and plan.target.completeness_pct >= 95.0 and plan.target.images > 0
+    assert plan.target.frames is None and plan.record.stage(RunStep.STRATEGY).status == "completed"
+    assert [c for c in plan.curve if c[0] == plan.target.rotation_deg][0][2] >= 95.0
+    # Within the one collected frame: far from complete, and said so.
+    one = strategy(sweep, session, index, index.selected.space_groups[-1], completeness_pct=95.0,
+                   within=sweep.frames)
+    assert one.frames_collected == Frames(1, 1) and one.target is None and one.max_completeness_pct < 95.0
+    assert one.record.directory.name == "02-strategy-2"
     run = integrate(sweep, session, index, index.selected.space_groups[0])
     assert run.frames == Frames(1, 1)  # the whole sweep, passed explicitly
     assert run.completed and run.mtz is not None and run.mtz.is_file()

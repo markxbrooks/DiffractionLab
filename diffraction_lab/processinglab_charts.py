@@ -285,6 +285,49 @@ class ResolutionBinsCanvas(FigureCanvasQTAgg):
         self.draw_idle()
 
 
+class StrategyCanvas(FigureCanvasQTAgg):
+    """Best completeness against total rotation (``RunStep.STRATEGY``)."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        self.figure = Figure(figsize=(6, 2.8), layout="constrained")
+        super().__init__(self.figure)
+        self.setParent(parent)
+        self.clear("Completeness against rotation: calculate a strategy")
+
+    def clear(self, message: str = "") -> None:
+        """An empty chart with *message*."""
+        self.figure.clear()
+        self.figure.text(0.5, 0.5, message, ha="center", va="center", color="0.4")
+        self.draw_idle()
+
+    def show_curve(self, curve, *, target_pct: float, anomalous: bool,
+                   chosen: tuple[float, float] | None = None, title: str = "") -> None:
+        """Plot ``(rotation, start, completeness %, anomalous %)`` points.
+
+        :param target_pct: The completeness asked for (a dashed line).
+        :param anomalous: Whether the target is anomalous completeness.
+        :param chosen: ``(rotation, completeness %)`` of the chosen segment.
+        """
+        self.figure.clear()
+        ax = self.figure.subplots()
+        if curve:
+            rot = [p[0] for p in curve]
+            ax.plot(rot, [p[2] for p in curve], color="#4C78A8", label="unique")
+            ax.plot(rot, [p[3] for p in curve], color="#F58518", label="anomalous pairs")
+        ax.axhline(target_pct, color="0.4", linestyle="--", linewidth=1,
+                   label=f"target {target_pct:g}%" + (" (anomalous)" if anomalous else ""))
+        if chosen is not None:
+            ax.plot([chosen[0]], [chosen[1]], "o", color="#E45756", label=f"{chosen[0]:g}°")
+        ax.set_xlabel("Total rotation (°)")
+        ax.set_ylabel("Completeness (%)")
+        ax.set_ylim(0, 101)
+        ax.grid(alpha=0.3)
+        ax.legend(loc="lower right", fontsize=8)
+        if title:
+            ax.set_title(title, fontsize=9)
+        self.draw_idle()
+
+
 class IntegrationChartsWidget(QWidget):
     """Live profile and resolution charts, fed with ProcessingLab output lines."""
 

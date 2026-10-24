@@ -98,6 +98,10 @@ def format_record(record: RunRecord) -> str:
             f"R<sub>meas</sub> {num(q.get('r_meas_pct'), '.1f')}%, I/σ {num(q.get('mean_i_over_sigma'), '.2f')}, "
             f"CC½ {num(q.get('cc_half_pct'), '.1f')}%, completeness {num(q.get('completeness_pct'), '.1f')}%",
         ))
+    if record.stages:
+        rows.append(("Steps", " · ".join(
+            f"{s.label} {s.status}" + (f" {s.duration_s:.1f} s" if s.duration_s is not None else "")
+            for s in record.stages)))
     rows.append(("Folder", str(record.directory)))
     return "<table>" + "".join(f"<tr><td><b>{k}</b>&nbsp;</td><td>{v}</td></tr>" for k, v in rows) + "</table>"
 

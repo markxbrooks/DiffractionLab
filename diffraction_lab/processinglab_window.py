@@ -8,17 +8,20 @@ DIALS / MOSFLM Processing window (:mod:`diffraction_lab.processing_wizard`):
    overlaid on the image.
 3. **Index**: ProcessingLab DPS AUTOINDEX; every lattice solution with its
    penalty, cell and possible space groups. Another solution can be chosen.
-4. **Integrate**: ProcessingLab integration in an initial space group chosen
+4. **Strategy** (``RunStep.STRATEGY``): the smallest rotation, and so the
+   number of images, that records a target completeness (MOSFLM's method),
+   within Setup's frames to process (then integrate just those) or on a full turn.
+5. **Integrate**: ProcessingLab integration in an initial space group chosen
    from the solution; re-integration from the refined cell and detector
    parameters (``--from``). The average spot profile and the resolution
    bins are charted live, after every batch of frames
    (:mod:`diffraction_lab.processinglab_charts`). Untrusted regions and
    resolution ranges for DEFPIX can be added, and the pixels it ignored
    (``defpix.cbf``) shown on the image.
-5. **Symmetry**: CCP4 Pointless (Laue / space group, reindexing, L-test for
+6. **Symmetry**: CCP4 Pointless (Laue / space group, reindexing, L-test for
    twinning).
-6. **Scale**: CCP4 Aimless (scale and merge).
-7. **Dimple**: CCP4 Dimple refines a known model against the merged data
+7. **Scale**: CCP4 Aimless (scale and merge).
+8. **Dimple**: CCP4 Dimple refines a known model against the merged data
    and finds unmodelled blobs (:mod:`diffraction_lab.dimple_tab`).
 
 Each stage is a ProcessingLab run in the session folder
@@ -72,7 +75,7 @@ from diffraction_lab.pointless_runner import (
 from diffraction_lab.jobs.jobs_tab import JobsTab
 from diffraction_lab.jobs.service import SCHEDARRAY_DB_NAME, JobService, use_schedarray
 from diffraction_lab.processing_sweep import Frames, ProcessingSweep
-from diffraction_lab.processinglab_charts import IntegrationChartsWidget
+from diffraction_lab.processinglab_charts import IntegrationChartsWidget, StrategyCanvas
 from diffraction_lab.processinglab_client import find_integrationlab
 from diffraction_lab.processing_window_base import ProcessingEngine, ProcessingWindowBase
 from diffraction_lab.processinglab_format import (
@@ -94,6 +97,7 @@ from diffraction_lab.processinglab_stages import (
     STAGE_INTEGRATE,
     IndexResult,
     LatticeSolution,
+    StrategyPlan,
     autoindex,
     find_spots,
     integrate,
@@ -102,6 +106,7 @@ from diffraction_lab.processinglab_stages import (
     scan_of,
     spot_overlay,
     stage_dir,
+    strategy,
 )
 from diffraction_lab.reflection_viewer_launch import launch_reflection_viewer
 from diffraction_lab.terminal_log_viewer import TerminalLogViewer
@@ -185,6 +190,7 @@ class _Session:
     folder: Path | None = None
     spots: RunRecord | None = None
     index: IndexResult | None = None
+    strategy: StrategyPlan | None = None
     integrated: RunRecord | None = None
     pointless: PointlessRunResult | None = None
     aimless: AimlessRunResult | None = None
@@ -239,6 +245,7 @@ class ProcessingLabWindow(ProcessingWindowBase):
         self._build_setup_tab()
         self._build_spots_tab()
         self._build_index_tab()
+        self._build_strategy_tab()
         self._build_integrate_tab()
         self._build_symmetry_tab()
         self._build_scale_tab()
@@ -285,6 +292,7 @@ class ProcessingLabWindow(ProcessingWindowBase):
         sv = QVBoxLayout(status)
         self.pipeline_labels = {}
         for key, text in (("spots", "Find spots (ProcessingLab)"), ("index", "Index (ProcessingLab)"),
+                          ("strategy", "Strategy (ProcessingLab, optional)"),
                           ("integrate", "Integrate (ProcessingLab)"), ("symmetry", "Symmetry (Pointless)"),
                           ("scale", "Scale (Aimless)")):
             label = QLabel(f"○ {text}")
@@ -368,6 +376,73 @@ class ProcessingLabWindow(ProcessingWindowBase):
         self.reindex_btn.clicked.connect(self._on_reindex_selected)
         v.addWidget(self.reindex_btn)
         self.tabs.addTab(page, "3. Index")
+
+    def _build_strategy_tab(self) -> None:
+        controls = QWidget()
+        v = QVBoxLayout(controls)
+        box = QGroupBox("Strategy (RunStep.STRATEGY): rotation for a target completeness")
+        form = QFormLayout(box)
+        note = QLabel("From the indexing solution, the smallest rotation that records the completeness "
+                      "wanted, as MOSFLM's STRATEGY does. Within Setup's frames to process it says which of "
+                      "them to integrate; on a full turn it plans a collection.")
+        note.setWordWrap(True)
+        form.addRow(note)
+        self.strategy_sg_combo = QComboBox()
+        self.strategy_sg_combo.setEditable(True)
+        self.strategy_sg_combo.setToolTip("Higher symmetry needs less rotation: use the space group you expect.")
+        form.addRow("Space group", self.strategy_sg_combo)
+        self.strategy_target = QDoubleSpinBox()
+        self.strategy_target.setRange(10.0, 100.0)
+        self.strategy_target.setDecimals(1)
+        self.strategy_target.setSuffix(" %")
+        self.strategy_target.setValue(99.0)
+        form.addRow("Completeness wanted", self.strategy_target)
+        self.strategy_anomalous = QCheckBox("Anomalous (both Friedel mates of each pair)")
+        form.addRow(self.strategy_anomalous)
+        self.strategy_within = QCheckBox("Within Setup's frames to process (otherwise plan on a full turn)")
+        self.strategy_within.setChecked(True)
+        form.addRow(self.strategy_within)
+        self.strategy_dmin = QDoubleSpinBox()
+        self.strategy_dmin.setRange(0.0, 20.0)
+        self.strategy_dmin.setDecimals(2)
+        self.strategy_dmin.setSuffix(" Å")
+        self.strategy_dmin.setSpecialValueText("detector edge")
+        form.addRow("High-resolution limit", self.strategy_dmin)
+        self.strategy_btn = QPushButton("Calculate strategy")
+        self.strategy_btn.clicked.connect(self._on_strategy)
+        form.addRow(self.strategy_btn)
+        v.addWidget(box)
+
+        result = QGroupBox("Result")
+        rv = QVBoxLayout(result)
+        self.strategy_label = QLabel("No strategy yet.")
+        self.strategy_label.setWordWrap(True)
+        self.strategy_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        rv.addWidget(self.strategy_label)
+        self.strategy_shells = QTableWidget(0, 6)
+        self.strategy_shells.setHorizontalHeaderLabels(
+            ["d (Å)", "Possible", "Observed", "Complete", "Multiplicity", "Anomalous"])
+        self.strategy_shells.verticalHeader().setVisible(False)
+        self.strategy_shells.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.strategy_shells.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.strategy_shells.setMaximumHeight(220)
+        rv.addWidget(self.strategy_shells)
+        self.strategy_use_btn = QPushButton("Integrate these frames")
+        self.strategy_use_btn.setToolTip("Set Setup's frames to process to the frames the strategy chose")
+        self.strategy_use_btn.clicked.connect(self._on_use_strategy_frames)
+        rv.addLayout(_row(self.strategy_use_btn))
+        v.addWidget(result)
+        v.addStretch(1)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(controls)
+        self.strategy_chart = StrategyCanvas()
+        page = QSplitter(Qt.Orientation.Vertical)
+        page.addWidget(scroll)
+        page.addWidget(self.strategy_chart)
+        page.setSizes([420, 280])
+        self.tabs.addTab(page, "4. Strategy")
 
     def _build_integrate_tab(self) -> None:
         controls = QWidget()
@@ -457,7 +532,7 @@ class ProcessingLabWindow(ProcessingWindowBase):
         page.addWidget(scroll)
         page.addWidget(self.charts)
         page.setSizes([300, 380])
-        self.tabs.addTab(page, "4. Integrate")
+        self.tabs.addTab(page, "5. Integrate")
 
     def _build_symmetry_tab(self) -> None:
         page = QWidget()
@@ -480,7 +555,7 @@ class ProcessingLabWindow(ProcessingWindowBase):
         bv.addLayout(_row(self.use_sg_btn, self.pointless_log_btn))
         v.addWidget(box)
         v.addStretch(1)
-        self.tabs.addTab(page, "5. Symmetry")
+        self.tabs.addTab(page, "6. Symmetry")
 
     def _build_scale_tab(self) -> None:
         page = QWidget()
@@ -510,7 +585,7 @@ class ProcessingLabWindow(ProcessingWindowBase):
         self.aimless_log_btn.clicked.connect(lambda: _open(self._s.aimless.log if self._s.aimless else None))
         v.addLayout(_row(self.merged_view_btn, self.aimless_log_btn))
         v.addStretch(1)
-        self.tabs.addTab(page, "6. Scale")
+        self.tabs.addTab(page, "7. Scale")
 
     def _build_dimple_tab(self) -> None:
         self.dimple_tab = DimpleTab(
@@ -522,7 +597,7 @@ class ProcessingLabWindow(ProcessingWindowBase):
             view_mtz=self._view_mtz,
             show_log=False,  # Dimple's output goes to the window's log
         )
-        self.tabs.addTab(self.dimple_tab, "7. Dimple")
+        self.tabs.addTab(self.dimple_tab, "8. Dimple")
 
     def _build_jobs_tab(self) -> None:
         """SchedArray history of this dataset's ProcessingLab, Pointless and Aimless jobs."""
@@ -635,6 +710,84 @@ class ProcessingLabWindow(ProcessingWindowBase):
         if solution is not None:
             self._on_index(solution.character)
 
+    def _on_strategy(self) -> None:
+        index = self._s.index
+        space_group = self.strategy_sg_combo.currentText().strip()
+        if index is None or not space_group or self._sweep is None:
+            return
+        sweep, session = self._sweep, self._session()
+        # The frames chosen on Setup ("Frames to process"), not every frame on disk.
+        within = self._integrate_frames() if self.strategy_within.isChecked() else None
+        target, anomalous = self.strategy_target.value(), self.strategy_anomalous.isChecked()
+        dmin = self.strategy_dmin.value() or None
+        where = f"frames {within}" if within else "a full turn"
+        self._start(f"Strategy for {target:g}% in {space_group} within {where}…",
+                    lambda emit, jobs=self._job_queue(): strategy(
+                        sweep, session, index, space_group, completeness_pct=target, anomalous=anomalous,
+                        within=within, resolution=dmin, on_line=emit, jobs=jobs),
+                    self._strategy_done)
+
+    def _strategy_done(self, plan: StrategyPlan) -> None:
+        self._s.strategy = plan
+        self._show_all()
+        self._go_to("Strategy")
+        t = plan.target
+        self.status_label.setText(
+            f"Strategy: {t.images} images" + (f" (frames {t.frames})" if t.frames else "") + " for "
+            f"{plan.target_completeness_pct:g}%." if t else
+            f"Strategy: {plan.target_completeness_pct:g}% is not reachable (at most "
+            f"{plan.max_completeness_pct:g}%).")
+
+    def _on_use_strategy_frames(self) -> None:
+        plan = self._s.strategy
+        if plan is None or plan.target is None or plan.target.frames is None:
+            return
+        frames = plan.target.frames
+        self.sweep_first.setValue(frames.start)
+        self.sweep_last.setValue(frames.end)
+        self.space_group_combo.setCurrentText(self.strategy_sg_combo.currentText())
+        self._go_to("Integrate")
+        self.status_label.setText(f"Frames {frames} set for integration ({plan.target.images} images, "
+                                  f"{plan.target.completeness_pct:g}% complete): Integrate next.")
+
+    def _show_strategy(self) -> None:
+        plan = self._s.strategy
+        self.strategy_shells.setRowCount(0)
+        if plan is None:
+            self.strategy_label.setText("No strategy yet.")
+            self.strategy_chart.clear("Completeness against rotation: calculate a strategy")
+            return
+        t = plan.target
+        lo, hi = plan.resolution
+        kind = "anomalous " if plan.anomalous else ""
+        where = (f"within frames {plan.frames_collected}" if plan.frames_collected
+                 else "on a full turn")
+        lines = [f"<b>{plan.target_completeness_pct:g}% {kind}completeness</b> {where}, {lo:.1f}–{hi:.2f} Å "
+                 f"({plan.unique_possible:,} unique reflections)."]
+        if t is None:
+            best = plan.max_anomalous_completeness_pct if plan.anomalous else plan.max_completeness_pct
+            lines.append(f"<b style='color:#b00'>Not reachable:</b> at most {best:g}% "
+                         "(the blind region, or the collected range, limits it).")
+        else:
+            frames = f", <b>frames {t.frames}</b>" if t.frames else ""
+            lines.append(f"<b>Rotate {t.rotation_deg:g}°</b> from φ {t.start_deg:.1f}° to {t.end_deg:.1f}°: "
+                         f"<b>{t.images} images</b> of {plan.oscillation_deg:g}°{frames}.")
+            lines.append(f"{t.completeness_pct:g}% complete, {t.anomalous_completeness_pct:g}% of anomalous "
+                         f"pairs, multiplicity {t.multiplicity:.2f}.")
+            for row, sh in enumerate(t.shells):
+                self.strategy_shells.insertRow(row)
+                for col, text in enumerate([
+                        f"{sh['d_low_angstrom']:.2f}–{sh['d_high_angstrom']:.2f}", str(sh["possible"]),
+                        str(sh["observed"]), f"{sh['completeness_pct']:g}%", f"{sh['multiplicity']:.2f}",
+                        f"{sh['anomalous_completeness_pct']:g}%"]):
+                    self.strategy_shells.setItem(row, col, QTableWidgetItem(text))
+        self.strategy_label.setText("<br>".join(lines))
+        chosen = None if t is None else (
+            t.rotation_deg, t.anomalous_completeness_pct if plan.anomalous else t.completeness_pct)
+        self.strategy_chart.show_curve(plan.curve, target_pct=plan.target_completeness_pct,
+                                       anomalous=plan.anomalous, chosen=chosen,
+                                       title="Best start for each total rotation")
+
     def _on_integrate(self) -> None:
         index = self._s.index
         space_group = self.space_group_combo.currentText().strip()
@@ -690,7 +843,7 @@ class ProcessingLabWindow(ProcessingWindowBase):
         if p is None or not p.space_group:
             return
         self.rerun_space_group.setText(p.space_group)
-        self.tabs.setCurrentIndex(3)
+        self._go_to("Integrate")
         self.status_label.setText(f"Space group {p.space_group} set for re-integration: choose what to refine, "
                                   "then Re-integrate.")
 
@@ -754,31 +907,33 @@ class ProcessingLabWindow(ProcessingWindowBase):
         self._s.spots, self._s.index, self._s.integrated = record, None, None
         self._s.pointless = self._s.aimless = None
         self._show_all()
-        self.tabs.setCurrentIndex(2)
+        self._go_to("Index")
         self.status_label.setText("Spots found: index next.")
 
     def _index_done(self, result: IndexResult) -> None:
         self._s.index, self._s.integrated, self._s.pointless, self._s.aimless = result, None, None, None
+        self._s.strategy = None
         self._show_all()
-        self.status_label.setText("Indexed: check the solution, choose an initial space group, integrate.")
+        self.status_label.setText("Indexed: check the solution, choose an initial space group; work out a "
+                                  "strategy (optional), then integrate.")
 
     def _integrate_done(self, record: RunRecord) -> None:
         self.charts.load_log(record.directory / "process.log")  # the final batch's charts
         self._s.integrated, self._s.pointless, self._s.aimless = record, None, None
         self._show_all()
-        self.tabs.setCurrentIndex(3)
+        self._go_to("Integrate")
         self.status_label.setText(f"Integrated: {record.directory}. Run Pointless next.")
 
     def _pointless_done(self, result: PointlessRunResult) -> None:
         self._s.pointless, self._s.aimless = result, None
         self._show_all()
-        self.tabs.setCurrentIndex(4)
+        self._go_to("Symmetry")
         self.status_label.setText("Pointless finished: check the space group and twinning, then scale.")
 
     def _aimless_done(self, result: AimlessRunResult) -> None:
         self._s.aimless = result
         self._show_all()
-        self.tabs.setCurrentIndex(5)
+        self._go_to("Scale")
         self.status_label.setText(f"Merged: {result.hklout}")
 
     def _all_done(self, session: _Session) -> None:
@@ -786,7 +941,7 @@ class ProcessingLabWindow(ProcessingWindowBase):
             self.charts.load_log(session.integrated.directory / "process.log")
         self._s = session
         self._show_all()
-        self.tabs.setCurrentIndex(5 if session.aimless else 3)
+        self._go_to("Scale" if session.aimless else "Integrate")
         self.status_label.setText("All steps finished." if session.aimless else
                                   "Integrated (CCP4 Pointless / Aimless not found).")
 
@@ -805,6 +960,7 @@ class ProcessingLabWindow(ProcessingWindowBase):
         else:
             self.spots_label.setText("")
         self._show_solutions()
+        self._show_strategy()
         if s.integrated is not None:
             self.integrate_label.setText(format_record(s.integrated))
         else:
@@ -816,6 +972,9 @@ class ProcessingLabWindow(ProcessingWindowBase):
             "spots": (s.spots, f"{n_spots} spots" if n_spots is not None else ""),
             "index": (s.index, f"{s.index.selected.lattice} (character {s.index.selected.character})"
                       if s.index and s.index.selected else ""),
+            "strategy": (s.strategy, (f"{s.strategy.target.images} images"
+                                      + (f", frames {s.strategy.target.frames}" if s.strategy.target.frames else "")
+                                      if s.strategy.target else "target not reachable") if s.strategy else ""),
             "integrate": (s.integrated, f"{s.integrated.integrated_reflections} reflections, space group "
                           f"{s.integrated.space_group_number}" if s.integrated else ""),
             "symmetry": (s.pointless, f"{s.pointless.solution_kind} {s.pointless.space_group}"
@@ -830,6 +989,13 @@ class ProcessingLabWindow(ProcessingWindowBase):
         self._update_defpix_overlay()
         self._update_enabled()
 
+    def _go_to(self, name: str) -> None:
+        """Show the tab titled ``"<n>. <name>"`` (or *name*)."""
+        for i in range(self.tabs.count()):
+            if self.tabs.tabText(i).split(". ", 1)[-1] == name:
+                self.tabs.setCurrentIndex(i)
+                return
+
     def _exclusions(self) -> PixelExclusions | None:
         """The DEFPIX regions and ranges entered, or ``None`` (after a warning) if they don't parse."""
         try:
@@ -837,7 +1003,7 @@ class ProcessingLabWindow(ProcessingWindowBase):
                                          ice=self.exclude_ice_check.isChecked())
         except ValueError as ex:
             QMessageBox.warning(self, "Ignored pixels", str(ex))
-            self.tabs.setCurrentIndex(3)
+            self._go_to("Integrate")
             return None
 
     def _update_defpix_overlay(self, *_args: Any) -> None:
@@ -865,6 +1031,7 @@ class ProcessingLabWindow(ProcessingWindowBase):
         table = self.solutions_table
         table.setRowCount(0)
         self.space_group_combo.clear()
+        self.strategy_sg_combo.clear()
         if index is None:
             self.index_label.setText("")
             return
@@ -888,6 +1055,10 @@ class ProcessingLabWindow(ProcessingWindowBase):
         chosen = index.selected
         if chosen is not None:
             self.space_group_combo.addItems(list(chosen.space_groups))
+            # Strategy: the highest symmetry of the lattice by default (the
+            # least rotation); Pointless confirms it after integration.
+            self.strategy_sg_combo.addItems(list(chosen.space_groups))
+            self.strategy_sg_combo.setCurrentIndex(len(chosen.space_groups) - 1)
         frac = "—" if index.indexed_fraction is None else f"{100 * index.indexed_fraction:.0f}%"
         rmsd = "—" if index.rmsd_hkl is None else f"{index.rmsd_hkl:.3f}"
         self.index_label.setText(
@@ -955,7 +1126,7 @@ class ProcessingLabWindow(ProcessingWindowBase):
         self.log_view.appendPlainText(f"\n=== {datetime.now():%H:%M:%S} {message}")
         if charts:
             self.charts.reset()
-            self.tabs.setCurrentIndex(3)
+            self._go_to("Integrate")
         if self.start_job(message, fn, on_finished, on_line=self.charts.feed if charts else None):
             self._update_enabled()
 
@@ -1046,6 +1217,9 @@ class ProcessingLabWindow(ProcessingWindowBase):
         self.reindex_btn.setEnabled(not busy and s.spots is not None and highlighted is not None
                                     and not highlighted.selected)
         self.integrate_btn.setEnabled(not busy and have_pl and s.index is not None)
+        self.strategy_btn.setEnabled(not busy and have_pl and s.index is not None)
+        self.strategy_use_btn.setEnabled(s.strategy is not None and s.strategy.target is not None
+                                         and s.strategy.target.frames is not None)
         self.rerun_btn.setEnabled(not busy and have_pl and s.integrated is not None and s.integrated.can_rerun)
         self.report_btn.setEnabled(s.integrated is not None)
         self.mtz_view_btn.setEnabled(s.integrated is not None and s.integrated.mtz is not None)

@@ -26,6 +26,7 @@ from typing import Any, Callable, Sequence
 
 from diffraction_lab.processing_sweep import Frames
 from diffraction_lab.processinglab_client import find_integrationlab
+from diffraction_lab.run_step import RunStep, StageRecord
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +177,12 @@ class RunRecord:
     outputs: dict[str, Path] = field(default_factory=dict)
     #: DEFPIX pixel counts (``trusted``, ``shaded``, ``defective``, …).
     defpix_pixels: dict[str, int] = field(default_factory=dict)
+    #: The run's steps (``process.json`` ``stages``), in order.
+    stages: tuple[StageRecord, ...] = ()
+
+    def stage(self, step: RunStep) -> StageRecord | None:
+        """The last stage that ran *step*, if any."""
+        return next((s for s in reversed(self.stages) if s.step is step), None)
 
     @property
     def defpix_image(self) -> Path | None:
@@ -361,6 +368,7 @@ def load_run_record(run_dir: Path | str) -> RunRecord:
         quality_total=dict(quality.get("total") or {}),
         outputs=outputs,
         defpix_pixels={k: int(v) for k, v in defpix.items() if isinstance(v, int)},
+        stages=tuple(StageRecord.from_json(s) for s in process.get("stages") or [] if isinstance(s, dict)),
     )
 
 

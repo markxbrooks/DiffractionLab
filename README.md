@@ -207,9 +207,10 @@ The current application code remains under `imosflm/`:
 | `processinglab_run.py` | `ProcessingLab run` / `--from` command lines, live log, `input.json` / `process.json` records |
 | `processinglab_format.py` | Display helpers: run records and Pointless / Aimless results as HTML, cell parsing, the default work folder |
 | `processing_sweep.py` | `ProcessingSweep` (image, `frames`, HDF5 data files) and `Frames` (`start`, `end`): the sweep ProcessingLab processes |
-| `processinglab_stages.py` | ProcessingLab step by step: find spots, index (all lattice solutions), integrate |
+| `processinglab_stages.py` | ProcessingLab step by step: find spots, index (all lattice solutions), strategy (`StrategyPlan`: the rotation and frames for a target completeness), integrate |
+| `run_step.py` | `RunStep` (`FIND_SPOTS`, `INDEXING`, `DEFPIX`, `INTEGRATE`, `STRATEGY`), mirroring ProcessingLab's, and the `stages` of a run record |
 | `processing_window_base.py` | `ProcessingWindowBase` (shared by both Processing windows: engine title, viewer, spot overlay, background jobs) and `ProcessingEngine` (`DIALS`, `MOSFLM`, `PROCESSINGLAB`) |
-| `processinglab_window.py` | The ProcessingLab Processing window (spots → index → integrate → Pointless → Aimless → Dimple) |
+| `processinglab_window.py` | The ProcessingLab Processing window (spots → index → strategy → integrate → Pointless → Aimless → Dimple) |
 | `processinglab_charts.py` | Live integration charts: streaming `PROFILE_MAP` / `RESOLUTION_BINS` parser, Qt signals, matplotlib canvases |
 | `pointless_runner.py`, `aimless_runner.py` | CCP4 Pointless and Aimless runners and log parsers |
 | `dimple_runner.py`, `dimple_tab.py` | CCP4 Dimple (refine a known model, find unmodelled blobs): runner, `dimple.log` parser, and the Dimple tab both Processing windows show after Scale |
