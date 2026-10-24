@@ -52,6 +52,7 @@ from diffraction_lab.beam import BeamParameters
 from diffraction_lab.cbf_header import CbfGeometry, read_cbf_geometry
 from diffraction_lab.detector import DetectorParameters
 from diffraction_lab.image_canvas import DiffractionImageCanvas, build_resolution_rings
+from diffraction_lab.image_histogram import pixel_histogram, plot_pixel_histogram
 from diffraction_lab.indexing import IndexingGeometry, as_float
 from diffraction_lab.processing_wizard import ProcessingWizard
 from diffraction_lab.processinglab_window import ProcessingLabWindow
@@ -1927,6 +1928,9 @@ class DiffractionLabApp(QMainWindow):
                 if instrument_path in f:
                     logging.info(f"\n--- Extracting Metadata from {instrument_path} ---")
                     self.parse_hdf5(f[instrument_path], instrument_path)
+                    saturation = f.get(f"{instrument_path}/detector/saturation_value")
+                    if saturation is not None:
+                        self.detector.overload = float(saturation[()])
                 else:
                     logging.warning(f"Path '{instrument_path}' not found in the HDF5 file.")
         except Exception as ex:
@@ -1948,6 +1952,8 @@ class DiffractionLabApp(QMainWindow):
             self.detector.x_pixel_size = geometry.pixel_x_mm
         if geometry.pixel_y_mm is not None:
             self.detector.y_pixel_size = geometry.pixel_y_mm
+        if geometry.overload is not None:
+            self.detector.overload = geometry.overload
 
     def display_cbf_image(self, file_path):
         """ display_cbf_image """
@@ -1955,7 +1961,7 @@ class DiffractionLabApp(QMainWindow):
             cbf_image = fabio.open(file_path)
             self._apply_cbf_geometry(read_cbf_geometry(cbf_image.header))
             data = cbf_image.data
-            self._raw_frame = np.asarray(data, dtype=np.float64)
+            self._raw_frame = np.asarray(data)  # native dtype: gaps / masks stay recognisable
             image = Image.fromarray(data)
             self.current_image = image.convert("L")
             self.show_image(self.current_image)
@@ -2132,9 +2138,7 @@ class DiffractionLabApp(QMainWindow):
             end_index = min(start_index + self.slice_size, self.num_frames)
             frame_data = np.array(self.dataset[start_index:end_index, :, :])  # Convert to NumPy array
             # Keep the slider frame (not the CLAHE average) for intensity histogram.
-            self._raw_frame = np.asarray(
-                self.dataset[start_index], dtype=np.float64
-            )
+            self._raw_frame = np.asarray(self.dataset[start_index])  # native dtype
 
             # Ensure grayscale format
             if frame_data.ndim == 3:
@@ -2353,11 +2357,11 @@ class DiffractionLabApp(QMainWindow):
                 logging.error(f"Error in update_contrast: {ex}")
 
     def show_histogram(self):
-        """Show an intensity histogram of the current raw detector frame.
+        """Show the pixel-intensity histogram of the current raw detector frame.
 
-        Excludes PAD dead/hot sentinels (Eiger ``2**16-1`` / ``2**32-1``) the
-        same way as :func:`imosflm.spotfile.find_spots_in_frame`, so saturated
-        mask pixels do not pin the percentile range near 65535.
+        Zeros are counted; detector gaps (negative) and masked pixels (the
+        dtype maximum, e.g. Eiger module gaps) are excluded; pixels at the
+        detector's overload are marked. See :mod:`diffraction_lab.image_histogram`.
         """
         logging.info("show_histogram")
         frame = self._raw_frame
@@ -2368,52 +2372,18 @@ class DiffractionLabApp(QMainWindow):
                 "No raw detector frame is available to histogram.",
             )
             return
-
-        data = np.asarray(frame, dtype=np.float64).ravel()
-        total = int(data.size)
-        finite_positive = data[np.isfinite(data) & (data > 0.0)]
-        # Trusted ADU: skip gaps (≤0) and saturated / mask sentinels.
-        valid = finite_positive[
-            (finite_positive < 60000.0) & (finite_positive < 1.0e8)
-        ]
-        n_sat = int(finite_positive.size - valid.size)
-        if valid.size == 0:
-            QMessageBox.information(
-                self,
-                "Histogram",
-                (
-                    "No trusted pixels to histogram "
-                    f"({total:,} total, {finite_positive.size:,} positive, "
-                    f"{n_sat:,} saturated/mask ≥ 60000)."
-                ),
-            )
+        try:
+            hist = pixel_histogram(frame, overload=self.detector.overload)
+        except ValueError as ex:
+            QMessageBox.information(self, "Histogram", str(ex))
             return
 
-        if valid.size >= 20:
-            vmin, vmax = np.percentile(valid, (1.0, 99.0))
-        else:
-            vmin, vmax = float(np.min(valid)), float(np.max(valid))
-        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
-            vmin, vmax = float(np.min(valid)), float(np.max(valid))
-        if vmax <= vmin:
-            vmax = vmin + 1.0
-
-        counts, bin_edges = np.histogram(valid, bins=256, range=(vmin, vmax))
-        centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
-        widths = np.diff(bin_edges)
-
+        name = Path(self.current_file).name if self.current_file else "image"
+        if self.dataset is not None and hasattr(self, "frame_slider"):
+            name += f", frame {int(self.frame_slider.value()) + 1}"
         fig = plt.figure("Histogram")
         fig.clf()
-        ax = fig.add_subplot(111)
-        ax.bar(centers, counts, width=widths, align="center", color="#4C78A8")
-        sat_note = f", excluded {n_sat:,} sat/mask" if n_sat else ""
-        ax.set_title(
-            f"Intensity histogram  ({valid.size:,} / {total:,} pixels{sat_note})"
-        )
-        ax.set_xlabel("Intensity (ADU)")
-        ax.set_ylabel("Pixel count")
-        ax.set_xlim(vmin, vmax)
-        ax.set_ylim(bottom=0)
+        plot_pixel_histogram(fig.add_subplot(111), hist, f"Pixel intensity histogram — {name}")
         fig.tight_layout()
         plt.show()
 

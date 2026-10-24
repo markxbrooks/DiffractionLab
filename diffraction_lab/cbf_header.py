@@ -22,6 +22,7 @@ _NUM = r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)"
 _PIXEL = re.compile(rf"Pixel_size\s+{_NUM}\s*m\s*x\s*{_NUM}\s*m", re.IGNORECASE)
 _WAVELENGTH = re.compile(rf"Wavelength\s+{_NUM}\s*A", re.IGNORECASE)
 _DISTANCE = re.compile(rf"Detector_distance\s+{_NUM}\s*m\b", re.IGNORECASE)
+_CUTOFF = re.compile(rf"Count_cutoff\s+{_NUM}", re.IGNORECASE)
 _BEAM = re.compile(rf"Beam_xy\s*\(\s*{_NUM}\s*,\s*{_NUM}\s*\)\s*(pixels|mm)?", re.IGNORECASE)
 
 
@@ -35,6 +36,7 @@ class CbfGeometry:
     :param pixel_y_mm: Pixel size along slow, mm.
     :param distance_mm: Detector distance, mm.
     :param wavelength_a: Wavelength, Å.
+    :param overload: Count at which a pixel is saturated (``Count_cutoff``).
     """
 
     beam_x_px: float | None = None
@@ -43,6 +45,7 @@ class CbfGeometry:
     pixel_y_mm: float | None = None
     distance_mm: float | None = None
     wavelength_a: float | None = None
+    overload: float | None = None
 
 
 def parse_minicbf_header(text: str) -> CbfGeometry:
@@ -65,8 +68,9 @@ def parse_minicbf_header(text: str) -> CbfGeometry:
                 beam_x = beam_y = None
     wavelength = float(m.group(1)) if (m := _WAVELENGTH.search(text)) is not None else None
     distance = float(m.group(1)) * 1000.0 if (m := _DISTANCE.search(text)) is not None else None
+    overload = float(m.group(1)) if (m := _CUTOFF.search(text)) is not None else None
     return CbfGeometry(beam_x_px=beam_x, beam_y_px=beam_y, pixel_x_mm=pixel_x, pixel_y_mm=pixel_y,
-                       distance_mm=distance, wavelength_a=wavelength)
+                       distance_mm=distance, wavelength_a=wavelength, overload=overload)
 
 
 def read_cbf_geometry(header: Mapping[str, str]) -> CbfGeometry:
