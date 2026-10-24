@@ -64,16 +64,24 @@ from diffraction_lab.pointless_runner import (
     is_identity_reindex,
     run_pointless,
 )
+from diffraction_lab.jobs.jobs_tab import JobsTab
+from diffraction_lab.jobs.service import SCHEDARRAY_DB_NAME, JobService, use_schedarray
 from diffraction_lab.processing_sweep import Frames, ProcessingSweep
 from diffraction_lab.processinglab_charts import IntegrationChartsWidget
 from diffraction_lab.processinglab_client import find_integrationlab
 from diffraction_lab.processing_window_base import ProcessingEngine, ProcessingWindowBase
-from diffraction_lab.processinglab_panel import (
+from diffraction_lab.processinglab_format import (
     default_work_parent,
     format_record,
     parse_cell_text,
 )
-from diffraction_lab.processinglab_run import REFINABLE_PARAMETERS, RunRecord, rerun_options, run_processinglab
+from diffraction_lab.processinglab_run import (
+    REFINABLE_PARAMETERS,
+    JobQueue,
+    RunRecord,
+    rerun_options,
+    run_processinglab,
+)
 from diffraction_lab.processinglab_stages import (
     STAGE_CCP4,
     STAGE_INTEGRATE,
@@ -89,6 +97,7 @@ from diffraction_lab.processinglab_stages import (
     stage_dir,
 )
 from diffraction_lab.reflection_viewer_launch import launch_reflection_viewer
+from diffraction_lab.terminal_log_viewer import TerminalLogViewer
 
 logger = logging.getLogger(__name__)
 
@@ -183,6 +192,8 @@ class ProcessingLabWindow(ProcessingWindowBase):
         self._sweep: ProcessingSweep | None = None
         self._s = _Session()
         self._overlay_shown = False  # whether this window drew the spot overlay
+        self._jobs_service: JobService | None = None
+        self._terminal: TerminalLogViewer | None = None
         self._slider_connected = False
         self._build_ui()
         self.refresh_dataset()
@@ -211,6 +222,7 @@ class ProcessingLabWindow(ProcessingWindowBase):
         self._build_integrate_tab()
         self._build_symmetry_tab()
         self._build_scale_tab()
+        self._build_jobs_tab()
 
     def _build_setup_tab(self) -> None:
         page = QWidget()
@@ -455,6 +467,19 @@ class ProcessingLabWindow(ProcessingWindowBase):
         v.addStretch(1)
         self.tabs.addTab(page, "6. Scale")
 
+    def _build_jobs_tab(self) -> None:
+        """SchedArray history of this dataset's ProcessingLab, Pointless and Aimless jobs."""
+        self.jobs_tab = JobsTab(
+            self,
+            service_provider=self._job_service,
+            work_dir_provider=lambda: self._s.folder,
+            tool_filters=(("All", None), ("ProcessingLab", "processinglab"), ("Pointless", "pointless"),
+                          ("Aimless", "aimless")),
+        )
+        self.jobs_tab.work_dir_only.setText("This session only")
+        self.jobs_tab.open_log_requested.connect(self._show_job_log)
+        self.tabs.addTab(self.jobs_tab, "Jobs")
+
     # ========================================================= dataset
 
     def refresh_dataset(self) -> None:
@@ -531,9 +556,9 @@ class ProcessingLabWindow(ProcessingWindowBase):
 
     def _on_find_spots(self) -> None:
         sweep, session, wedge = self._sweep, self._session(), self._spot_frames()
-        threshold, max_spots = self.spot_threshold.value(), self.spot_max.value()
+        threshold, max_spots, jobs = self.spot_threshold.value(), self.spot_max.value(), self._job_queue()
         self._start("Finding spots…", lambda emit: find_spots(sweep, session, wedge, threshold=threshold,
-                                                              max_spots=max_spots, on_line=emit),
+                                                              max_spots=max_spots, on_line=emit, jobs=jobs),
                     self._spots_done)
 
     def _on_index(self, character: int | None) -> None:
@@ -543,10 +568,10 @@ class ProcessingLabWindow(ProcessingWindowBase):
         sweep, session = self._sweep, self._session()
         threshold = self.index_threshold.value()
         dmax = self.index_dmax.value() or None
-        spt = spots.outputs["spot_list"]
+        spt, jobs = spots.outputs["spot_list"], self._job_queue()
         what = "Indexing…" if character is None else f"Re-indexing with lattice character {character}…"
         self._start(what, lambda emit: autoindex(sweep, session, spt, threshold=threshold, dmax=dmax,
-                                                 character=character, on_line=emit), self._index_done)
+                                                 character=character, on_line=emit, jobs=jobs), self._index_done)
 
     def _on_reindex_selected(self) -> None:
         solution = self._highlighted_solution()
@@ -560,7 +585,8 @@ class ProcessingLabWindow(ProcessingWindowBase):
             return
         sweep, session, frames = self._sweep, self._session(), self._integrate_frames()
         self._start(f"Integrating frames {frames} in {space_group}…",
-                    lambda emit: integrate(sweep, session, index, space_group, frames=frames, on_line=emit),
+                    lambda emit, jobs=self._job_queue(): integrate(sweep, session, index, space_group, frames=frames,
+                                                                   on_line=emit, jobs=jobs),
                     self._integrate_done, charts=True)
 
     def _on_reintegrate(self) -> None:
@@ -577,18 +603,21 @@ class ProcessingLabWindow(ProcessingWindowBase):
             QMessageBox.warning(self, "Re-integrate", str(ex))
             return
         self._start(f"Re-integrating from {record.directory.name} (refining {', '.join(refine) or 'nothing'})…",
-                    lambda emit: run_processinglab(options, on_line=emit), self._integrate_done, charts=True)
+                    lambda emit, jobs=self._job_queue(): run_processinglab(options, on_line=emit, jobs=jobs,
+                                                                          step="reintegrate"),
+                    self._integrate_done, charts=True)
 
     def _on_pointless(self) -> None:
         record = self._s.integrated
         if record is None or record.mtz is None:
             return
         out = stage_dir(self._session(), STAGE_CCP4)
-        mtz = record.mtz
+        mtz, service = record.mtz, self._job_service()
 
         def task(emit: Callable[[str], None]) -> PointlessRunResult:
             emit(f"Pointless on {mtz} → {out}")
-            return run_pointless(mtz, out / "pointless.mtz", work_dir=out, choose_space_group=True)
+            return run_pointless(mtz, out / "pointless.mtz", work_dir=out, choose_space_group=True,
+                                 job_service=service)
 
         self._start("Running Pointless…", task, self._pointless_done)
 
@@ -607,12 +636,12 @@ class ProcessingLabWindow(ProcessingWindowBase):
             return
         hklin, work = p.hklout, p.hklout.parent
         dmin = self.aimless_dmin.value() or None
-        anomalous = self.aimless_anomalous.isChecked()
+        anomalous, service = self.aimless_anomalous.isChecked(), self._job_service()
 
         def task(emit: Callable[[str], None]) -> AimlessRunResult:
             emit(f"Aimless on {hklin}")
             return run_aimless(hklin, work / "aimless.mtz", work_dir=work, resolution_high=dmin,
-                               anomalous=anomalous)
+                               anomalous=anomalous, job_service=service)
 
         self._start("Running Aimless…", task, self._aimless_done)
 
@@ -623,27 +652,31 @@ class ProcessingLabWindow(ProcessingWindowBase):
         threshold, max_spots = self.spot_threshold.value(), self.spot_max.value()
         ix_threshold, dmax = self.index_threshold.value(), self.index_dmax.value() or None
         dmin, anomalous = self.aimless_dmin.value() or None, self.aimless_anomalous.isChecked()
+        jobs = self._job_queue()
+        service = jobs.service if jobs else None
 
         def task(emit: Callable[[str], None]) -> _Session:
             s = _Session(folder=session)
             emit("=== Find spots")
             s.spots = find_spots(sweep, session, wedge, threshold=threshold, max_spots=max_spots,
-                                 on_line=emit)
+                                 on_line=emit, jobs=jobs)
             emit("=== Index")
             s.index = autoindex(sweep, session, s.spots.outputs["spot_list"], threshold=ix_threshold, dmax=dmax,
-                                on_line=emit)
+                                on_line=emit, jobs=jobs)
             chosen = s.index.selected
             space_group = chosen.space_groups[0] if chosen and chosen.space_groups else "1"
             emit(f"=== Integrate in {space_group}")
-            s.integrated = integrate(sweep, session, s.index, space_group, frames=frames, on_line=emit)
+            s.integrated = integrate(sweep, session, s.index, space_group, frames=frames, on_line=emit,
+                                     jobs=jobs)
             if s.integrated.mtz is not None and find_pointless() is not None:
                 out = stage_dir(session, STAGE_CCP4)
                 emit("=== Pointless")
-                s.pointless = run_pointless(s.integrated.mtz, out / "pointless.mtz", work_dir=out)
+                s.pointless = run_pointless(s.integrated.mtz, out / "pointless.mtz", work_dir=out,
+                                            job_service=service)
                 if find_aimless() is not None:
                     emit("=== Aimless")
                     s.aimless = run_aimless(s.pointless.hklout, out / "aimless.mtz", work_dir=out,
-                                            resolution_high=dmin, anomalous=anomalous)
+                                            resolution_high=dmin, anomalous=anomalous, job_service=service)
             return s
 
         self._start("Running all steps…", task, self._all_done, charts=True)
@@ -839,8 +872,50 @@ class ProcessingLabWindow(ProcessingWindowBase):
         self.log_view.appendPlainText(text)
 
     def on_job_ended(self) -> None:
-        """Re-enable the buttons."""
+        """Re-enable the buttons; show the finished job in the Jobs tab."""
         self._update_enabled()
+        self.jobs_tab.refresh()
+
+    # ----- SchedArray jobs
+
+    def _job_service(self) -> JobService | None:
+        """This window's job service: ``<work folder>/schedarray_scheduler.db``.
+
+        One database per dataset (every session in the work folder), owned by
+        this window rather than the shared service the DIALS window rebinds.
+        ``None`` when SchedArray is not active: steps then run directly.
+        """
+        if not use_schedarray():
+            return None
+        work = self.work_edit.text().strip()
+        if not work:
+            return self._jobs_service
+        db = (Path(work).expanduser() / SCHEDARRAY_DB_NAME).resolve()
+        current = self._jobs_service
+        if current is not None and (current.db_path == db or self.job_running()):
+            return current  # never switch databases under a running job
+        try:
+            service = JobService(db_path=db)
+        except Exception as ex:  # noqa: BLE001 - steps still run without it
+            logger.warning("SchedArray job service unavailable: %s", ex)
+            return current
+        if current is not None:
+            current.close()
+        self._jobs_service = service
+        return service
+
+    def _job_queue(self) -> JobQueue | None:
+        """Where steps are submitted (``None``: run directly)."""
+        service = self._job_service()
+        return None if service is None else JobQueue(service, self._s.folder.name if self._s.folder else None)
+
+    def _show_job_log(self, log_path: object) -> None:
+        """Follow a job's log in a terminal window."""
+        if self._terminal is None:
+            self._terminal = TerminalLogViewer(self, title=f"DiffractionLab Terminal — {self.engine.label}")
+        self._terminal.set_log_file(Path(str(log_path)), reload=True)
+        self._terminal.show()
+        self._terminal.raise_()
 
     def clear_spot_overlay(self) -> None:
         """Clear the overlay only if this window drew it."""

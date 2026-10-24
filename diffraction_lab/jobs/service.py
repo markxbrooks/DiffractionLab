@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import os
 import shlex
+import subprocess
 import time
 from pathlib import Path
 from typing import Any, Optional, Sequence
@@ -28,6 +29,9 @@ _TERMINAL_STATES = frozenset(
         "disabled",
     }
 )
+
+#: States after which a job will not change again.
+TERMINAL_STATES = _TERMINAL_STATES
 
 _service: Optional["JobService"] = None
 _service_db_path: Optional[Path] = None
@@ -167,6 +171,10 @@ class JobService:
         """Underlying :class:`~schedarray.SqliteJobScheduler` instance."""
         return self._scheduler
 
+    def close(self) -> None:
+        """Stop this service's local worker pool (jobs already finished are kept)."""
+        _stop_service_workers(self)
+
     def submit(
         self,
         command: str | Sequence[str],
@@ -259,7 +267,8 @@ class JobService:
         :param state: SchedArray state filter (exact).
         :param tool: Filter ``metadata.tool`` (case-insensitive).
         :param session_id: Filter ``metadata.session_id``.
-        :param work_dir: Filter ``working_dir`` or ``metadata.work_dir``.
+        :param work_dir: Keep jobs whose ``working_dir`` (or ``metadata.work_dir``)
+            is this directory or inside it.
         :param limit: Max rows from SchedArray before client-side filters.
         :param app_only: If True, keep only jobs with ``metadata.app`` of
             ``diffraction_lab`` (or missing app for older rows).
@@ -284,7 +293,8 @@ class JobService:
             if work_s:
                 jd = job.get("working_dir") or meta.get("work_dir") or ""
                 try:
-                    same = Path(jd).resolve() == Path(work_s).resolve()
+                    job_dir, wanted = Path(jd).resolve(), Path(work_s).resolve()
+                    same = job_dir == wanted or wanted in job_dir.parents
                 except OSError:
                     same = str(Path(jd)) == work_s or work_s in str(jd)
                 if not same:
@@ -293,8 +303,26 @@ class JobService:
         return out
 
     def cancel(self, job_id: str) -> bool:
-        """Cancel a pending/running job."""
-        return bool(self._scheduler.cancel_job(job_id))
+        """Cancel a pending/running job, stopping its command if it is running.
+
+        SchedArray's ``cancel_job`` only marks the job; the command a local
+        worker started (a shell and the program it runs) is stopped here.
+        """
+        ok = bool(self._scheduler.cancel_job(job_id))
+        self._stop_process(job_id)
+        return ok
+
+    def _stop_process(self, job_id: str) -> None:
+        """Terminate the local worker process running *job_id* and its children."""
+        pool = getattr(self._scheduler, "_worker_pool", None)
+        for worker in list((getattr(pool, "workers", None) or {}).values()):
+            process = getattr(worker, "process", None)
+            if getattr(worker, "current_job_id", None) != job_id or process is None:
+                continue
+            if process.poll() is None:
+                # The job runs through a shell: stop what it started, then it.
+                subprocess.run(["pkill", "-TERM", "-P", str(process.pid)], check=False)
+                process.terminate()
 
     def wait_for_job(
         self,

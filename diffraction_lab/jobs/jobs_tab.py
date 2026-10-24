@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QBrush
@@ -41,6 +41,13 @@ _COLUMNS = (
 )
 
 # Bootstrap-inspired status colors (mxflask queue_viewer getStatusColor)
+_DEFAULT_TOOL_FILTERS: tuple[tuple[str, str | None], ...] = (
+    ("All", None),
+    ("DIALS", "dials"),
+    ("Pointless", "pointless"),
+    ("MOSFLM", "mosflm"),
+)
+
 _STATE_COLORS = {
     "pending": ("#6c757d", "#f8f9fa"),
     "running": ("#ffffff", "#0d6efd"),
@@ -65,9 +72,23 @@ class JobsTab(QWidget):
         service: JobService | None = None,
         work_dir_provider: Callable[[], Path | None] | None = None,
         prepare_service: Callable[[], None] | None = None,
+        service_provider: Callable[[], JobService | None] | None = None,
+        tool_filters: Sequence[tuple[str, str | None]] | None = None,
     ) -> None:
+        """
+        :param service: A fixed job service (default: the shared one).
+        :param work_dir_provider: Work directory for "This work dir only".
+        :param prepare_service: Called before each refresh (e.g. rebinds the
+            shared service to the current dataset's database).
+        :param service_provider: Returns the service to list (for a window
+            that owns its own service); overrides *service*.
+        :param tool_filters: Filter buttons as ``(label, tool)``; ``None`` tool
+            is "All". Default: All, DIALS, Pointless, MOSFLM.
+        """
         super().__init__(parent)
         self._service = service
+        self._service_provider = service_provider
+        self._tool_filters = tuple(tool_filters) if tool_filters else _DEFAULT_TOOL_FILTERS
         self._work_dir_provider = work_dir_provider
         self._prepare_service = prepare_service
         self._tool_filter: str | None = None
@@ -109,12 +130,7 @@ class JobsTab(QWidget):
 
         bar.addWidget(QLabel("Filter:"))
         self._filter_buttons: dict[str | None, QPushButton] = {}
-        for label, key in (
-            ("All", None),
-            ("DIALS", "dials"),
-            ("Pointless", "pointless"),
-            ("MOSFLM", "mosflm"),
-        ):
+        for label, key in self._tool_filters:
             btn = QPushButton(label)
             btn.setCheckable(True)
             btn.setChecked(key is None)
@@ -151,6 +167,8 @@ class JobsTab(QWidget):
         layout.addWidget(self.table)
 
     def _service_or_none(self) -> JobService | None:
+        if self._service_provider is not None:
+            return self._service_provider()
         if self._service is not None:
             return self._service
         if not use_schedarray():
@@ -190,8 +208,8 @@ class JobsTab(QWidget):
             self.table.setRowCount(0)
             if not use_schedarray():
                 self.status_label.setText(
-                    "SchedArray not active — DIALS/Pointless steps run locally "
-                    "and are not recorded. Install schedarray into this Python "
+                    "SchedArray not active — steps run locally and are not "
+                    "recorded. Install schedarray into this Python "
                     "(pip install -e ../SchedArray) and restart DiffractionLab."
                 )
             else:

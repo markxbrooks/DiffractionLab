@@ -295,8 +295,13 @@ def _run_via_schedarray(
     choose_space_group: bool,
     copy_free: bool,
     custom: str,
+    job_service: Any = None,
 ) -> PointlessRunResult:
-    """Submit Pointless to SchedArray and wait for completion."""
+    """Submit Pointless to SchedArray and wait for completion.
+
+    :param job_service: The service to submit to (default: the shared one,
+        bound to *cwd*'s dataset database).
+    """
     from diffraction_lab.jobs.service import configure_job_service_for_work_dir
 
     stamp = datetime.now().strftime("%y%m%d-%H%M%S")
@@ -315,7 +320,7 @@ def _run_via_schedarray(
     bin_dir = shlex.quote(str(exe.parent))
     wrapped = f'export PATH={bin_dir}:"$PATH"; {command_str}'
     logger.info("Running Pointless (SchedArray) in %s:\n%s", cwd, command_str)
-    service = configure_job_service_for_work_dir(cwd)
+    service = job_service or configure_job_service_for_work_dir(cwd)
     status = service.submit_and_wait(
         wrapped,
         working_dir=cwd,
@@ -485,6 +490,7 @@ def run_pointless(
     choose_space_group: bool = True,
     copy_free: bool = False,
     custom: str = "",
+    job_service: Any = None,
 ) -> PointlessRunResult:
     """Run Pointless on *hklin* and write *hklout*.
 
@@ -497,6 +503,8 @@ def run_pointless(
     :param choose_space_group: Emit ``SETTING SYMMETRY-BASED``.
     :param copy_free: Emit ``COPY FREE`` (default off — can skip Laue scoring).
     :param custom: Optional extra keyword line(s).
+    :param job_service: Submit to this SchedArray service (as the ProcessingLab
+        window does); default: the shared service when SchedArray is active.
     :returns: Paths plus parsed log fields.
     :raises FileNotFoundError: If Pointless is missing or HKLIN does not exist.
     :raises RuntimeError: If Pointless exits non-zero without producing HKLOUT.
@@ -525,6 +533,8 @@ def run_pointless(
         "custom": (custom or "").strip(),
     }
 
+    if job_service is not None:
+        return _run_via_schedarray(exe, hklin, hklout, cwd, job_service=job_service, **opts)
     try:
         from diffraction_lab.jobs.service import use_schedarray
 

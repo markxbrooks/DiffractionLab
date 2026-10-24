@@ -14,7 +14,7 @@ from diffraction_lab.aimless_runner import (  # noqa: E402
     parse_aimless_summary,
 )
 from diffraction_lab.pointless_runner import PointlessRunResult  # noqa: E402
-from diffraction_lab.processinglab_panel import (  # noqa: E402
+from diffraction_lab.processinglab_format import (  # noqa: E402
     default_work_parent,
     format_record,
     format_scaling,
@@ -96,7 +96,9 @@ def test_window_formatters_and_construct(tmp_path: Path) -> None:
     assert (window.sweep_first.value(), window.sweep_last.value()) == (1, 1400)
     assert window.spot_last.value() == 50
     assert [window.tabs.tabText(i) for i in range(window.tabs.count())] == [
-        "1. Setup", "2. Find spots", "3. Index", "4. Integrate", "5. Symmetry", "6. Scale"]
+        "1. Setup", "2. Find spots", "3. Index", "4. Integrate", "5. Symmetry", "6. Scale", "Jobs"]
+    assert [b.text() for b in window.jobs_tab._filter_buttons.values()] == [
+        "All", "ProcessingLab", "Pointless", "Aimless"]
     assert not window.index_btn.isEnabled() and not window.pointless_btn.isEnabled()
     # The chosen range is always passed explicitly, even when it is the whole sweep.
     window.sweep_last.setValue(1000)

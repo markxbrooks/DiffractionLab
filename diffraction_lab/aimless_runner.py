@@ -18,7 +18,7 @@ import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from diffraction_lab.pointless_runner import PointlessRunResult
@@ -219,6 +219,7 @@ def run_aimless(
     resolution_high: float | None = None,
     anomalous: bool = False,
     custom: str = "",
+    job_service: Any = None,
 ) -> AimlessRunResult:
     """Scale and merge *hklin* (normally Pointless output) into *hklout*.
 
@@ -228,6 +229,8 @@ def run_aimless(
     :param resolution_high: High-resolution cutoff (Å), or ``None``.
     :param anomalous: ``ANOMALOUS ON``.
     :param custom: Extra keyword line(s).
+    :param job_service: Submit as a SchedArray job to this
+        :class:`~diffraction_lab.jobs.service.JobService` (``None``: run here).
     :returns: Paths plus the parsed summary.
     :raises FileNotFoundError: If Aimless is missing or HKLIN does not exist.
     :raises RuntimeError: If Aimless fails or writes no summary.
@@ -246,24 +249,36 @@ def run_aimless(
     log_path = cwd / f"{datetime.now():%y%m%d-%H%M%S}-aimless.log"
     heredoc = "\n".join(aimless_keywords(resolution_high=resolution_high, anomalous=anomalous,
                                          custom=custom))
-    command = (
-        f"{shlex.quote(str(exe))} HKLIN {shlex.quote(str(hklin))} "
-        f"HKLOUT {shlex.quote(str(hklout))} << EOF >> {shlex.quote(log_path.name)}\n{heredoc}\nEOF"
-    )
-    env = os.environ.copy()
-    if str(exe.parent) not in env.get("PATH", "").split(os.pathsep):
-        env["PATH"] = f"{exe.parent}{os.pathsep}{env.get('PATH', '')}"
-    logger.info("Running Aimless in %s:\n%s", cwd, command)
-    completed = subprocess.run(command, shell=True, cwd=str(cwd), env=env, text=True,
-                               capture_output=True, check=False)
+    program = f"{shlex.quote(str(exe))} HKLIN {shlex.quote(str(hklin))} HKLOUT {shlex.quote(str(hklout))}"
+    if job_service is not None:
+        # The job's output file is the log; Aimless's directory goes on PATH.
+        command = (f"export PATH={shlex.quote(str(exe.parent))}:\"$PATH\"; "
+                   f"{program} << EOF\n{heredoc}\nEOF")
+        logger.info("Running Aimless (SchedArray) in %s:\n%s", cwd, command)
+        status = job_service.submit_and_wait(command, working_dir=cwd, job_name="aimless", output_file=log_path,
+                                             error_file=log_path.with_suffix(".err"), tool="aimless",
+                                             step="scale", max_retries=0, poll_interval=0.5)
+        returncode = status.get("return_code")
+        returncode = int(returncode) if returncode is not None else (
+            0 if str(status.get("state", "")).lower() == "completed" else 1)
+        stderr = ""
+    else:
+        command = f"{program} << EOF >> {shlex.quote(log_path.name)}\n{heredoc}\nEOF"
+        env = os.environ.copy()
+        if str(exe.parent) not in env.get("PATH", "").split(os.pathsep):
+            env["PATH"] = f"{exe.parent}{os.pathsep}{env.get('PATH', '')}"
+        logger.info("Running Aimless in %s:\n%s", cwd, command)
+        completed = subprocess.run(command, shell=True, cwd=str(cwd), env=env, text=True,
+                                   capture_output=True, check=False)
+        returncode, stderr = completed.returncode, completed.stderr or ""
     try:
         text = log_path.read_text(encoding="utf-8", errors="replace")
     except FileNotFoundError:
         text = ""
     summary = parse_aimless_summary(text)
-    if completed.returncode != 0 or not summary.rows:
-        tail = "\n".join(text.strip().splitlines()[-5:]) or (completed.stderr or "").strip()
-        raise RuntimeError(f"Aimless failed (exit {completed.returncode}): {tail or command}")
+    if returncode != 0 or not summary.rows:
+        tail = "\n".join(text.strip().splitlines()[-5:]) or stderr.strip()
+        raise RuntimeError(f"Aimless failed (exit {returncode}): {tail or command}")
     return AimlessRunResult(hklin=hklin, hklout=hklout, log=log_path, summary=summary, command=command)
 
 

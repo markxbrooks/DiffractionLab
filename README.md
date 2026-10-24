@@ -64,23 +64,13 @@ Working files default to `~/.qtmosflm/dials/<dataset_stem>/`. Spot/prediction ov
    - **When it can't decide:** it says when only the point group could be determined.
    - **Re-integrating in its group:** **Re-integrate in this space group** is available only when Pointless found a space group without reindexing.
 6. **Scale:** CCP4 Aimless on Pointless's output, with an optional high-resolution cutoff and an anomalous option. It shows the overall, inner and outer statistics, the resolution estimates and the merged MTZ.
+7. **Jobs:** the SchedArray history of this dataset's ProcessingLab, Pointless and Aimless jobs, like the DIALS window's Jobs tab.
+   - **Where they're kept:** in `<work folder>/schedarray_scheduler.db`, one database per dataset covering every session.
+   - **How each step runs:** as a SchedArray job. Its log (`<session>/<step>.out`, or the Pointless / Aimless log) is followed live, so the log pane and integration charts update as before.
+   - **Using the tab:** filter by tool or by **This session only**, **View Log** opens a terminal that follows the log, and **Cancel Selected Job** stops the running step.
+   - **Without SchedArray:** the steps run directly and aren't recorded.
 
 Each step is a ProcessingLab run in a session folder (`<work>/session_YYYYMMDD_HHMMSS/`): `01-findspots/`, `02-index/`, `03-integrate/` and `04-ccp4/` (Pointless and Aimless). Each has its own `process.json` and `process.md`, and a repeated step gets a new numbered folder. ProcessingLab's output streams into the log pane. The steps are also a Python API: `diffraction_lab.processinglab_stages`.
-
-### Processing with ProcessingLab (any format → MTZ → Pointless / Aimless → re-run)
-
-The **ProcessingLab** tab of the Processing window drives `ProcessingLab run` on the open image (CBF, SMV or an HDF5 / NeXus master):
-
-1. **Run ProcessingLab:** find spots, autoindex and integrate the chosen frames into a new `processing_YYYYMMDD_HHMMSS/` folder. The work folder defaults to `<image_dir>/<stem>-processinglab/`, or `~/.qtmosflm/processinglab/<stem>/` when the image folder is read-only. A space group and cell can be given up front. The Result box shows the run record: the refined cell, space group, distance, beam, tilt/twist and mosaicity, what was refined or held fixed, the integrated reflections and the unscaled statistics. **Open run…** loads an earlier run.
-2. **Run Pointless → Aimless:** run on the run's `process.mtz`, into the run's `ccp4/` folder (`pointless.mtz`, `aimless.mtz`, both logs). It shows:
-   - Pointless's solution, reindex operator and space-group and Laue-group confidences. When only the point group can be determined (too few axial reflections for screw axes), it says so.
-   - Aimless's overall, inner and outer statistics: resolution, R<sub>meas</sub>, CC½, ⟨I/σ⟩, completeness and multiplicity, plus the CC½ resolution estimate.
-3. **Re-run with refined parameters:** runs `ProcessingLab run --from` on the run, starting from its refined unit cell, detector distance, beam centre, tilt/twist and orientation, with no autoindexing.
-   - **What is refined:** ticked parameters are refined again and the rest are held fixed. The default is orientation and mosaicity.
-   - **Space group:** filled in from Pointless only when Pointless found a space group and its reindex operator is `[h,k,l]`, because `--spacegroup` does not reindex.
-   - **Cell:** a different cell can be entered; ProcessingLab rebuilds the orientation matrix for it.
-
-ProcessingLab's output streams into the tab's log. The underlying API is `diffraction_lab.processinglab_run` (`run_processinglab`, `load_run_record`, `rerun_options`) and `diffraction_lab.aimless_runner` (`scale_and_merge`).
 
 See [imosflm/README.md](diffraction_lab/README.md) for the full Index UI reference, and the [DIALS processing-in-detail tutorial](https://dials.github.io/documentation/tutorials/processing_in_detail_betalactamase_dui.html).
 
@@ -200,7 +190,7 @@ Optional command-line flags:
 4. Run the available indexing workflow:
    - **CBF and other MOSFLM-supported images:** find spots and run MOSFLM DPS autoindexing.
    - **HDF5 / NeXus masters:** find spots with DIALS, index and refine, then optionally integrate and export to MTZ.
-   - **Any format, with ProcessingLab:** in the **ProcessingLab** tab, run ProcessingLab, then Pointless → Aimless, then re-run with the refined cell and detector parameters.
+   - **Any format, with ProcessingLab:** open **Process with ProcessingLab…** (`Ctrl+Shift+I`) and work through its tabs, or use **Run all steps**.
 5. Enable **Show indexing spots** to overlay found spots and predictions. For multi-image datasets, move the frame slider to inspect the overlay on each frame.
 
 ## Package layout
@@ -215,7 +205,7 @@ The current application code remains under `imosflm/`:
 | `terminal_log_viewer.py` | JDXI-style live terminal for DIALS logs |
 | `dials_engine.py` | DIALS subprocess pipeline and `.npz` caches |
 | `processinglab_run.py` | `ProcessingLab run` / `--from` command lines, live log, `input.json` / `process.json` records |
-| `processinglab_panel.py` | ProcessingLab tab: run → Pointless / Aimless → re-run from refined values |
+| `processinglab_format.py` | Display helpers: run records and Pointless / Aimless results as HTML, cell parsing, the default work folder |
 | `processing_sweep.py` | `ProcessingSweep` (image, `frames`, HDF5 data files) and `Frames` (`start`, `end`): the sweep ProcessingLab processes |
 | `processinglab_stages.py` | ProcessingLab step by step: find spots, index (all lattice solutions), integrate |
 | `processing_window_base.py` | `ProcessingWindowBase` (shared by both Processing windows: engine title, viewer, spot overlay, background jobs) and `ProcessingEngine` (`DIALS`, `MOSFLM`, `PROCESSINGLAB`) |

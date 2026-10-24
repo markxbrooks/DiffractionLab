@@ -16,8 +16,11 @@ from __future__ import annotations
 import json
 import logging
 import re
+import shlex
 import subprocess
+import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -116,6 +119,19 @@ class RunRecord:
     def can_rerun(self) -> bool:
         """Whether ``--from`` can use this run (completed with a refined model)."""
         return self.completed and self.cell is not None
+
+
+@dataclass(frozen=True)
+class JobQueue:
+    """Run ProcessingLab steps as SchedArray jobs, so they are listed and kept.
+
+    :param service: The :class:`~diffraction_lab.jobs.service.JobService`
+        (its SQLite database holds the jobs).
+    :param session_id: Recorded on each job, to group a session's steps.
+    """
+
+    service: Any
+    session_id: str | None = None
 
 
 class ProcessingLabError(RuntimeError):
@@ -272,12 +288,16 @@ def run_processinglab(
     *,
     executable: Path | None = None,
     on_line: Callable[[str], None] | None = None,
+    jobs: JobQueue | None = None,
+    step: str = "run",
 ) -> RunRecord:
     """Run ``ProcessingLab run`` and return its record.
 
     :param options: What to run.
     :param executable: The binary (default: :func:`find_integrationlab`).
     :param on_line: Called with each line of output as it arrives.
+    :param jobs: Submit as a SchedArray job (``None``: run directly).
+    :param step: Job step name (e.g. ``integrate``).
     :returns: The completed run's record.
     :raises FileNotFoundError: If ProcessingLab is not installed.
     :raises ProcessingLabError: If it refused the inputs (nothing created) or
@@ -285,7 +305,7 @@ def run_processinglab(
     """
     argv = build_run_argv(_executable(executable), options)
     cwd = Path(options.parent_dir or Path.cwd()).expanduser()
-    return execute(argv, cwd=cwd, output_dir=options.output_dir, on_line=on_line)
+    return execute(argv, cwd=cwd, output_dir=options.output_dir, on_line=on_line, jobs=jobs, step=step)
 
 
 def run_control_stage(
@@ -296,6 +316,8 @@ def run_control_stage(
     script_path: Path | None = None,
     executable: Path | None = None,
     on_line: Callable[[str], None] | None = None,
+    jobs: JobQueue | None = None,
+    step: str = "stage",
 ) -> RunRecord:
     """Run a CONTROL script (``ProcessingLab --image … --output-dir … script``).
 
@@ -309,6 +331,8 @@ def run_control_stage(
         *output_dir*, as ``<name>.in``).
     :param executable: The binary (default: :func:`find_integrationlab`).
     :param on_line: Called with each line of output.
+    :param jobs: Submit as a SchedArray job (``None``: run directly).
+    :param step: Job step name (e.g. ``findspots``).
     :returns: The completed stage's record.
     :raises FileNotFoundError: If ProcessingLab is not installed.
     :raises ProcessingLabError: If the stage was refused or failed.
@@ -319,7 +343,7 @@ def run_control_stage(
     script.parent.mkdir(parents=True, exist_ok=True)
     script.write_text("\n".join(control_lines).rstrip() + "\n", encoding="utf-8")
     argv = [str(exe), "--image", str(image), "--output-dir", str(output_dir), str(script)]
-    return execute(argv, cwd=output_dir.parent, output_dir=output_dir, on_line=on_line)
+    return execute(argv, cwd=output_dir.parent, output_dir=output_dir, on_line=on_line, jobs=jobs, step=step)
 
 
 def _executable(executable: Path | None) -> Path:
@@ -338,39 +362,43 @@ def execute(
     cwd: Path,
     output_dir: Path | None = None,
     on_line: Callable[[str], None] | None = None,
+    jobs: JobQueue | None = None,
+    step: str = "run",
 ) -> RunRecord:
     """Run a ProcessingLab command line and load the run it reports.
+
+    Runs it directly, or (with *jobs*) as a SchedArray job whose log is
+    followed, so *on_line* sees the same lines either way.
 
     :param argv: The command line.
     :param cwd: Working directory (created if needed).
     :param output_dir: The ``--output-dir`` given, if any (used when the
         output does not name the directory).
     :param on_line: Called with each line of output.
+    :param jobs: Submit as a SchedArray job (``None``: run directly).
+    :param step: Job step name.
     :returns: The completed run's record.
-    :raises ProcessingLabError: If it refused the inputs or the run failed.
+    :raises ProcessingLabError: If it refused the inputs, the run failed, or
+        the job was cancelled.
     """
     cwd = Path(cwd).expanduser()
     cwd.mkdir(parents=True, exist_ok=True)
     logger.info("Running %s in %s", " ".join(argv), cwd)
     lines: list[str] = []
     run_dir: Path | None = None
-    with subprocess.Popen(
-        list(argv),
-        cwd=str(cwd),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-    ) as proc:
-        assert proc.stdout is not None
-        for raw in proc.stdout:
-            line = raw.rstrip("\n")
-            lines.append(line)
-            if (m := _OUTPUT_DIR_LINE.match(line)) is not None:
-                run_dir = Path(m.group(1))
-            if on_line is not None:
-                on_line(line)
-        returncode = proc.wait()
+
+    def emit(line: str) -> None:
+        nonlocal run_dir
+        lines.append(line)
+        if (m := _OUTPUT_DIR_LINE.match(line)) is not None:
+            run_dir = Path(m.group(1))
+        if on_line is not None:
+            on_line(line)
+
+    if jobs is not None:
+        returncode = _run_as_job(argv, cwd, output_dir, jobs, step, emit)
+    else:
+        returncode = _run_directly(argv, cwd, emit)
 
     if run_dir is None and output_dir is not None and (cwd / output_dir).is_dir():
         run_dir = (cwd / output_dir).resolve()
@@ -386,6 +414,76 @@ def execute(
     if not record.completed:
         raise ProcessingLabError(record.error or f"ProcessingLab exited {returncode}", run_dir=run_dir)
     return record
+
+
+def _run_directly(argv: Sequence[str], cwd: Path, emit: Callable[[str], None]) -> int:
+    """Run *argv*, passing each output line (stdout and stderr) to *emit*."""
+    with subprocess.Popen(
+        list(argv),
+        cwd=str(cwd),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    ) as proc:
+        assert proc.stdout is not None
+        for raw in proc.stdout:
+            emit(raw.rstrip("\n"))
+        return proc.wait()
+
+
+def _run_as_job(argv: Sequence[str], cwd: Path, output_dir: Path | None, jobs: JobQueue, step: str,
+                emit: Callable[[str], None], poll_s: float = 0.2) -> int:
+    """Submit *argv* to SchedArray and follow its log until the job ends.
+
+    The log (stdout and stderr, in order) is ``<cwd>/<run name>.out``.
+
+    :returns: The exit status.
+    :raises ProcessingLabError: If the job was cancelled or timed out.
+    """
+    from diffraction_lab.jobs.service import TERMINAL_STATES
+
+    name = Path(output_dir).name if output_dir else f"processinglab-{datetime.now():%Y%m%d-%H%M%S-%f}"
+    log = cwd / f"{name}.out"
+    job_id = jobs.service.submit(
+        f"{shlex.join(str(a) for a in argv)} 2>&1",
+        working_dir=cwd,
+        job_name=f"processinglab.{step}" + (f" {name}" if output_dir else ""),
+        output_file=log,
+        tool="processinglab",
+        step=step,
+        session_id=jobs.session_id,
+        metadata={"run_dir": str(Path(cwd) / output_dir) if output_dir else None},
+    )
+    position, partial = 0, ""
+
+    def follow() -> None:
+        nonlocal position, partial
+        try:
+            with log.open("r", encoding="utf-8", errors="replace") as handle:
+                handle.seek(position)
+                chunk = handle.read()
+                position = handle.tell()
+        except FileNotFoundError:
+            return
+        *complete, partial = (partial + chunk).split("\n")
+        for line in complete:
+            emit(line)
+
+    while True:
+        status = jobs.service.get_status(job_id) or {}
+        state = str(status.get("state", "")).lower()
+        follow()
+        if state in TERMINAL_STATES:
+            break
+        time.sleep(poll_s)
+    follow()
+    if partial:
+        emit(partial)
+    if state in {"cancelled", "timeout"}:
+        raise ProcessingLabError(f"ProcessingLab job {job_id[:8]} was {state}")
+    code = status.get("return_code")
+    return int(code) if code is not None else (0 if state == "completed" else 1)
 
 
 def rerun_options(

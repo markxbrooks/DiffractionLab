@@ -163,3 +163,63 @@ def test_run_and_rerun_insulin(tmp_path: Path) -> None:
     assert again.refinement["unit_cell"] == "refined"
     assert again.refinement["detector_distance"] == "fixed"
     assert again.directory.parent == rec.directory.parent
+
+
+
+@pytest.fixture
+def job_service(tmp_path: Path):
+    pytest.importorskip("schedarray")
+    from diffraction_lab.jobs.service import JobService
+
+    service = JobService(db_path=tmp_path / "jobs" / "schedarray_scheduler.db")
+    yield service
+    service.close()
+
+
+def test_run_as_schedarray_job(tmp_path: Path, job_service) -> None:
+    """A step submitted as a job is followed line by line, like a direct run."""
+    from diffraction_lab.processinglab_run import JobQueue, execute
+
+    run = _write_run(tmp_path / "work" / "03-integrate")
+    exe = _fake_exe(tmp_path, 'echo "first line"\nsleep 1\necho "to stderr" >&2\n'
+                              f'echo " Output directory: {run}"\nexit 0\n')
+    lines: list[str] = []
+    record = execute([str(exe), "run"], cwd=tmp_path / "work", output_dir=Path("03-integrate-job"),
+                     on_line=lines.append, jobs=JobQueue(job_service, "session_1"), step="integrate")
+    assert record.directory == run and record.completed
+    assert lines == ["first line", "to stderr", f" Output directory: {run}"]
+    (job,) = job_service.list_jobs(tool="processinglab")
+    assert job["state"] == "completed" and job["metadata"]["step"] == "integrate"
+    assert job["metadata"]["session_id"] == "session_1"
+    assert (tmp_path / "work" / "03-integrate-job.out").is_file()
+    # "This work dir only" includes jobs in folders inside it.
+    assert job_service.list_jobs(work_dir=tmp_path) and not job_service.list_jobs(work_dir=tmp_path / "other")
+
+
+def test_cancelled_job(tmp_path: Path, job_service) -> None:
+    import threading
+
+    from diffraction_lab.processinglab_run import JobQueue, execute
+
+    exe = _fake_exe(tmp_path, 'echo "started"\nsleep 30\n')
+
+    def cancel_when_started() -> None:
+        for _ in range(100):
+            running = job_service.list_jobs(state="running")
+            if running:
+                job_service.cancel(running[0]["job_id"])
+                return
+            threading.Event().wait(0.1)
+
+    threading.Thread(target=cancel_when_started, daemon=True).start()
+    with pytest.raises(ProcessingLabError, match="was cancelled"):
+        execute([str(exe), "run"], cwd=tmp_path / "w", jobs=JobQueue(job_service), step="findspots")
+    # The command was stopped, and the job stays "cancelled" (not "failed").
+    (job,) = job_service.list_jobs(tool="processinglab")
+    for _ in range(50):
+        if job_service.get_status(job["job_id"])["state"] == "cancelled" and not any(
+                getattr(w, "current_job_id", None) for w in job_service.scheduler._worker_pool.workers.values()):
+            break
+        threading.Event().wait(0.1)
+    assert job_service.get_status(job["job_id"])["state"] == "cancelled"
+    assert not any(getattr(w, "current_job_id", None) for w in job_service.scheduler._worker_pool.workers.values())

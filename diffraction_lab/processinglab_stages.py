@@ -26,6 +26,7 @@ from typing import Callable, Sequence
 
 from diffraction_lab.processing_sweep import Frames, ProcessingSweep
 from diffraction_lab.processinglab_run import (
+    JobQueue,
     RunOptions,
     RunRecord,
     run_control_stage,
@@ -149,28 +150,32 @@ def autoindex_commands(spot_file: Path, *, threshold: float = 15.0, dmax: float 
 
 
 def find_spots(sweep: ProcessingSweep, session: Path, frames: Frames | None = None, *, threshold: float = 5.0,
-               max_spots: int = 1500, on_line: Callable[[str], None] | None = None) -> RunRecord:
-    """Stage 1: spot search over *frames* (default: the sweep's first 50) into a new stage folder."""
+               max_spots: int = 1500, on_line: Callable[[str], None] | None = None,
+               jobs: JobQueue | None = None) -> RunRecord:
+    """Stage 1: spot search over *frames* (default: the sweep's first 50) into a new stage folder.
+
+    With *jobs*, every stage runs as a SchedArray job (listed in a Jobs tab).
+    """
     out = stage_dir(session, STAGE_FINDSPOTS)
     wedge = frames or sweep.spot_wedge()
     return run_control_stage(sweep.image, findspots_commands(wedge, threshold=threshold, max_spots=max_spots),
-                             out, on_line=on_line)
+                             out, on_line=on_line, jobs=jobs, step="findspots")
 
 
 def autoindex(sweep: ProcessingSweep, session: Path, spot_file: Path, *, threshold: float = 15.0,
               dmax: float | None = None, character: int | None = None,
-              on_line: Callable[[str], None] | None = None) -> IndexResult:
+              on_line: Callable[[str], None] | None = None, jobs: JobQueue | None = None) -> IndexResult:
     """Stage 2: autoindex *spot_file* (optionally forcing one lattice solution)."""
     out = stage_dir(session, STAGE_INDEX)
     record = run_control_stage(
         sweep.image, autoindex_commands(spot_file, threshold=threshold, dmax=dmax, character=character), out,
-        on_line=on_line)
+        on_line=on_line, jobs=jobs, step="index")
     return load_index_result(record)
 
 
 def integrate(sweep: ProcessingSweep, session: Path, index: IndexResult, space_group: str, *,
               frames: Frames | None = None, refine: Sequence[str] | None = None,
-              on_line: Callable[[str], None] | None = None) -> RunRecord:
+              on_line: Callable[[str], None] | None = None, jobs: JobQueue | None = None) -> RunRecord:
     """Stage 3: integrate *frames* (default: the whole sweep) in *space_group*.
 
     Runs ``ProcessingLab run --xparm <index>/XPARM.XDS --spacegroup …
@@ -184,7 +189,7 @@ def integrate(sweep: ProcessingSweep, session: Path, index: IndexResult, space_g
                          space_group=space_group, xparm=index.xparm,
                          refine=tuple(refine) if refine is not None else
                          ("orientation", "cell", "distance", "beam", "tilt_twist", "mosaicity"))
-    return run_processinglab(options, on_line=on_line)
+    return run_processinglab(options, on_line=on_line, jobs=jobs, step="integrate")
 
 
 def load_index_result(record: RunRecord) -> IndexResult:
