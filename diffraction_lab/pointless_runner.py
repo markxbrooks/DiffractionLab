@@ -25,6 +25,30 @@ _POINTLESS_MISSING = (
 
 
 @dataclass(frozen=True)
+class TwinningTest:
+    """Pointless's L-test for twinning (acentric reflections).
+
+    ``mean_abs_l`` is 0.5 for untwinned data and 0.375 for a perfect twin;
+    ``mean_l2`` is 0.333 and 0.2. ``twin_fraction`` is Pointless's estimate
+    from ⟨|L|⟩ (rough, especially for large fractions). ``verdict`` is
+    Pointless's own sentence.
+    """
+
+    mean_abs_l: float | None
+    mean_l2: float | None
+    twin_fraction: float | None
+    verdict: str | None
+
+    @property
+    def suggests_twinning(self) -> bool | None:
+        """Pointless's verdict as a flag (``None`` if it gave none)."""
+        if not self.verdict:
+            return None
+        v = self.verdict.lower()
+        return not ("not twinned" in v or "do not appear" in v)
+
+
+@dataclass(frozen=True)
 class PointlessRunResult:
     """Paths and parsed fields from a Pointless run."""
 
@@ -35,6 +59,11 @@ class PointlessRunResult:
     reindex_operator: str | None
     confidence: float | None
     command: str
+    #: ``"space group"``, or ``"point group"`` when Pointless could determine
+    #: only the point group (e.g. too few axial reflections for screw axes).
+    solution_kind: str | None = None
+    laue_confidence: float | None = None
+    twinning: TwinningTest | None = None
 
 
 def find_pointless() -> Path | None:
@@ -99,29 +128,56 @@ def parse_pointless_log(log_path: Path) -> dict[str, Any]:
         Best Solution:    space group P 41 21 2
            Reindex operator:                   [h,k,l]
            Space group confidence:             0.931
+           Laue group confidence:              1.000
+
+    When the space group cannot be determined Pointless reports
+    ``Best Solution:    point group P 4 2 2``; ``space_group`` is then the
+    point group symbol and ``solution_kind`` is ``"point group"``.
 
     :param log_path: Path to the Pointless ``.log`` file.
-    :returns: Dict with ``space_group``, ``reindex_operator``, ``confidence``.
+    :returns: Dict with ``space_group``, ``solution_kind``,
+        ``reindex_operator``, ``confidence``, ``laue_confidence``.
     """
     results: dict[str, Any] = {
         "space_group": None,
+        "solution_kind": None,
         "reindex_operator": None,
         "confidence": None,
+        "laue_confidence": None,
+        "twinning": None,
     }
+    twin: dict[str, Any] = {}
     try:
         with open(log_path, encoding="utf-8", errors="replace") as handle:
             for raw in handle:
                 line = raw.rstrip("\n")
                 lower = line.lower()
-                if "best solution" in lower and "space group" in lower:
-                    # "Best Solution:    space group P 41 21 2"
-                    idx = lower.index("space group") + len("space group")
+                if "< |l| >" in lower and ":" in line:
+                    # "   < |L| >:    0.480 (0.5 untwinned, 0.375 perfect twin)"
+                    twin["mean_abs_l"] = _first_float(line.split(":", 1)[1])
+                elif "< l^2 >" in lower and ":" in line:
+                    twin["mean_l2"] = _first_float(line.split(":", 1)[1])
+                elif "estimated twin fraction alpha from < |l| >" in lower:
+                    twin["twin_fraction"] = _first_float(line.rsplit(">", 1)[1])
+                elif ("the l-test suggests" in lower or "appear to be twinned" in lower) and "verdict" not in twin:
+                    twin["verdict"] = line.strip()
+                elif "best solution" in lower and ("space group" in lower or "point group" in lower):
+                    # "Best Solution:    space group P 41 21 2" (or "point group P 4 2 2")
+                    kind = "space group" if "space group" in lower else "point group"
+                    idx = lower.index(kind) + len(kind)
                     results["space_group"] = line[idx:].strip() or None
+                    results["solution_kind"] = kind
                 elif "reindex operator" in lower and ":" in line:
                     # Prefer the indented Best Solution block (has "[h,k,l]").
                     value = line.split(":", 1)[1].strip()
                     if value:
                         results["reindex_operator"] = value
+                elif "laue group confidence" in lower and "sqrt" not in lower:
+                    # "   Laue group confidence               0.999" (no colon)
+                    try:
+                        results["laue_confidence"] = float(line.replace(":", " ").split()[-1])
+                    except (IndexError, ValueError):
+                        pass
                 elif (
                     "space group confidence" in lower
                     and "sqrt" not in lower
@@ -137,7 +193,35 @@ def parse_pointless_log(log_path: Path) -> dict[str, Any]:
                             pass
     except OSError as ex:
         logger.warning("Failed to parse Pointless log %s: %s", log_path, ex)
+    if twin:
+        results["twinning"] = TwinningTest(
+            mean_abs_l=twin.get("mean_abs_l"),
+            mean_l2=twin.get("mean_l2"),
+            twin_fraction=twin.get("twin_fraction"),
+            verdict=twin.get("verdict"),
+        )
     return results
+
+
+def _first_float(text: str) -> float | None:
+    for token in text.replace("(", " ").split():
+        try:
+            return float(token)
+        except ValueError:
+            continue
+    return None
+
+
+def is_identity_reindex(operator: str | None) -> bool:
+    """Whether a Pointless reindex operator leaves the indices unchanged.
+
+    ProcessingLab's ``--spacegroup`` does not reindex, so a Pointless space
+    group can be applied to a re-run only when its operator is ``[h,k,l]``.
+
+    :param operator: E.g. ``"[h,k,l]"`` or ``"[k,h,-l]"``.
+    :returns: True for the identity (spaces and case ignored).
+    """
+    return (operator or "").replace(" ", "").lower() in {"[h,k,l]", "h,k,l"}
 
 
 def _keyword_lines(
@@ -262,6 +346,9 @@ def _run_via_schedarray(
         reindex_operator=parsed.get("reindex_operator"),
         confidence=parsed.get("confidence"),
         command=command_str,
+        solution_kind=parsed.get("solution_kind"),
+        laue_confidence=parsed.get("laue_confidence"),
+        twinning=parsed.get("twinning"),
     )
 
 
@@ -322,6 +409,9 @@ def _run_via_subprocess(
         reindex_operator=parsed.get("reindex_operator"),
         confidence=parsed.get("confidence"),
         command=command_str,
+        solution_kind=parsed.get("solution_kind"),
+        laue_confidence=parsed.get("laue_confidence"),
+        twinning=parsed.get("twinning"),
     )
 
 
@@ -381,6 +471,9 @@ def _run_via_mxlib(
         reindex_operator=parsed.get("reindex_operator"),
         confidence=parsed.get("confidence"),
         command=command_str,
+        solution_kind=parsed.get("solution_kind"),
+        laue_confidence=parsed.get("laue_confidence"),
+        twinning=parsed.get("twinning"),
     )
 
 

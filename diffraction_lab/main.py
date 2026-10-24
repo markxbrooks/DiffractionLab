@@ -49,10 +49,12 @@ from PySide6.QtGui import (
 from PySide6.QtCore import Qt, QPoint, QSettings, QSize
 
 from diffraction_lab.beam import BeamParameters
+from diffraction_lab.cbf_header import CbfGeometry, read_cbf_geometry
 from diffraction_lab.detector import DetectorParameters
 from diffraction_lab.image_canvas import DiffractionImageCanvas, build_resolution_rings
 from diffraction_lab.indexing import IndexingGeometry, as_float
 from diffraction_lab.processing_wizard import ProcessingWizard
+from diffraction_lab.processinglab_window import ProcessingLabWindow
 from diffraction_lab.session import (
     DiffractionLabSession,
     ViewerState,
@@ -682,6 +684,7 @@ class DiffractionLabApp(QMainWindow):
         self._session_path: Path | None = None
         self._session_dirty = False
         self._processing_wizard: ProcessingWizard | None = None
+        self._processinglab_window: ProcessingLabWindow | None = None
         self._indexing_spot_overlay: list[tuple[float, float, bool]] | None = None
         self._indexing_solution = None
 
@@ -808,6 +811,20 @@ class DiffractionLabApp(QMainWindow):
         )
         self._act_index.triggered.connect(self.open_indexing_dialog)
 
+        self._act_processinglab = QAction(
+            _registry_icon(
+                IconRegistry.DATASET_PROCESSING if _HAS_PICOUI else ""
+            ),
+            "Process with &ProcessingLab…",
+            self,
+        )
+        self._act_processinglab.setShortcut("Ctrl+Shift+I")
+        self._act_processinglab.setStatusTip(
+            "Open ProcessingLab processing (spots → index → integrate → "
+            "Pointless → Aimless)"
+        )
+        self._act_processinglab.triggered.connect(self.open_processinglab_window)
+
         self._act_terminal = QAction(
             _registry_icon(_icon_key("TERMINAL_TAB")),
             "Show &Terminal",
@@ -905,6 +922,7 @@ class DiffractionLabApp(QMainWindow):
 
         process_menu = self.menuBar().addMenu("&Process")
         process_menu.addAction(self._act_index)
+        process_menu.addAction(self._act_processinglab)
         process_menu.addAction(self._act_save_spotfile)
 
     def _refresh_recent_files_menu(self) -> None:
@@ -1289,6 +1307,7 @@ class DiffractionLabApp(QMainWindow):
         toolbar.addAction(self._act_reset_zoom)
         toolbar.addSeparator()
         toolbar.addAction(self._act_index)
+        toolbar.addAction(self._act_processinglab)
 
     def _build_central_ui(self) -> None:
         """Build the central image viewer and controls."""
@@ -1553,6 +1572,28 @@ class DiffractionLabApp(QMainWindow):
     def _on_indexing_dialog_destroyed(self, *_args) -> None:
         self._processing_wizard = None
 
+    def open_processinglab_window(self) -> None:
+        """Open the ProcessingLab processing window for the loaded sweep."""
+        if self.current_file is None:
+            QMessageBox.information(
+                self,
+                "Process with ProcessingLab",
+                "Open a diffraction image or HDF5 / NeXus master first.",
+            )
+            return
+        if self._processinglab_window is None:
+            self._processinglab_window = ProcessingLabWindow(self)
+            self._processinglab_window.destroyed.connect(
+                self._on_processinglab_window_destroyed
+            )
+        self._processinglab_window.refresh_dataset()
+        self._processinglab_window.show()
+        self._processinglab_window.raise_()
+        self._processinglab_window.activateWindow()
+
+    def _on_processinglab_window_destroyed(self, *_args) -> None:
+        self._processinglab_window = None
+
     def set_indexing_spot_overlay(
         self,
         spots_px: list[tuple[float, float, bool]] | None,
@@ -1763,6 +1804,10 @@ class DiffractionLabApp(QMainWindow):
         self.statusBar().showMessage(f"Loaded {file_path}", 5000)
         self._recent_files.add(file_path)
         self._refresh_recent_files_menu()
+        # Each file brings its own geometry: never keep the previous file's
+        # beam centre, distance, wavelength or pixel size.
+        self.beam_parameters = BeamParameters()
+        self.detector = DetectorParameters()
         if file_path.lower().endswith(".cbf"):
             self.display_cbf_image(file_path)
         elif file_path.lower().endswith(".h5"):
@@ -1887,10 +1932,28 @@ class DiffractionLabApp(QMainWindow):
         except Exception as ex:
             logging.error(f"Error opening or parsing HDF5 file '{hdf5_path}': {ex}")
 
+    def _apply_cbf_geometry(self, geometry: CbfGeometry) -> None:
+        """Set beam centre, distance, wavelength and pixel size from a miniCBF header.
+
+        :param geometry: Parsed header values; missing ones are left unchanged.
+        """
+        beam = self.beam_parameters
+        if geometry.beam_x_px is not None and geometry.beam_y_px is not None:
+            beam.x, beam.y = geometry.beam_x_px, geometry.beam_y_px
+        if geometry.distance_mm is not None:
+            beam.detector_distance = geometry.distance_mm
+        if geometry.wavelength_a is not None:
+            beam.incident_wavelength = geometry.wavelength_a
+        if geometry.pixel_x_mm is not None:
+            self.detector.x_pixel_size = geometry.pixel_x_mm
+        if geometry.pixel_y_mm is not None:
+            self.detector.y_pixel_size = geometry.pixel_y_mm
+
     def display_cbf_image(self, file_path):
         """ display_cbf_image """
         try:
             cbf_image = fabio.open(file_path)
+            self._apply_cbf_geometry(read_cbf_geometry(cbf_image.header))
             data = cbf_image.data
             self._raw_frame = np.asarray(data, dtype=np.float64)
             image = Image.fromarray(data)

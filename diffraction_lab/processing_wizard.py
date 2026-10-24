@@ -146,6 +146,7 @@ from diffraction_lab.processinglab_client import (
     find_integrationlab,
     prefer_processinglab,
 )
+from diffraction_lab.processinglab_panel import ProcessingLabPanel
 from diffraction_lab.reflection_viewer_launch import launch_reflection_viewer
 from diffraction_lab.summary_vs_resolution import open_summary_vs_resolution_from_work_dir
 from diffraction_lab.terminal_log_viewer import TerminalLogViewer
@@ -1440,6 +1441,10 @@ class ProcessingWizard(QDialog):
         scale_layout.addStretch(1)
         self._scale_tab_index = self.pipeline_tabs.addTab(scale_page, "7. Scale")
 
+        # ----- Tab: ProcessingLab (run → Pointless/Aimless → re-run) -----
+        self.processinglab_panel = ProcessingLabPanel(self)
+        self.pipeline_tabs.addTab(self.processinglab_panel, "ProcessingLab")
+
         # ----- Tab: Jobs (SchedArray history) -----
         if JobsTab is not None:
             self._jobs_tab = JobsTab(
@@ -1511,6 +1516,11 @@ class ProcessingWizard(QDialog):
             self.frame_step.setValue(1)
 
         app = self.parentWidget()
+        if app is not None:
+            current = getattr(app, "current_file", None)
+            self.processinglab_panel.set_dataset(
+                Path(current) if current else None, n_frames
+            )
         geometry = None
         try:
             if app is not None and hasattr(app, "build_indexing_geometry"):
