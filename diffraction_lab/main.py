@@ -51,7 +51,8 @@ from PySide6.QtCore import Qt, QPoint, QSettings, QSize
 from diffraction_lab.beam import BeamParameters
 from diffraction_lab.cbf_header import CbfGeometry, read_cbf_geometry
 from diffraction_lab.detector import DetectorParameters
-from diffraction_lab.image_canvas import DiffractionImageCanvas, build_resolution_rings
+from diffraction_lab.beamstop import GROUP_MAX_FRAMES, detect_beamstop, frame_groups, sibling_frames
+from diffraction_lab.image_canvas import DiffractionImageCanvas, build_ice_rings, build_resolution_rings
 from diffraction_lab.image_histogram import pixel_histogram, plot_pixel_histogram
 from diffraction_lab.indexing import IndexingGeometry, as_float
 from diffraction_lab.processing_wizard import ProcessingWizard
@@ -679,6 +680,9 @@ class DiffractionLabApp(QMainWindow):
         self.slice_size = 10  # Number of frames to load at once
         self.image_inverted = False
         self.show_rings = True  # Default to showing rings
+        self.show_ice_rings = False
+        self.show_beamstop = False
+        self._beamstop_key: tuple | None = None
         self.show_indexing_spots = True
         self._recent_files = RecentFilesManager()
         self._recent_sessions = RecentSessionsManager()
@@ -784,6 +788,26 @@ class DiffractionLabApp(QMainWindow):
         self._act_rings.setChecked(self.show_rings)
         self._act_rings.setStatusTip("Toggle resolution rings")
         self._act_rings.toggled.connect(self._on_rings_action_toggled)
+
+        self._act_ice_rings = QAction(
+            _registry_icon(_icon_key("SNOWFLAKE", "mdi.snowflake")),
+            "Show &ice rings",
+            self,
+        )
+        self._act_ice_rings.setCheckable(True)
+        self._act_ice_rings.setChecked(self.show_ice_rings)
+        self._act_ice_rings.setStatusTip("Toggle hexagonal-ice ring positions")
+        self._act_ice_rings.toggled.connect(self.set_ice_rings_shown)
+
+        self._act_beamstop = QAction(
+            _registry_icon(_icon_key("BEAMSTOP", "mdi.circle-slice-8")),
+            "Show &beamstop",
+            self,
+        )
+        self._act_beamstop.setCheckable(True)
+        self._act_beamstop.setChecked(self.show_beamstop)
+        self._act_beamstop.setStatusTip("Detect and tint the beamstop shadow")
+        self._act_beamstop.toggled.connect(self.set_beamstop_shown)
 
         self._act_indexing_spots = QAction(
             _registry_icon(_icon_key("SPOTS", _icon_key("CHART_SCATTER_PLOT"))),
@@ -914,6 +938,8 @@ class DiffractionLabApp(QMainWindow):
         file_menu.addAction(self._act_invert)
         file_menu.addAction(self._act_histogram)
         file_menu.addAction(self._act_rings)
+        file_menu.addAction(self._act_ice_rings)
+        file_menu.addAction(self._act_beamstop)
         file_menu.addAction(self._act_indexing_spots)
         file_menu.addSeparator()
         file_menu.addAction(self._act_quit)
@@ -924,6 +950,8 @@ class DiffractionLabApp(QMainWindow):
         view_menu.addAction(self._act_reset_zoom)
         view_menu.addSeparator()
         view_menu.addAction(self._act_rings)
+        view_menu.addAction(self._act_ice_rings)
+        view_menu.addAction(self._act_beamstop)
         view_menu.addAction(self._act_indexing_spots)
         view_menu.addAction(self._act_defpix)
         view_menu.addSeparator()
@@ -1027,6 +1055,8 @@ class DiffractionLabApp(QMainWindow):
             dataset_name=dataset_name,
             frame_index=frame_index,
             show_rings=bool(self.show_rings),
+            show_ice_rings=bool(self.show_ice_rings),
+            show_beamstop=bool(self.show_beamstop),
             show_indexing_spots=bool(self.show_indexing_spots),
             image_inverted=bool(self.image_inverted),
             contrast=contrast,
@@ -1067,6 +1097,10 @@ class DiffractionLabApp(QMainWindow):
             self._act_rings.blockSignals(False)
         if hasattr(self, "image_canvas"):
             self.image_canvas.set_rings_visible(self.show_rings)
+        if hasattr(self, "ice_rings_checkbox") and hasattr(self, "_act_ice_rings"):
+            self.set_ice_rings_shown(bool(state.show_ice_rings))
+        if hasattr(self, "beamstop_checkbox") and hasattr(self, "_act_beamstop"):
+            self.set_beamstop_shown(bool(state.show_beamstop))
         self.show_indexing_spots = bool(state.show_indexing_spots)
         if hasattr(self, "_act_indexing_spots"):
             self._act_indexing_spots.blockSignals(True)
@@ -1146,9 +1180,12 @@ class DiffractionLabApp(QMainWindow):
         if hasattr(self, "image_canvas"):
             self.image_canvas.set_spot_overlay(None)
             self.image_canvas.set_resolution_rings(None)
+            self.image_canvas.set_ice_rings(None)
+            self.image_canvas.set_beamstop(None)
             self.image_canvas.set_beam_center(None)
             self.image_canvas.set_image_pixmap(QPixmap(), reset_view=True)
             self.image_canvas.set_placeholder("No image loaded")
+        self._beamstop_key = None
 
     def open_session_dialog(self) -> None:
         """Prompt for a ``.dlsession`` file and open it."""
@@ -1309,6 +1346,8 @@ class DiffractionLabApp(QMainWindow):
         toolbar.addAction(self._act_invert)
         toolbar.addAction(self._act_histogram)
         toolbar.addAction(self._act_rings)
+        toolbar.addAction(self._act_ice_rings)
+        toolbar.addAction(self._act_beamstop)
         toolbar.addAction(self._act_indexing_spots)
         toolbar.addSeparator()
         toolbar.addAction(self._act_zoom_in)
@@ -1439,6 +1478,20 @@ class DiffractionLabApp(QMainWindow):
         self.rings_checkbox.stateChanged.connect(self.toggle_rings)
         button_layout.addWidget(self.rings_checkbox)
 
+        self.ice_rings_checkbox = QCheckBox("Show ice rings")
+        self.ice_rings_checkbox.setIcon(_registry_icon(_icon_key("SNOWFLAKE", "mdi.snowflake")))
+        self.ice_rings_checkbox.setChecked(self.show_ice_rings)
+        self.ice_rings_checkbox.setStatusTip("Toggle hexagonal-ice ring positions")
+        self.ice_rings_checkbox.toggled.connect(self.set_ice_rings_shown)
+        button_layout.addWidget(self.ice_rings_checkbox)
+
+        self.beamstop_checkbox = QCheckBox("Show beamstop")
+        self.beamstop_checkbox.setIcon(_registry_icon(_icon_key("BEAMSTOP", "mdi.circle-slice-8")))
+        self.beamstop_checkbox.setChecked(self.show_beamstop)
+        self.beamstop_checkbox.setStatusTip("Detect and tint the beamstop shadow")
+        self.beamstop_checkbox.toggled.connect(self.set_beamstop_shown)
+        button_layout.addWidget(self.beamstop_checkbox)
+
         self.indexing_spots_checkbox = QCheckBox("Show indexing spots")
         self.indexing_spots_checkbox.setIcon(
             _registry_icon(_icon_key("SPOTS", _icon_key("CHART_SCATTER_PLOT")))
@@ -1527,6 +1580,80 @@ class DiffractionLabApp(QMainWindow):
             self.rings_checkbox.setChecked(checked)
             self.rings_checkbox.blockSignals(False)
         self.image_canvas.set_rings_visible(self.show_rings)
+
+    def set_ice_rings_shown(self, checked: bool) -> None:
+        """Show or hide the ice rings, keeping the checkbox and action in step.
+
+        :param checked: Whether the ice rings are drawn.
+        """
+        self.show_ice_rings = bool(checked)
+        for widget in (self.ice_rings_checkbox, self._act_ice_rings):
+            if widget.isChecked() != self.show_ice_rings:
+                widget.blockSignals(True)
+                widget.setChecked(self.show_ice_rings)
+                widget.blockSignals(False)
+        self.image_canvas.set_ice_rings_visible(self.show_ice_rings)
+
+    def set_beamstop_shown(self, checked: bool) -> None:
+        """Show or hide the beamstop shadow, keeping the checkbox and action in step.
+
+        The shadow is detected the first time it is shown for an image.
+
+        :param checked: Whether the shadow is drawn.
+        """
+        self.show_beamstop = bool(checked)
+        for widget in (self.beamstop_checkbox, self._act_beamstop):
+            if widget.isChecked() != self.show_beamstop:
+                widget.blockSignals(True)
+                widget.setChecked(self.show_beamstop)
+                widget.blockSignals(False)
+        self._refresh_beamstop()
+        self.image_canvas.set_beamstop_visible(self.show_beamstop)
+
+    def _beamstop_frames(self) -> list[np.ndarray]:
+        """Return up to five frames, or frame groups, of the sweep for shadow detection.
+
+        An HDF5 sweep is often fine-sliced with few counts per frame, so each
+        of five evenly spaced starts sums consecutive frames into a group.
+
+        :returns: Raw frames, or summed groups, spread over the sweep.
+        """
+        if self.dataset is not None:
+            n = int(self.dataset.shape[0])
+            span = max(0, n - GROUP_MAX_FRAMES)
+            starts = sorted({int(i) for i in np.linspace(0, span, num=min(5, n)).round()})
+            return frame_groups(lambda i: np.asarray(self.dataset[i]), n, starts)
+        if self.current_file and str(self.current_file).lower().endswith(".cbf"):
+            return [fabio.open(str(p)).data for p in sibling_frames(Path(self.current_file))]
+        return [] if self._raw_frame is None else [self._raw_frame]
+
+    def _refresh_beamstop(self) -> None:
+        """Detect the beamstop shadow if shown and not yet found for this image and beam."""
+        center = self.beam_parameters.center
+        key = (str(self.current_file), center)
+        if not self.show_beamstop or key == self._beamstop_key:
+            return
+        self._beamstop_key = key
+        if center is None:
+            self.image_canvas.set_beamstop(None)
+            self.statusBar().showMessage("Beamstop: no beam centre to search from.", 5000)
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            found = detect_beamstop(self._beamstop_frames(), float(center[0]), float(center[1]))
+        except (OSError, ValueError) as ex:
+            logging.warning("Beamstop detection failed: %s", ex)
+            found = None
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.image_canvas.set_beamstop(None if found is None else found.mask)
+        if found is None:
+            self.statusBar().showMessage("Beamstop: no shadow found at the beam centre.", 5000)
+        else:
+            x0, y0, x1, y1 = found.bbox
+            self.statusBar().showMessage(
+                f"Beamstop: {found.n_pixels} shadowed pixels, x {x0}–{x1}, y {y0}–{y1}.", 8000
+            )
 
     def _on_indexing_spots_action_toggled(self, checked: bool) -> None:
         """Keep toolbar action and checkbox in sync for indexing spots."""
@@ -2245,22 +2372,28 @@ class DiffractionLabApp(QMainWindow):
         self.image_canvas.set_beam_center(center)
         self._update_beam_geometry_labels()
         rings = []
+        ice_rings = []
         try:
             if (
                 center is not None
                 and beam.incident_wavelength is not None
                 and self.detector.x_pixel_size is not None
             ):
-                rings = build_resolution_rings(
-                    beam_x=float(center[0]),
-                    beam_y=float(center[1]),
-                    wavelength_a=float(beam.incident_wavelength),
-                    distance_mm=float(beam.detector_distance),
-                    pixel_size_mm=float(self.detector.x_pixel_size),
-                )
+                geometry = {
+                    "beam_x": float(center[0]),
+                    "beam_y": float(center[1]),
+                    "wavelength_a": float(beam.incident_wavelength),
+                    "distance_mm": float(beam.detector_distance),
+                    "pixel_size_mm": float(self.detector.x_pixel_size),
+                }
+                rings = build_resolution_rings(**geometry)
+                ice_rings = build_ice_rings(**geometry)
         except Exception as ex:
             logging.warning("Could not build resolution rings: %s", ex)
             rings = []
+            ice_rings = []
+        self.image_canvas.set_ice_rings(ice_rings, visible=self.show_ice_rings)
+        self._refresh_beamstop()
         self.image_canvas.set_resolution_rings(rings, visible=self.show_rings)
 
     def _update_beam_geometry_labels(self) -> None:

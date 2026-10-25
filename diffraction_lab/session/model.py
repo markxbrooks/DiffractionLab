@@ -24,6 +24,8 @@ class ViewerState:
     dataset_name: str | None = None
     frame_index: int = 0
     show_rings: bool = True
+    show_ice_rings: bool = False
+    show_beamstop: bool = False
     show_indexing_spots: bool = True
     image_inverted: bool = False
     contrast: int = 100

@@ -7,6 +7,7 @@ import math
 from dataclasses import dataclass
 
 import numpy as np
+from scipy import ndimage
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import (
     QColor,
@@ -44,6 +45,12 @@ SpotOverlay = list[tuple[float, float, bool]]
 # Default d-spacings (Å) for detector resolution rings.
 DEFAULT_RING_RESOLUTIONS_A = (1.0, 2.0, 3.0)
 
+# Hexagonal ice Ih (P6₃/mmc) cell, and the full ring width in 1/d² (Å⁻²) that
+# ProcessingLab and DIALS reject when estimating the maximum cell.
+ICE_CELL_A = (4.498, 7.338)
+ICE_RING_WIDTH_INV_A2 = 0.004
+ICE_RING_D_MIN_A = 1.5
+
 
 @dataclass(frozen=True)
 class ResolutionRing:
@@ -53,6 +60,86 @@ class ResolutionRing:
     center_x: float
     center_y: float
     radius_px: float
+
+
+@dataclass(frozen=True)
+class IceRing(ResolutionRing):
+    """One hexagonal-ice powder ring, with the band it occupies on the detector."""
+
+    inner_px: float = 0.0
+    outer_px: float = 0.0
+
+
+def ice_ring_resolutions(d_min_a: float = ICE_RING_D_MIN_A) -> list[float]:
+    """Return the d-spacings (Å) of hexagonal-ice rings down to *d_min_a*.
+
+    Allowed reflections of P6₃/mmc ice (``hh-2hl`` and ``000l`` need even
+    ``l``), from 1/d² = 4/(3a²)(h² + hk + k²) + l²/c². The same rings
+    ProcessingLab and DIALS filter as ice.
+
+    :param d_min_a: Highest resolution to list (Å).
+    :returns: Distinct d-spacings, largest first.
+    """
+    a, c = ICE_CELL_A
+    s2_max = 1.0 / (d_min_a * d_min_a)
+    hmax = math.ceil(a / d_min_a) + 1
+    lmax = math.ceil(c / d_min_a)
+    s2_values = {
+        round(4.0 / (3.0 * a * a) * (h * h + h * k + k * k) + l * l / (c * c), 9)
+        for h in range(-hmax, hmax + 1)
+        for k in range(-hmax, hmax + 1)
+        for l in range(lmax + 1)
+        if (h, k, l) != (0, 0, 0)
+        and not (l % 2 and (h == k or k == -2 * h or h == -2 * k))
+    }
+    return [1.0 / math.sqrt(s2) for s2 in sorted(s2_values) if s2 <= s2_max]
+
+
+def build_ice_rings(
+    *,
+    beam_x: float,
+    beam_y: float,
+    wavelength_a: float,
+    distance_mm: float,
+    pixel_size_mm: float,
+    d_min_a: float = ICE_RING_D_MIN_A,
+    width_inv_a2: float = ICE_RING_WIDTH_INV_A2,
+) -> list[IceRing]:
+    """Build drawable hexagonal-ice rings in image-pixel coordinates.
+
+    :param beam_x: Beam centre x (pixels).
+    :param beam_y: Beam centre y (pixels).
+    :param wavelength_a: Wavelength (Å).
+    :param distance_mm: Crystal-to-detector distance (mm).
+    :param pixel_size_mm: Pixel size (mm).
+    :param d_min_a: Highest-resolution ring to include (Å).
+    :param width_inv_a2: Full band width in 1/d² (Å⁻²).
+    :returns: One :class:`IceRing` per ring that falls on a physical radius.
+    """
+    rings: list[IceRing] = []
+    half = 0.5 * width_inv_a2
+    for d in ice_ring_resolutions(d_min_a):
+        s2 = 1.0 / (d * d)
+        radius = radius_pixels_for_resolution(d, wavelength_a, distance_mm, pixel_size_mm)
+        if radius is None or radius <= 0.0:
+            continue
+        inner = radius_pixels_for_resolution(
+            1.0 / math.sqrt(s2 - half), wavelength_a, distance_mm, pixel_size_mm
+        )
+        outer = radius_pixels_for_resolution(
+            1.0 / math.sqrt(s2 + half), wavelength_a, distance_mm, pixel_size_mm
+        )
+        rings.append(
+            IceRing(
+                d_angstrom=float(d),
+                center_x=float(beam_x),
+                center_y=float(beam_y),
+                radius_px=float(radius),
+                inner_px=float(inner if inner is not None else radius),
+                outer_px=float(outer if outer is not None else radius),
+            )
+        )
+    return rings
 
 
 def radius_pixels_for_resolution(
@@ -138,6 +225,10 @@ class DiffractionImageCanvas(ZoomableCanvas if _HAS_ZOOMABLE else QWidget):
         self._show_pixel_mask = True
         self._resolution_rings: list[ResolutionRing] = []
         self._show_rings = True
+        self._ice_rings: list[IceRing] = []
+        self._show_ice_rings = False
+        self._beamstop_mask = QImage()
+        self._show_beamstop = False
         self._beam_center: tuple[float, float] | None = None
         self._show_beam_marker = True
         self._show_crosshair = True
@@ -239,6 +330,70 @@ class DiffractionImageCanvas(ZoomableCanvas if _HAS_ZOOMABLE else QWidget):
         self._show_rings = bool(visible)
         self.update()
 
+    def set_beamstop(
+        self,
+        mask: np.ndarray | None,
+        *,
+        color: tuple[int, int, int, int] = (255, 140, 0, 110),
+        visible: bool | None = None,
+    ) -> None:
+        """Tint the beamstop shadow, outlined so its edge stays visible.
+
+        :param mask: Boolean shadow, ``(height, width)`` of the image; drawn
+            only while the image has that size. ``None`` clears it.
+        :param color: RGBA tint of the shadow; the outline is opaque.
+        :param visible: Show or hide it (``None``: unchanged).
+        """
+        if mask is None:
+            self._beamstop_mask = QImage()
+        else:
+            mask = np.asarray(mask, dtype=bool)
+            edge = mask & ~ndimage.binary_erosion(mask, iterations=2)
+            rgba = np.zeros((*mask.shape, 4), dtype=np.uint8)
+            rgba[mask] = color
+            rgba[edge] = (*color[:3], 255)
+            h, w = mask.shape
+            self._beamstop_mask = QImage(rgba.data, w, h, 4 * w, QImage.Format.Format_RGBA8888).copy()
+        if visible is not None:
+            self._show_beamstop = bool(visible)
+        self.update()
+
+    def set_beamstop_visible(self, visible: bool) -> None:
+        """Show or hide the beamstop shadow without rebuilding it.
+
+        :param visible: Whether to draw the shadow.
+        """
+        self._show_beamstop = bool(visible)
+        self.update()
+
+    def has_beamstop(self) -> bool:
+        """Whether a beamstop shadow is set."""
+        return not self._beamstop_mask.isNull()
+
+    def set_ice_rings(
+        self,
+        rings: list[IceRing] | None,
+        *,
+        visible: bool | None = None,
+    ) -> None:
+        """Set hexagonal-ice rings (image-pixel geometry).
+
+        :param rings: Rings from :func:`build_ice_rings`, or ``None`` to clear.
+        :param visible: Optionally show or hide them at the same time.
+        """
+        self._ice_rings = list(rings or [])
+        if visible is not None:
+            self._show_ice_rings = bool(visible)
+        self.update()
+
+    def set_ice_rings_visible(self, visible: bool) -> None:
+        """Show or hide ice rings without recomputing geometry.
+
+        :param visible: Whether to draw the ice rings.
+        """
+        self._show_ice_rings = bool(visible)
+        self.update()
+
     def set_beam_center(
         self,
         center: tuple[float, float] | None,
@@ -332,6 +487,18 @@ class DiffractionImageCanvas(ZoomableCanvas if _HAS_ZOOMABLE else QWidget):
                 self._pixel_mask,
                 QRectF(0.0, 0.0, float(src_w), float(src_h)),
             )
+
+        if (self._show_beamstop and not self._beamstop_mask.isNull()
+                and self._beamstop_mask.size() == self._pixmap.size()):
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
+            painter.drawImage(
+                QRectF(min(x0, x1), min(y0, y1), dest_w, dest_h),
+                self._beamstop_mask,
+                QRectF(0.0, 0.0, float(src_w), float(src_h)),
+            )
+
+        if self._show_ice_rings and self._ice_rings:
+            self._paint_ice_rings(painter, transform)
 
         if self._show_rings and self._resolution_rings:
             self._paint_resolution_rings(painter, transform)
@@ -440,6 +607,40 @@ class DiffractionImageCanvas(ZoomableCanvas if _HAS_ZOOMABLE else QWidget):
             label = self._format_resolution_label(ring.d_angstrom)
             painter.setPen(label_color)
             painter.drawText(QPointF(cx + radius + 4.0, cy - 3.0), label)
+
+    def _paint_ice_rings(
+        self, painter: QPainter, transform: ViewTransform
+    ) -> None:
+        """Draw ice rings as translucent bands with a thin centre line.
+
+        Each band spans the 1/d² window filtered as ice; labels sit above the
+        beam and are skipped where they would overprint a neighbour.
+        """
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        font = QFont(painter.font())
+        font.setPointSize(max(9, font.pointSize() - 1))
+        painter.setFont(font)
+        band_color = QColor(80, 200, 255, 70)
+        line_pen = QPen(QColor(80, 200, 255, 220), 1, Qt.PenStyle.DashLine)
+        label_color = QColor(140, 220, 255, 240)
+        last_label_y: float | None = None
+
+        for ring in self._ice_rings:
+            cx, cy = transform.world_to_screen(ring.center_x, ring.center_y)
+            scale = abs(transform.world_to_screen(ring.center_x + 1.0, ring.center_y)[0] - cx)
+            radius = ring.radius_px * scale
+            if radius < 2.0:
+                continue
+            band = max(1.5, (ring.outer_px - ring.inner_px) * scale)
+            painter.setPen(QPen(band_color, band))
+            painter.drawEllipse(QPointF(cx, cy), radius, radius)
+            painter.setPen(line_pen)
+            painter.drawEllipse(QPointF(cx, cy), radius, radius)
+            label_y = cy - radius - 3.0
+            if last_label_y is None or abs(last_label_y - label_y) >= 14.0:
+                painter.setPen(label_color)
+                painter.drawText(QPointF(cx + 4.0, label_y), f"{ring.d_angstrom:.2f} Å")
+                last_label_y = label_y
 
     @staticmethod
     def _format_resolution_label(d_angstrom: float) -> str:
