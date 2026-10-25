@@ -41,21 +41,15 @@ from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QDesktopServices, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QCheckBox,
-    QComboBox,
-    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
-    QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
-    QLineEdit,
+    QLayout,
     QMessageBox,
     QPlainTextEdit,
-    QPushButton,
     QScrollArea,
-    QSpinBox,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -76,6 +70,15 @@ from diffraction_lab.jobs.jobs_tab import JobsTab
 from diffraction_lab.jobs.service import SCHEDARRAY_DB_NAME, JobService, use_schedarray
 from diffraction_lab.processing_sweep import Frames, ProcessingSweep
 from diffraction_lab.processinglab_charts import IntegrationChartsWidget, StrategyCanvas
+from diffraction_lab.processinglab_specs import (
+    ProcessingLabSpecs,
+    create_button,
+    create_checkbox,
+    create_editable_combo,
+    create_optional_double_spinbox,
+    create_text_field,
+    processinglab_specs,
+)
 from diffraction_lab.processinglab_client import find_integrationlab
 from diffraction_lab.processing_window_base import ProcessingEngine, ProcessingWindowBase
 from diffraction_lab.processinglab_format import (
@@ -84,7 +87,6 @@ from diffraction_lab.processinglab_format import (
     parse_cell_text,
 )
 from diffraction_lab.processinglab_run import (
-    REFINABLE_PARAMETERS,
     JobQueue,
     PixelExclusions,
     RunRecord,
@@ -110,17 +112,12 @@ from diffraction_lab.processinglab_stages import (
 )
 from diffraction_lab.reflection_viewer_launch import launch_reflection_viewer
 from diffraction_lab.terminal_log_viewer import TerminalLogViewer
+from picoui.helpers.groups import build_group
+from picoui.helpers.layout import create_layout_with_items, create_splitter_with_items, create_widget_with_layout
+from picoui.widget.helper import create_double_spinbox_from_spec, create_spinbox_from_spec
 
 logger = logging.getLogger(__name__)
 
-_REFINE_LABELS = {
-    "orientation": "Orientation",
-    "cell": "Unit cell",
-    "distance": "Distance",
-    "beam": "Beam centre",
-    "tilt_twist": "Tilt / twist",
-    "mosaicity": "Mosaicity",
-}
 _SOLUTION_COLUMNS = ("No", "Lattice", "Penalty", "a", "b", "c", "α", "β", "γ", "Metric dev %", "Space groups")
 
 
@@ -196,18 +193,6 @@ class _Session:
     aimless: AimlessRunResult | None = None
 
 
-@dataclass
-class SpotDefaults:
-    first = 1
-    last = 999999
-    threshold_value = 5
-    threshold_low_value = 1
-    threshold_high_value = 100
-    to_find_max_value = 20_000
-    to_find_range_low_value = 50
-    to_find_range_high_value = 100_000
-
-
 class ProcessingLabWindow(ProcessingWindowBase):
     """Processing with ProcessingLab, Pointless and Aimless only
     (:attr:`ProcessingEngine.PROCESSINGLAB`)."""
@@ -221,6 +206,8 @@ class ProcessingLabWindow(ProcessingWindowBase):
         self._jobs_service: JobService | None = None
         self._terminal: TerminalLogViewer | None = None
         self._slider_connected = False
+        #: Every control's range, default, text and slot (one group per tab).
+        self.specs: ProcessingLabSpecs = processinglab_specs(self)
         self._build_ui()
         self.refresh_dataset()
 
@@ -253,43 +240,19 @@ class ProcessingLabWindow(ProcessingWindowBase):
         self._build_jobs_tab()
 
     def _build_setup_tab(self) -> None:
-        page = QWidget()
-        v = QVBoxLayout(page)
-        box = QGroupBox("Sweep and session")
-        form = QFormLayout(box)
+        spec = self.specs.setup
         self.image_label = QLabel("(no image loaded)")
         self.image_label.setWordWrap(True)
-        form.addRow("Image", self.image_label)
-        self.sweep_first = QSpinBox()
-        self.sweep_last = QSpinBox()
-        for spin in (self.sweep_first, self.sweep_last):
-            spin.setRange(1, 999999)
-        form.addRow("Frames to process", _row(self.sweep_first, QLabel("to"), self.sweep_last))
+        self.sweep_first = create_spinbox_from_spec(spec.frames)
+        self.sweep_last = create_spinbox_from_spec(spec.frames)
         self.sweep_label = QLabel("")
-        form.addRow("Sweep on disk", self.sweep_label)
-        self.work_edit = QLineEdit()
-        self.work_edit.setToolTip("Sessions are created here as session_YYYYMMDD_HHMMSS")
-        browse = QPushButton("Browse…")
-        browse.clicked.connect(self._on_browse_work)
-        form.addRow("Work folder", _row(self.work_edit, browse, stretch_first=True))
+        self.work_edit = create_text_field(spec.work_folder)
+        browse = create_button(spec.browse)
         self.session_label = QLabel("(none yet: created by the first step)")
         self.session_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        new_btn = QPushButton("New session")
-        new_btn.clicked.connect(self._on_new_session)
-        reveal_btn = QPushButton("Reveal")
-        reveal_btn.clicked.connect(lambda: _open(self._s.folder))
-        form.addRow("Session", _row(self.session_label, new_btn, reveal_btn, stretch_first=True))
-        v.addWidget(box)
-
-        tools = QGroupBox("Programs")
-        tools_form = QFormLayout(tools)
+        new_btn = create_button(spec.new_session)
+        reveal_btn = create_button(spec.reveal)
         self.tool_labels = {name: QLabel() for name in ("ProcessingLab", "Pointless", "Aimless")}
-        for name, label in self.tool_labels.items():
-            tools_form.addRow(name, label)
-        v.addWidget(tools)
-
-        status = QGroupBox("Pipeline")
-        sv = QVBoxLayout(status)
         self.pipeline_labels = {}
         for key, text in (("spots", "Find spots (ProcessingLab)"), ("index", "Index (ProcessingLab)"),
                           ("strategy", "Strategy (ProcessingLab, optional)"),
@@ -298,67 +261,46 @@ class ProcessingLabWindow(ProcessingWindowBase):
             label = QLabel(f"○ {text}")
             label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             self.pipeline_labels[key] = (label, text)
-            sv.addWidget(label)
-        self.run_all_btn = QPushButton("Run all steps with these settings")
-        self.run_all_btn.setToolTip("Find spots → index (suggested solution) → integrate (its first space group) "
-                                    "→ Pointless → Aimless")
-        self.run_all_btn.clicked.connect(self._on_run_all)
-        sv.addWidget(self.run_all_btn)
-        v.addWidget(status)
-        v.addStretch(1)
-        self.tabs.addTab(page, "1. Setup")
+        self.run_all_btn = create_button(spec.run_all)
+
+        box = build_group("Sweep and session", _form(
+            ("Image", self.image_label),
+            ("Frames to process", _row(self.sweep_first, QLabel("to"), self.sweep_last)),
+            ("Sweep on disk", self.sweep_label),
+            ("Work folder", _row(self.work_edit, browse, stretch_first=True)),
+            ("Session", _row(self.session_label, new_btn, reveal_btn, stretch_first=True)),
+        ))
+        tools = build_group("Programs", _form(*self.tool_labels.items()))
+        status = build_group("Pipeline", _column(*(label for label, _text in self.pipeline_labels.values()),
+                                                 self.run_all_btn))
+        self.tabs.addTab(create_widget_with_layout(_column(box, tools, status, stretch=True)), "1. Setup")
 
     def _build_spots_tab(self) -> None:
-        spot_defaults = SpotDefaults()
-        page = QWidget()
-        v = QVBoxLayout(page)
-        box = QGroupBox("Spot finding (ProcessingLab FINDSPOTS)")
-        form = QFormLayout(box)
-        self.spot_first = QSpinBox()
-        self.spot_last = QSpinBox()
-        for spin in (self.spot_first, self.spot_last):
-            spin.setRange(spot_defaults.first, spot_defaults.last)
-        form.addRow("Frames", _row(self.spot_first, QLabel("to"), self.spot_last))
-        self.spot_threshold = QDoubleSpinBox()
-        self.spot_threshold.setRange(spot_defaults.threshold_low_value, spot_defaults.threshold_high_value)
-        self.spot_threshold.setValue(spot_defaults.threshold_value)
-        form.addRow("Threshold (σ)", self.spot_threshold)
-        self.spot_max = QSpinBox()
-        self.spot_max.setRange(spot_defaults.to_find_range_low_value, spot_defaults.to_find_range_high_value)
-        self.spot_max.setValue(spot_defaults.to_find_max_value)
-        form.addRow("Maximum spots", self.spot_max)
-        self.find_spots_btn = QPushButton("Find spots")
-        self.find_spots_btn.clicked.connect(self._on_find_spots)
-        self.show_spots_check = QCheckBox("Show spots on the image (current frame)")
-        self.show_spots_check.toggled.connect(lambda _on: self._update_spot_overlay())
-        form.addRow(_row(self.find_spots_btn, self.show_spots_check))
-        v.addWidget(box)
+        spec = self.specs.spots
+        # Widgets
+        self.spot_first = create_spinbox_from_spec(spec.frames)
+        self.spot_last = create_spinbox_from_spec(spec.frames)
+        self.spot_threshold = create_double_spinbox_from_spec(spec.threshold)
+        self.spot_max = create_spinbox_from_spec(spec.max_spots)
+        self.find_spots_btn = create_button(spec.find)
+        self.show_spots_check = create_checkbox(spec.show_spots)
         self.spots_label = QLabel("")
         self.spots_label.setWordWrap(True)
-        v.addWidget(self.spots_label)
-        v.addStretch(1)
-        self.tabs.addTab(page, "2. Find spots")
+
+        # Layout: the settings form in a group, the result below it.
+        box = build_group("Spot finding (ProcessingLab FINDSPOTS)", _form(
+            ("Frames", _row(self.spot_first, QLabel("to"), self.spot_last)),
+            ("Threshold (σ)", self.spot_threshold),
+            ("Maximum spots", self.spot_max),
+            _row(self.find_spots_btn, self.show_spots_check),
+        ))
+        self.tabs.addTab(create_widget_with_layout(_column(box, self.spots_label, stretch=True)), "2. Find spots")
 
     def _build_index_tab(self) -> None:
-        page = QWidget()
-        v = QVBoxLayout(page)
-        box = QGroupBox("Autoindexing (ProcessingLab DPS)")
-        form = QFormLayout(box)
-        self.index_threshold = QDoubleSpinBox()
-        self.index_threshold.setRange(1.0, 200.0)
-        self.index_threshold.setValue(15.0)
-        form.addRow("Spot I/σ threshold", self.index_threshold)
-        self.index_dmax = QDoubleSpinBox()
-        self.index_dmax.setRange(0.0, 2000.0)
-        self.index_dmax.setSpecialValueText("200 Å (default)")
-        self.index_dmax.setSuffix(" Å")
-        self.index_dmax.setToolTip("Longest cell edge searched; raise it for very long axes")
-        form.addRow("Maximum cell edge", self.index_dmax)
-        self.index_btn = QPushButton("Index")
-        self.index_btn.clicked.connect(lambda: self._on_index(None))
-        form.addRow(self.index_btn)
-        v.addWidget(box)
-
+        spec = self.specs.index
+        self.index_threshold = create_double_spinbox_from_spec(spec.threshold)
+        self.index_dmax = create_optional_double_spinbox(spec.max_cell_edge)
+        self.index_btn = create_button(spec.index)
         self.solutions_table = QTableWidget(0, len(_SOLUTION_COLUMNS))
         self.solutions_table.setHorizontalHeaderLabels(_SOLUTION_COLUMNS)
         self.solutions_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -367,58 +309,34 @@ class ProcessingLabWindow(ProcessingWindowBase):
         self.solutions_table.horizontalHeader().setSectionResizeMode(
             len(_SOLUTION_COLUMNS) - 1, QHeaderView.ResizeMode.Stretch)
         self.solutions_table.itemSelectionChanged.connect(self._update_enabled)
-        v.addWidget(self.solutions_table, stretch=1)
         self.index_label = QLabel("")
         self.index_label.setWordWrap(True)
-        v.addWidget(self.index_label)
-        self.reindex_btn = QPushButton("Use the highlighted solution (re-index)")
-        self.reindex_btn.setToolTip("Re-run AUTOINDEX choosing this lattice (AUTOINDEX CHARACTER n)")
-        self.reindex_btn.clicked.connect(self._on_reindex_selected)
-        v.addWidget(self.reindex_btn)
-        self.tabs.addTab(page, "3. Index")
+        self.reindex_btn = create_button(spec.reindex)
+
+        box = build_group("Autoindexing (ProcessingLab DPS)", _form(
+            ("Spot I/σ threshold", self.index_threshold),
+            ("Maximum cell edge", self.index_dmax),
+            self.index_btn,
+        ))
+        v = _column(box, self.solutions_table, self.index_label, self.reindex_btn)
+        v.setStretchFactor(self.solutions_table, 1)  # the table takes the spare height
+        self.tabs.addTab(create_widget_with_layout(v), "3. Index")
 
     def _build_strategy_tab(self) -> None:
-        controls = QWidget()
-        v = QVBoxLayout(controls)
-        box = QGroupBox("Strategy (RunStep.STRATEGY): rotation for a target completeness")
-        form = QFormLayout(box)
+        spec = self.specs.strategy
         note = QLabel("From the indexing solution, the smallest rotation that records the completeness "
                       "wanted, as MOSFLM's STRATEGY does. Within Setup's frames to process it says which of "
                       "them to integrate; on a full turn it plans a collection.")
         note.setWordWrap(True)
-        form.addRow(note)
-        self.strategy_sg_combo = QComboBox()
-        self.strategy_sg_combo.setEditable(True)
-        self.strategy_sg_combo.setToolTip("Higher symmetry needs less rotation: use the space group you expect.")
-        form.addRow("Space group", self.strategy_sg_combo)
-        self.strategy_target = QDoubleSpinBox()
-        self.strategy_target.setRange(10.0, 100.0)
-        self.strategy_target.setDecimals(1)
-        self.strategy_target.setSuffix(" %")
-        self.strategy_target.setValue(99.0)
-        form.addRow("Completeness wanted", self.strategy_target)
-        self.strategy_anomalous = QCheckBox("Anomalous (both Friedel mates of each pair)")
-        form.addRow(self.strategy_anomalous)
-        self.strategy_within = QCheckBox("Within Setup's frames to process (otherwise plan on a full turn)")
-        self.strategy_within.setChecked(True)
-        form.addRow(self.strategy_within)
-        self.strategy_dmin = QDoubleSpinBox()
-        self.strategy_dmin.setRange(0.0, 20.0)
-        self.strategy_dmin.setDecimals(2)
-        self.strategy_dmin.setSuffix(" Å")
-        self.strategy_dmin.setSpecialValueText("detector edge")
-        form.addRow("High-resolution limit", self.strategy_dmin)
-        self.strategy_btn = QPushButton("Calculate strategy")
-        self.strategy_btn.clicked.connect(self._on_strategy)
-        form.addRow(self.strategy_btn)
-        v.addWidget(box)
-
-        result = QGroupBox("Result")
-        rv = QVBoxLayout(result)
+        self.strategy_sg_combo = create_editable_combo(spec.space_group)
+        self.strategy_target = create_double_spinbox_from_spec(spec.target)
+        self.strategy_anomalous = create_checkbox(spec.anomalous)
+        self.strategy_within = create_checkbox(spec.within)
+        self.strategy_dmin = create_optional_double_spinbox(spec.resolution)
+        self.strategy_btn = create_button(spec.calculate)
         self.strategy_label = QLabel("No strategy yet.")
         self.strategy_label.setWordWrap(True)
         self.strategy_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        rv.addWidget(self.strategy_label)
         self.strategy_shells = QTableWidget(0, 6)
         self.strategy_shells.setHorizontalHeaderLabels(
             ["d (Å)", "Possible", "Observed", "Complete", "Multiplicity", "Anomalous"])
@@ -426,166 +344,107 @@ class ProcessingLabWindow(ProcessingWindowBase):
         self.strategy_shells.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.strategy_shells.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.strategy_shells.setMaximumHeight(220)
-        rv.addWidget(self.strategy_shells)
-        self.strategy_use_btn = QPushButton("Integrate these frames")
-        self.strategy_use_btn.setToolTip("Set Setup's frames to process to the frames the strategy chose")
-        self.strategy_use_btn.clicked.connect(self._on_use_strategy_frames)
-        rv.addLayout(_row(self.strategy_use_btn))
-        v.addWidget(result)
-        v.addStretch(1)
+        self.strategy_use_btn = create_button(spec.use_frames)
+        self.strategy_chart = StrategyCanvas()
 
+        box = build_group("Strategy (RunStep.STRATEGY): rotation for a target completeness", _form(
+            note,
+            ("Space group", self.strategy_sg_combo),
+            ("Completeness wanted", self.strategy_target),
+            self.strategy_anomalous,
+            self.strategy_within,
+            ("High-resolution limit", self.strategy_dmin),
+            self.strategy_btn,
+        ))
+        result = build_group("Result", _column(self.strategy_label, self.strategy_shells,
+                                               _row(self.strategy_use_btn)))
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setWidget(controls)
-        self.strategy_chart = StrategyCanvas()
-        page = QSplitter(Qt.Orientation.Vertical)
-        page.addWidget(scroll)
-        page.addWidget(self.strategy_chart)
-        page.setSizes([420, 280])
+        scroll.setWidget(create_widget_with_layout(_column(box, result, stretch=True)))
+        page = create_splitter_with_items([scroll, self.strategy_chart], [420, 280])
         self.tabs.addTab(page, "4. Strategy")
 
     def _build_integrate_tab(self) -> None:
-        controls = QWidget()
-        v = QVBoxLayout(controls)
-        box = QGroupBox("Integration (ProcessingLab)")
-        form = QFormLayout(box)
-        self.space_group_combo = QComboBox()
-        self.space_group_combo.setEditable(True)
-        self.space_group_combo.setToolTip("Initial space group: any group of the chosen lattice. Pointless "
-                                          "(Symmetry tab) tests it after integration.")
-        form.addRow("Initial space group", self.space_group_combo)
-        self.integrate_btn = QPushButton("Integrate")
-        self.integrate_btn.clicked.connect(self._on_integrate)
-        form.addRow(self.integrate_btn)
-        v.addWidget(box)
-
-        defpix = QGroupBox("Ignored pixels (DEFPIX)")
-        dform = QFormLayout(defpix)
+        spec = self.specs.integrate
+        self.space_group_combo = create_editable_combo(spec.space_group)
+        self.integrate_btn = create_button(spec.integrate)
         note = QLabel("Shaded (beamstop), defective and hot pixels are found automatically. "
                       "Add regions and resolution ranges to ignore as well:")
         note.setWordWrap(True)
-        dform.addRow(note)
-        self.untrusted_edit = QPlainTextEdit()
-        self.untrusted_edit.setPlaceholderText("One per line, XDS pixels (x along fast, from 1), e.g.\n"
-                                               "RECTANGLE 1200 1300 1150 1250\n"
-                                               "ELLIPSE x1 x2 y1 y2   ·   QUADRILATERAL x1 y1 … x4 y4")
-        self.untrusted_edit.setMaximumHeight(72)
-        dform.addRow("Untrusted regions", self.untrusted_edit)
-        self.exclude_res_edit = QLineEdit()
-        self.exclude_res_edit.setPlaceholderText("e.g. 3.93 3.87, 2.70 2.64 (Å)")
-        dform.addRow("Exclude resolution", self.exclude_res_edit)
-        self.exclude_ice_check = QCheckBox("Exclude the usual ice-ring ranges")
-        dform.addRow(self.exclude_ice_check)
-        v.addWidget(defpix)
-
-        result = QGroupBox("Result")
-        rv = QVBoxLayout(result)
+        self.untrusted_edit = create_text_field(spec.untrusted)
+        self.exclude_res_edit = create_text_field(spec.exclude_resolution)
+        self.exclude_ice_check = create_checkbox(spec.exclude_ice)
         self.integrate_label = QLabel("Not integrated yet.")
         self.integrate_label.setWordWrap(True)
         self.integrate_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        rv.addWidget(self.integrate_label)
-        self.report_btn = QPushButton("Open report")
-        self.report_btn.clicked.connect(lambda: _open(self._s.integrated.directory / "process.md"
-                                                      if self._s.integrated else None))
-        self.mtz_view_btn = QPushButton("Open MTZ in viewer")
-        self.mtz_view_btn.clicked.connect(lambda: self._view_mtz(self._s.integrated.mtz
-                                                                if self._s.integrated else None))
-        rv.addLayout(_row(self.report_btn, self.mtz_view_btn))
-        self.show_defpix_check = QCheckBox("Show the ignored pixels on the image (magenta)")
-        self.show_defpix_check.setToolTip("DEFPIX's control image, defpix.cbf, over the main window's image")
-        self.show_defpix_check.toggled.connect(self._update_defpix_overlay)
-        rv.addWidget(self.show_defpix_check)
-        v.addWidget(result)
+        self.report_btn = create_button(spec.report)
+        self.mtz_view_btn = create_button(spec.view_mtz)
+        self.show_defpix_check = create_checkbox(spec.show_defpix)
+        self.refine_checks = {name: create_checkbox(check) for name, check in spec.refine.items()}
+        self.rerun_space_group = create_text_field(spec.rerun_space_group)
+        self.rerun_cell = create_text_field(spec.rerun_cell)
+        self.rerun_btn = create_button(spec.rerun)
+        self.charts = IntegrationChartsWidget()
 
-        rerun = QGroupBox("Re-integrate with the refined unit cell and detector parameters")
-        rr = QVBoxLayout(rerun)
-        checks = QHBoxLayout()
-        self.refine_checks: dict[str, QCheckBox] = {}
-        for name in REFINABLE_PARAMETERS:
-            box_ = QCheckBox(_REFINE_LABELS[name])
-            box_.setChecked(name in ("orientation", "mosaicity"))
-            self.refine_checks[name] = box_
-            checks.addWidget(box_)
-        checks.addStretch(1)
-        rr.addWidget(QLabel("Refine again (unticked parameters stay at their refined values):"))
-        rr.addLayout(checks)
-        rform = QFormLayout()
-        self.rerun_space_group = QLineEdit()
-        self.rerun_space_group.setPlaceholderText("optional; filled from Pointless when it is safe")
-        rform.addRow("Space group", self.rerun_space_group)
-        self.rerun_cell = QLineEdit()
-        self.rerun_cell.setPlaceholderText("optional a b c α β γ (default: the refined cell)")
-        rform.addRow("Unit cell", self.rerun_cell)
-        rr.addLayout(rform)
-        self.rerun_btn = QPushButton("Re-integrate")
-        self.rerun_btn.clicked.connect(self._on_reintegrate)
-        rr.addWidget(self.rerun_btn)
-        v.addWidget(rerun)
-        v.addStretch(1)
-
+        box = build_group("Integration (ProcessingLab)", _form(
+            ("Initial space group", self.space_group_combo),
+            self.integrate_btn,
+        ))
+        defpix = build_group("Ignored pixels (DEFPIX)", _form(
+            note,
+            ("Untrusted regions", self.untrusted_edit),
+            ("Exclude resolution", self.exclude_res_edit),
+            self.exclude_ice_check,
+        ))
+        result = build_group("Result", _column(self.integrate_label, _row(self.report_btn, self.mtz_view_btn),
+                                               self.show_defpix_check))
+        rerun = build_group("Re-integrate with the refined unit cell and detector parameters", _column(
+            QLabel("Refine again (unticked parameters stay at their refined values):"),
+            _row(*self.refine_checks.values()),
+            _form(("Space group", self.rerun_space_group), ("Unit cell", self.rerun_cell)),
+            self.rerun_btn,
+        ))
         # Controls above, live charts (profile, resolution bins) below.
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setWidget(controls)
-        self.charts = IntegrationChartsWidget()
-        page = QSplitter(Qt.Orientation.Vertical)
-        page.addWidget(scroll)
-        page.addWidget(self.charts)
-        page.setSizes([300, 380])
+        scroll.setWidget(create_widget_with_layout(_column(box, defpix, result, rerun, stretch=True)))
+        page = create_splitter_with_items([scroll, self.charts], [300, 380])
         self.tabs.addTab(page, "5. Integrate")
 
     def _build_symmetry_tab(self) -> None:
-        page = QWidget()
-        v = QVBoxLayout(page)
-        box = QGroupBox("Space group and twinning (CCP4 Pointless)")
-        bv = QVBoxLayout(box)
-        bv.addWidget(QLabel("Tests the Laue group from symmetry-related intensities, screw axes from "
-                            "systematic absences, and twinning (L-test), on the integrated reflections."))
-        self.pointless_btn = QPushButton("Run Pointless")
-        self.pointless_btn.clicked.connect(self._on_pointless)
-        bv.addWidget(self.pointless_btn)
+        spec = self.specs.symmetry
+        about = QLabel("Tests the Laue group from symmetry-related intensities, screw axes from "
+                       "systematic absences, and twinning (L-test), on the integrated reflections.")
+        self.pointless_btn = create_button(spec.run)
         self.pointless_label = QLabel("")
         self.pointless_label.setWordWrap(True)
         self.pointless_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        bv.addWidget(self.pointless_label)
-        self.use_sg_btn = QPushButton("Re-integrate in this space group…")
-        self.use_sg_btn.clicked.connect(self._on_use_pointless_space_group)
-        self.pointless_log_btn = QPushButton("Open log")
-        self.pointless_log_btn.clicked.connect(lambda: _open(self._s.pointless.log if self._s.pointless else None))
-        bv.addLayout(_row(self.use_sg_btn, self.pointless_log_btn))
-        v.addWidget(box)
-        v.addStretch(1)
-        self.tabs.addTab(page, "6. Symmetry")
+        self.use_sg_btn = create_button(spec.use_space_group)
+        self.pointless_log_btn = create_button(spec.log)
+
+        box = build_group("Space group and twinning (CCP4 Pointless)", _column(
+            about, self.pointless_btn, self.pointless_label, _row(self.use_sg_btn, self.pointless_log_btn)))
+        self.tabs.addTab(create_widget_with_layout(_column(box, stretch=True)), "6. Symmetry")
 
     def _build_scale_tab(self) -> None:
-        page = QWidget()
-        v = QVBoxLayout(page)
-        box = QGroupBox("Scaling and merging (CCP4 Aimless)")
-        form = QFormLayout(box)
-        self.aimless_dmin = QDoubleSpinBox()
-        self.aimless_dmin.setRange(0.0, 20.0)
-        self.aimless_dmin.setDecimals(2)
-        self.aimless_dmin.setSpecialValueText("all data")
-        self.aimless_dmin.setSuffix(" Å")
-        form.addRow("High-resolution cutoff", self.aimless_dmin)
-        self.aimless_anomalous = QCheckBox("Anomalous (keep I+ and I− separate)")
-        form.addRow(self.aimless_anomalous)
-        self.aimless_btn = QPushButton("Run Aimless")
-        self.aimless_btn.clicked.connect(self._on_aimless)
-        form.addRow(self.aimless_btn)
-        v.addWidget(box)
+        spec = self.specs.scale
+        self.aimless_dmin = create_optional_double_spinbox(spec.resolution)
+        self.aimless_anomalous = create_checkbox(spec.anomalous)
+        self.aimless_btn = create_button(spec.run)
         self.aimless_label = QLabel("")
         self.aimless_label.setWordWrap(True)
         self.aimless_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        v.addWidget(self.aimless_label)
-        self.merged_view_btn = QPushButton("Open merged MTZ in viewer")
-        self.merged_view_btn.clicked.connect(lambda: self._view_mtz(self._s.aimless.hklout
-                                                                   if self._s.aimless else None))
-        self.aimless_log_btn = QPushButton("Open log")
-        self.aimless_log_btn.clicked.connect(lambda: _open(self._s.aimless.log if self._s.aimless else None))
-        v.addLayout(_row(self.merged_view_btn, self.aimless_log_btn))
-        v.addStretch(1)
-        self.tabs.addTab(page, "7. Scale")
+        self.merged_view_btn = create_button(spec.view_merged)
+        self.aimless_log_btn = create_button(spec.log)
+
+        box = build_group("Scaling and merging (CCP4 Aimless)", _form(
+            ("High-resolution cutoff", self.aimless_dmin),
+            self.aimless_anomalous,
+            self.aimless_btn,
+        ))
+        self.tabs.addTab(create_widget_with_layout(
+            _column(box, self.aimless_label, _row(self.merged_view_btn, self.aimless_log_btn), stretch=True)),
+            "7. Scale")
 
     def _build_dimple_tab(self) -> None:
         self.dimple_tab = DimpleTab(
@@ -1247,6 +1106,23 @@ class ProcessingLabWindow(ProcessingWindowBase):
         """Pick up a newly opened image when the window is shown again."""
         super().showEvent(event)
         self.refresh_dataset()
+
+
+def _form(*rows: tuple[str, QWidget | QLayout] | QWidget | QLayout) -> QFormLayout:
+    """A form layout: each row is ``(label, field)``, or one widget or layout across both columns."""
+    form = QFormLayout()
+    for row in rows:
+        if isinstance(row, tuple):
+            form.addRow(*row)
+        else:
+            form.addRow(row)
+    return form
+
+
+def _column(*items: QWidget | QLayout, stretch: bool = False) -> QVBoxLayout:
+    """*items* stacked vertically (PicoUI) with the window's margins and spacing; *stretch*: space below."""
+    return create_layout_with_items(items=list(items), vertical=True, start_stretch=False, end_stretch=stretch,
+                                    margins=(9, 9, 9, 9), spacing=6)
 
 
 def _row(*widgets: QWidget, stretch_first: bool = False) -> QHBoxLayout:
