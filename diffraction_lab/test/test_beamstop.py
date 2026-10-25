@@ -88,6 +88,25 @@ def test_frame_groups_stop_at_target() -> None:
     assert np.isnan(groups[0][3, 3])
 
 
+def test_flare_beside_the_stop() -> None:
+    """Bright beam flare touching the shadow is flare; a bright patch far away is not."""
+    rng = np.random.default_rng(3)
+    yy, xx = np.indices((240, 300))
+    r = np.hypot(xx - BEAM[0], yy - BEAM[1])
+    background = 40.0 * np.exp(-r / 150.0) + 5.0
+    stop = (r <= 18.0) | ((np.abs(yy - BEAM[1]) <= 6) & (xx >= BEAM[0]))
+    lobe = np.hypot(xx - BEAM[0], yy - (BEAM[1] - 24.0)) <= 7.0
+    far = np.hypot(xx - 40.0, yy - 40.0) <= 7.0
+    background = np.where(stop, 0.03 * background, background)
+    background = np.where(lobe | far, 6.0 * background, background)
+    found = detect_beamstop([rng.poisson(background).astype(np.int32) for _ in range(3)], *BEAM)
+    assert found is not None and found.flare is not None
+    assert found.flare[lobe].mean() > 0.8
+    assert not found.flare[far].any()
+    assert not (found.flare & found.mask).any()
+    assert found.n_flare == int(found.flare.sum())
+
+
 def test_no_shadow_returns_none() -> None:
     """A detector with no beamstop gives no shadow."""
     assert detect_beamstop(_frames(shadow=False), *BEAM) is None
@@ -126,7 +145,7 @@ def test_canvas_and_session_toggle() -> None:
 
     QApplication.instance() or QApplication([])
     canvas = DiffractionImageCanvas()
-    canvas.set_beamstop(np.eye(8, dtype=bool))
+    canvas.set_beamstop(np.eye(8, dtype=bool), flare=np.fliplr(np.eye(8, dtype=bool)))
     assert canvas.has_beamstop() and canvas._show_beamstop is False
     canvas.set_beamstop_visible(True)
     assert canvas._show_beamstop is True

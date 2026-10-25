@@ -14,6 +14,12 @@ Fine-sliced data (an Eiger frame may hold 0.03 counts per pixel) has too few
 counts per pixel to tell shadow from background, so consecutive frames are
 first summed into groups (:func:`frame_groups`), and the median of the groups
 is binned until the smoothing kernel holds :data:`TARGET_KERNEL_COUNTS`.
+
+The opposite happens beside the stop: where the direct beam is not fully
+blocked it flares, leaving pixels far brighter than the rest of their ring.
+That flare is the bright region, joined to the shadow or the beam, above
+:data:`FLARE_FACTOR` × its ring's normal level (the median of its unshadowed
+pixels).
 """
 
 from __future__ import annotations
@@ -51,6 +57,13 @@ MAX_BIN_PX = 16
 #: A pixel can only be shadow if its ring's lit level puts this many counts
 #: in the smoothing kernel.
 MIN_LIT_COUNTS = 30.0
+#: A pixel is in the flare above this multiple of its ring's normal level.
+FLARE_FACTOR = 2.0
+#: …and its excess counts in the smoothing kernel must exceed this many σ.
+FLARE_SIGNIFICANCE = 5.0
+#: Flare must lie within this distance (pixels) of the shadow or the beam;
+#: the step from shadow to flare spans a smoothing width or so.
+FLARE_REACH_PX = 18
 #: Sum consecutive frames into a group until it averages this many counts per
 #: pixel, or :data:`GROUP_MAX_FRAMES` frames.
 GROUP_TARGET_COUNTS = 1.0
@@ -59,14 +72,18 @@ GROUP_MAX_FRAMES = 16
 
 @dataclass(frozen=True)
 class Beamstop:
-    """A detected beamstop shadow (image-pixel coordinates)."""
+    """A detected beamstop shadow and beam flare (image-pixel coordinates)."""
 
     #: ``True`` on shadowed pixels, the shape of the image.
     mask: np.ndarray
     #: Shadowed pixel count.
     n_pixels: int
-    #: Shadow bounding box ``(x0, y0, x1, y1)``, inclusive.
+    #: Bounding box ``(x0, y0, x1, y1)`` of shadow and flare, inclusive.
     bbox: tuple[int, int, int, int]
+    #: ``True`` where the unblocked beam flares beside the stop.
+    flare: np.ndarray | None = None
+    #: Flared pixel count.
+    n_flare: int = 0
 
 
 def valid_pixels(frame: np.ndarray) -> np.ndarray:
@@ -194,19 +211,31 @@ def _smooth(image: np.ndarray, sigma: float = SMOOTH_SIGMA_PX) -> np.ndarray:
     return out
 
 
-def lit_level(image: np.ndarray, radius: np.ndarray, window: int = LIT_WINDOW_PX) -> np.ndarray:
-    """Return each pixel's lit level: a high percentile of its ring.
+def ring_level(
+    image: np.ndarray,
+    radius: np.ndarray,
+    percentile: float,
+    *,
+    window: int,
+    use: np.ndarray | None = None,
+    reduce: str = "max",
+) -> np.ndarray:
+    """Return each pixel's ring level: a percentile of its 1-pixel ring.
 
-    Rings are 1 pixel wide; each ring's level is the largest percentile over
-    it and the rings up to *window* further out.
+    Each ring's level is then the maximum (or minimum) over it and the rings
+    up to *window* further out, so rings filled by the shadow (or the flare)
+    take their level from clearer rings outside.
 
     :param image: Smoothed image, NaN where invalid.
     :param radius: Distance of each pixel from the beam (pixels).
+    :param percentile: Percentile of each ring's pixels.
     :param window: Rings further out that also count (pixels).
-    :returns: Lit level per pixel (NaN where no ring data).
+    :param use: Pixels to include (default: every valid pixel).
+    :param reduce: ``"max"`` or ``"min"`` over the window.
+    :returns: Level per pixel (NaN where no ring data).
     """
     ring = radius.astype(np.int64)
-    valid = np.isfinite(image)
+    valid = np.isfinite(image) if use is None else np.isfinite(image) & use
     n_rings = int(ring.max()) + 1
     level = np.full(n_rings, np.nan)
     order = np.argsort(ring[valid], kind="stable")
@@ -215,12 +244,61 @@ def lit_level(image: np.ndarray, radius: np.ndarray, window: int = LIT_WINDOW_PX
     for r in range(n_rings):
         chunk = values[bounds[r]: bounds[r + 1]]
         if chunk.size:
-            level[r] = np.percentile(chunk, LIT_PERCENTILE)
-    # Reverse running maximum over a window of rings further out.
-    filled = np.nan_to_num(level, nan=-np.inf)
-    windowed = ndimage.maximum_filter1d(filled, size=window + 1, origin=-(window // 2))
+            level[r] = np.percentile(chunk, percentile)
+    # Running extreme over a window of rings further out.
+    if reduce == "max":
+        filled = np.nan_to_num(level, nan=-np.inf)
+        windowed = ndimage.maximum_filter1d(filled, size=window + 1, origin=-(window // 2))
+    else:
+        filled = np.nan_to_num(level, nan=np.inf)
+        windowed = ndimage.minimum_filter1d(filled, size=window + 1, origin=-(window // 2))
     windowed[~np.isfinite(windowed)] = np.nan
     return windowed[ring]
+
+
+def lit_level(image: np.ndarray, radius: np.ndarray, window: int = LIT_WINDOW_PX) -> np.ndarray:
+    """Return each pixel's lit level: the :data:`LIT_PERCENTILE` of its ring.
+
+    The largest level over the ring and those up to *window* further out.
+
+    :param image: Smoothed image, NaN where invalid.
+    :param radius: Distance of each pixel from the beam (pixels).
+    :param window: Rings further out that also count (pixels).
+    :returns: Lit level per pixel (NaN where no ring data).
+    """
+    return ring_level(image, radius, LIT_PERCENTILE, window=window, reduce="max")
+
+
+def _flare(
+    image: np.ndarray,
+    radius: np.ndarray,
+    shadow: np.ndarray,
+    *,
+    kernel_px: float,
+    window: int,
+    reach: int,
+    beam_disc: np.ndarray,
+) -> np.ndarray:
+    """Return the flare: bright regions joined to the shadow or the beam.
+
+    A ring's normal level is the median of its unshadowed pixels, taking the
+    smallest over the window further out (rings near the beam are flare).
+    """
+    valid = np.isfinite(image)
+    normal = ring_level(image, radius, 50.0, window=window, use=~shadow, reduce="min")
+    with np.errstate(invalid="ignore"):
+        excess = (image - normal) * kernel_px
+        noise = np.sqrt(np.maximum(normal, 0.0) * kernel_px)
+        bright = (
+            valid & ~shadow & (image > FLARE_FACTOR * normal)
+            & (excess > FLARE_SIGNIFICANCE * np.maximum(noise, 1.0))
+        )
+    labels, n = ndimage.label(bright)
+    if n == 0:
+        return bright
+    anchor = ndimage.binary_dilation(shadow, iterations=reach) | beam_disc
+    ids = np.unique(labels[anchor & bright])
+    return np.isin(labels, ids[ids > 0])
 
 
 def bin_size(level: float) -> int:
@@ -243,13 +321,13 @@ def detect_beamstop(
     beam_x: float,
     beam_y: float,
 ) -> Beamstop | None:
-    """Detect the beamstop shadow around the beam centre.
+    """Detect the beamstop shadow, and the beam flaring past it, at the beam centre.
 
     :param frames: One or more raw frames, or summed frame groups from
         :func:`frame_groups` (more remove more spots).
     :param beam_x: Beam centre x (pixels).
     :param beam_y: Beam centre y (pixels).
-    :returns: The shadow, or ``None`` if none covers the beam.
+    :returns: The shadow and flare, or ``None`` if neither is at the beam.
     """
     combined = median_frame(frames)
     full_shape = combined.shape
@@ -268,30 +346,40 @@ def detect_beamstop(
     # Gap pixels next to shadow join it, so a band crossing a gap stays whole.
     near = ndimage.binary_dilation(shadow, iterations=max(2, math.ceil(GAP_BRIDGE_PX / size)))
     labels, n = ndimage.label(shadow | (~valid & near))
-    if n == 0:
-        logger.info("Beamstop: no shadow found")
-        return None
     beam_disc = radius <= max(1.5, BEAM_SEARCH_PX / size)
-    ids = np.unique(labels[beam_disc & shadow])
+    ids = np.unique(labels[beam_disc & shadow]) if n else np.array([], dtype=int)
     ids = ids[ids > 0]
-    if ids.size == 0:
-        logger.info("Beamstop: no shadow within %.0f px of the beam", BEAM_SEARCH_PX)
-        return None
     # Holes (pixels invalid in some frame, the attenuated direct beam) are
     # part of the shadow too.
-    mask = ndimage.binary_fill_holes(np.isin(labels, ids) & valid)
+    mask = ndimage.binary_fill_holes(np.isin(labels, ids) & valid) if ids.size else np.zeros_like(valid)
+    flare = _flare(
+        image, radius, mask,
+        kernel_px=kernel_px,
+        window=max(2, LIT_WINDOW_PX // size),
+        reach=max(2, math.ceil(FLARE_REACH_PX / size)),
+        beam_disc=beam_disc,
+    )
+    mask &= ~flare
+    if not mask.any() and not flare.any():
+        logger.info("Beamstop: no shadow or flare within %.0f px of the beam", BEAM_SEARCH_PX)
+        return None
     if size > 1:
-        mask = np.repeat(np.repeat(mask, size, axis=0), size, axis=1)[: full_shape[0], : full_shape[1]]
-    ys, xs = np.nonzero(mask)
+        mask, flare = (
+            np.repeat(np.repeat(m, size, axis=0), size, axis=1)[: full_shape[0], : full_shape[1]]
+            for m in (mask, flare)
+        )
+    ys, xs = np.nonzero(mask | flare)
     found = Beamstop(
         mask=mask,
-        n_pixels=int(xs.size),
+        n_pixels=int(mask.sum()),
         bbox=(int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())),
+        flare=flare,
+        n_flare=int(flare.sum()),
     )
     x0, y0, x1, y1 = found.bbox
     logger.info(
-        "Beamstop: %d shadowed pixels, x %d–%d, y %d–%d (%.2f counts/pixel, %d px bins)",
-        found.n_pixels, x0, x1, y0, y1, level, size,
+        "Beamstop: %d shadowed and %d flared pixels, x %d–%d, y %d–%d (%.2f counts/pixel, %d px bins)",
+        found.n_pixels, found.n_flare, x0, x1, y0, y1, level, size,
     )
     return found
 

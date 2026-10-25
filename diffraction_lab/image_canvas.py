@@ -334,24 +334,32 @@ class DiffractionImageCanvas(ZoomableCanvas if _HAS_ZOOMABLE else QWidget):
         self,
         mask: np.ndarray | None,
         *,
+        flare: np.ndarray | None = None,
         color: tuple[int, int, int, int] = (255, 140, 0, 110),
+        flare_color: tuple[int, int, int, int] = (170, 80, 255, 120),
         visible: bool | None = None,
     ) -> None:
-        """Tint the beamstop shadow, outlined so its edge stays visible.
+        """Tint the beamstop shadow, and the beam flaring past it, with outlines.
 
         :param mask: Boolean shadow, ``(height, width)`` of the image; drawn
             only while the image has that size. ``None`` clears it.
-        :param color: RGBA tint of the shadow; the outline is opaque.
+        :param flare: Boolean flare of the same shape, or ``None``.
+        :param color: RGBA tint of the shadow; its outline is opaque.
+        :param flare_color: RGBA tint of the flare; its outline is opaque.
         :param visible: Show or hide it (``None``: unchanged).
         """
         if mask is None:
             self._beamstop_mask = QImage()
         else:
             mask = np.asarray(mask, dtype=bool)
-            edge = mask & ~ndimage.binary_erosion(mask, iterations=2)
             rgba = np.zeros((*mask.shape, 4), dtype=np.uint8)
-            rgba[mask] = color
-            rgba[edge] = (*color[:3], 255)
+            layers = [(mask, color)]
+            if flare is not None:
+                layers.append((np.asarray(flare, dtype=bool), flare_color))
+            for region, tint in layers:
+                edge = region & ~ndimage.binary_erosion(region, iterations=2)
+                rgba[region] = tint
+                rgba[edge] = (*tint[:3], 255)
             h, w = mask.shape
             self._beamstop_mask = QImage(rgba.data, w, h, 4 * w, QImage.Format.Format_RGBA8888).copy()
         if visible is not None:
