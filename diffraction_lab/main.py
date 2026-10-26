@@ -51,7 +51,19 @@ from PySide6.QtCore import Qt, QPoint, QSettings, QSize
 from diffraction_lab.beam import BeamParameters
 from diffraction_lab.cbf_header import CbfGeometry, read_cbf_geometry
 from diffraction_lab.detector import DetectorParameters
-from diffraction_lab.beamstop import DEFPIX_FRAMES, MIN_DETECT_FRAMES, defpix_frames, detect_beamstop, sweep_files
+from diffraction_lab.beamstop import (
+    DEFECTIVE,
+    DEFPIX_FRAMES,
+    DETECTOR_MASKED,
+    HOT,
+    MIN_DETECT_FRAMES,
+    DefpixClassification,
+    beamstop_from,
+    classify_frames,
+    defpix_frames,
+    masked_pixels,
+    sweep_files,
+)
 from diffraction_lab.image_canvas import DiffractionImageCanvas, build_ice_rings, build_resolution_rings
 from diffraction_lab.image_histogram import pixel_histogram, plot_pixel_histogram
 from diffraction_lab.indexing import IndexingGeometry, as_float
@@ -683,6 +695,10 @@ class DiffractionLabApp(QMainWindow):
         self.show_ice_rings = False
         self.show_beamstop = False
         self._beamstop_key: tuple | None = None
+        self.show_masked_pixels = False
+        self._masked_key: tuple | None = None
+        # (image, beam centre) → DEFPIX classification shared by both overlays.
+        self._defpix_cache: tuple[tuple, DefpixClassification | None] | None = None
         self.show_indexing_spots = True
         self._recent_files = RecentFilesManager()
         self._recent_sessions = RecentSessionsManager()
@@ -810,6 +826,18 @@ class DiffractionLabApp(QMainWindow):
             "Tint the pixels ProcessingLab's DEFPIX rejects: shaded (orange) and beam halo (violet)"
         )
         self._act_beamstop.toggled.connect(self.set_beamstop_shown)
+
+        self._act_masked_pixels = QAction(
+            _registry_icon(_icon_key("MASKED_PIXELS", "mdi.grid-off")),
+            "Show &masked pixels",
+            self,
+        )
+        self._act_masked_pixels.setCheckable(True)
+        self._act_masked_pixels.setChecked(self.show_masked_pixels)
+        self._act_masked_pixels.setStatusTip(
+            "Tint the pixels ProcessingLab never integrates (cyan): module gaps, bad, defective and hot pixels"
+        )
+        self._act_masked_pixels.toggled.connect(self.set_masked_pixels_shown)
 
         self._act_indexing_spots = QAction(
             _registry_icon(_icon_key("SPOTS", _icon_key("CHART_SCATTER_PLOT"))),
@@ -942,6 +970,7 @@ class DiffractionLabApp(QMainWindow):
         file_menu.addAction(self._act_rings)
         file_menu.addAction(self._act_ice_rings)
         file_menu.addAction(self._act_beamstop)
+        file_menu.addAction(self._act_masked_pixels)
         file_menu.addAction(self._act_indexing_spots)
         file_menu.addSeparator()
         file_menu.addAction(self._act_quit)
@@ -954,6 +983,7 @@ class DiffractionLabApp(QMainWindow):
         view_menu.addAction(self._act_rings)
         view_menu.addAction(self._act_ice_rings)
         view_menu.addAction(self._act_beamstop)
+        view_menu.addAction(self._act_masked_pixels)
         view_menu.addAction(self._act_indexing_spots)
         view_menu.addAction(self._act_defpix)
         view_menu.addSeparator()
@@ -1059,6 +1089,7 @@ class DiffractionLabApp(QMainWindow):
             show_rings=bool(self.show_rings),
             show_ice_rings=bool(self.show_ice_rings),
             show_beamstop=bool(self.show_beamstop),
+            show_masked_pixels=bool(self.show_masked_pixels),
             show_indexing_spots=bool(self.show_indexing_spots),
             image_inverted=bool(self.image_inverted),
             contrast=contrast,
@@ -1103,6 +1134,8 @@ class DiffractionLabApp(QMainWindow):
             self.set_ice_rings_shown(bool(state.show_ice_rings))
         if hasattr(self, "beamstop_checkbox") and hasattr(self, "_act_beamstop"):
             self.set_beamstop_shown(bool(state.show_beamstop))
+        if hasattr(self, "masked_pixels_checkbox") and hasattr(self, "_act_masked_pixels"):
+            self.set_masked_pixels_shown(bool(state.show_masked_pixels))
         self.show_indexing_spots = bool(state.show_indexing_spots)
         if hasattr(self, "_act_indexing_spots"):
             self._act_indexing_spots.blockSignals(True)
@@ -1184,10 +1217,13 @@ class DiffractionLabApp(QMainWindow):
             self.image_canvas.set_resolution_rings(None)
             self.image_canvas.set_ice_rings(None)
             self.image_canvas.set_beamstop(None)
+            self.image_canvas.set_masked_pixels(None)
             self.image_canvas.set_beam_center(None)
             self.image_canvas.set_image_pixmap(QPixmap(), reset_view=True)
             self.image_canvas.set_placeholder("No image loaded")
         self._beamstop_key = None
+        self._masked_key = None
+        self._defpix_cache = None
 
     def open_session_dialog(self) -> None:
         """Prompt for a ``.dlsession`` file and open it."""
@@ -1350,6 +1386,7 @@ class DiffractionLabApp(QMainWindow):
         toolbar.addAction(self._act_rings)
         toolbar.addAction(self._act_ice_rings)
         toolbar.addAction(self._act_beamstop)
+        toolbar.addAction(self._act_masked_pixels)
         toolbar.addAction(self._act_indexing_spots)
         toolbar.addSeparator()
         toolbar.addAction(self._act_zoom_in)
@@ -1490,9 +1527,16 @@ class DiffractionLabApp(QMainWindow):
         self.beamstop_checkbox = QCheckBox("Show beamstop")
         self.beamstop_checkbox.setIcon(_registry_icon(_icon_key("BEAMSTOP", "mdi.circle-slice-8")))
         self.beamstop_checkbox.setChecked(self.show_beamstop)
-        self.beamstop_checkbox.setStatusTip("Detect and tint the beamstop shadow (orange) and beam halo (violet)")
+        self.beamstop_checkbox.setStatusTip(self._act_beamstop.statusTip())
         self.beamstop_checkbox.toggled.connect(self.set_beamstop_shown)
         button_layout.addWidget(self.beamstop_checkbox)
+
+        self.masked_pixels_checkbox = QCheckBox("Show masked pixels")
+        self.masked_pixels_checkbox.setIcon(_registry_icon(_icon_key("MASKED_PIXELS", "mdi.grid-off")))
+        self.masked_pixels_checkbox.setChecked(self.show_masked_pixels)
+        self.masked_pixels_checkbox.setStatusTip(self._act_masked_pixels.statusTip())
+        self.masked_pixels_checkbox.toggled.connect(self.set_masked_pixels_shown)
+        button_layout.addWidget(self.masked_pixels_checkbox)
 
         self.indexing_spots_checkbox = QCheckBox("Show indexing spots")
         self.indexing_spots_checkbox.setIcon(
@@ -1629,31 +1673,55 @@ class DiffractionLabApp(QMainWindow):
             return [fabio.open(str(files[i])).data for i in defpix_frames(0, len(files) - 1, DEFPIX_FRAMES)]
         return [] if self._raw_frame is None else [self._raw_frame]
 
-    def _refresh_beamstop(self) -> None:
-        """Detect the beamstop shadow if shown and not yet found for this image and beam."""
+    def _defpix_key(self) -> tuple:
+        """Return what a DEFPIX classification depends on: the image and the beam centre."""
+        return (str(self.current_file), self.beam_parameters.center)
+
+    def _defpix_classification(self) -> DefpixClassification | None:
+        """Return DEFPIX's classification of this sweep, computed once per image and beam.
+
+        Without a beam centre the image centre stands in: it only moves the
+        resolution rings, which the detector masks do not depend on.
+
+        :returns: The classification, or ``None`` if the frames could not be read.
+        """
+        key = self._defpix_key()
+        if self._defpix_cache is not None and self._defpix_cache[0] == key:
+            return self._defpix_cache[1]
         center = self.beam_parameters.center
-        key = (str(self.current_file), center)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        result: DefpixClassification | None = None
+        try:
+            frames = self._beamstop_frames()
+            if center is None and frames:
+                h, w = np.asarray(frames[0]).shape
+                center = (0.5 * w, 0.5 * h)
+            if frames:
+                result = classify_frames(frames, float(center[0]), float(center[1]))
+        except (OSError, ValueError) as ex:
+            logging.warning("DEFPIX classification failed: %s", ex)
+        finally:
+            QApplication.restoreOverrideCursor()
+        self._defpix_cache = (key, result)
+        return result
+
+    def _refresh_beamstop(self) -> None:
+        """Find the beamstop shadow if shown and not yet found for this image and beam."""
+        key = self._defpix_key()
         if not self.show_beamstop or key == self._beamstop_key:
             return
         self._beamstop_key = key
-        if center is None:
+        if self.beam_parameters.center is None:
             self.image_canvas.set_beamstop(None)
             self.statusBar().showMessage("Beamstop: no beam centre to search from.", 5000)
             return
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        frames: list[np.ndarray] = []
-        try:
-            frames = self._beamstop_frames()
-            found = detect_beamstop(frames, float(center[0]), float(center[1]))
-        except (OSError, ValueError) as ex:
-            logging.warning("Beamstop detection failed: %s", ex)
-            found = None
-        finally:
-            QApplication.restoreOverrideCursor()
+        classification = self._defpix_classification()
+        found = None if classification is None else beamstop_from(classification)
+        n_frames = 0 if classification is None else classification.n_frames
         if found is None:
             self.image_canvas.set_beamstop(None)
-            if len(frames) < MIN_DETECT_FRAMES:
-                message = f"Beamstop: DEFPIX needs {MIN_DETECT_FRAMES} frames of the sweep, found {len(frames)}."
+            if n_frames < MIN_DETECT_FRAMES:
+                message = f"Beamstop: DEFPIX needs {MIN_DETECT_FRAMES} frames of the sweep, found {n_frames}."
             else:
                 message = "Beamstop: DEFPIX found no shaded or halo pixels."
             self.statusBar().showMessage(message, 5000)
@@ -1661,10 +1729,47 @@ class DiffractionLabApp(QMainWindow):
             self.image_canvas.set_beamstop(found.mask, halo=found.halo)
             x0, y0, x1, y1 = found.bbox
             self.statusBar().showMessage(
-                f"Beamstop (DEFPIX, {len(frames)} frames, {found.block_px} px blocks): "
+                f"Beamstop (DEFPIX, {n_frames} frames, {found.block_px} px blocks): "
                 f"{found.n_pixels} shaded and {found.n_halo} halo pixels, x {x0}–{x1}, y {y0}–{y1}.",
                 8000,
             )
+
+    def set_masked_pixels_shown(self, checked: bool) -> None:
+        """Show or hide masked pixels, keeping the checkbox and action in step.
+
+        They are classified the first time they are shown for an image.
+
+        :param checked: Whether masked pixels are drawn.
+        """
+        self.show_masked_pixels = bool(checked)
+        for widget in (self.masked_pixels_checkbox, self._act_masked_pixels):
+            if widget.isChecked() != self.show_masked_pixels:
+                widget.blockSignals(True)
+                widget.setChecked(self.show_masked_pixels)
+                widget.blockSignals(False)
+        self._refresh_masked_pixels()
+        self.image_canvas.set_masked_pixels_visible(self.show_masked_pixels)
+
+    def _refresh_masked_pixels(self) -> None:
+        """Classify masked pixels if shown and not yet done for this image and beam."""
+        key = self._defpix_key()
+        if not self.show_masked_pixels or key == self._masked_key:
+            return
+        self._masked_key = key
+        classification = self._defpix_classification()
+        if classification is None:
+            self.image_canvas.set_masked_pixels(None)
+            self.statusBar().showMessage("Masked pixels: no frames of the sweep to classify.", 5000)
+            return
+        status = classification.status
+        self.image_canvas.set_masked_pixels(masked_pixels(status))
+        counts = {name: int((status == code).sum())
+                  for name, code in (("masked by the detector", DETECTOR_MASKED),
+                                     ("defective", DEFECTIVE), ("hot", HOT))}
+        detail = ", ".join(f"{n:,} {name}" for name, n in counts.items())
+        self.statusBar().showMessage(
+            f"Masked pixels (DEFPIX, {classification.n_frames} frames, cyan): {detail}.", 8000
+        )
 
     def _on_indexing_spots_action_toggled(self, checked: bool) -> None:
         """Keep toolbar action and checkbox in sync for indexing spots."""
@@ -2405,6 +2510,7 @@ class DiffractionLabApp(QMainWindow):
             ice_rings = []
         self.image_canvas.set_ice_rings(ice_rings, visible=self.show_ice_rings)
         self._refresh_beamstop()
+        self._refresh_masked_pixels()
         self.image_canvas.set_resolution_rings(rings, visible=self.show_rings)
 
     def _update_beam_geometry_labels(self) -> None:

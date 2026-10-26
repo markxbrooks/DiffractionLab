@@ -8,12 +8,16 @@ import numpy as np
 import pytest
 
 from diffraction_lab.beamstop import (
+    DEFECTIVE,
     DEFPIX_FRAMES,
+    DETECTOR_MASKED,
     HALO,
     SHADED,
+    classify_frames,
     classify_pixels,
     defpix_frames,
     detect_beamstop,
+    masked_pixels,
     pixel_classes,
     pixel_sums,
     sweep_files,
@@ -142,6 +146,30 @@ def test_statuses_are_processinglab_codes() -> None:
     assert SHADED == 4 and HALO == 7
 
 
+def test_module_gaps_are_masked() -> None:
+    """Gap pixels (−1, or 16-bit 65535 at saturation 65535) are masked; lit pixels are not."""
+    found = classify_frames(_frames(), *BEAM)
+    masked = masked_pixels(found.status)
+    assert masked[160:167, :].all()  # −1 gap row
+    assert (found.status[160:167, :] == DETECTOR_MASKED).all()
+    assert not masked[50:100, 20:80].any()
+
+    sixteen = [np.clip(f, 0, 65534).astype(np.uint16) for f in _frames()]
+    for f in sixteen:
+        f[160:167, :] = 65535  # Eiger gap value equal to the saturation level
+    found = classify_frames(sixteen, *BEAM, saturation=65535, find_defects=False)
+    assert (found.status[160:167, :] == DEFECTIVE).all()  # overloaded in every frame
+    assert masked_pixels(found.status)[160:167, :].all()
+
+
+def test_masked_pixels_need_no_shading_frames() -> None:
+    """With one frame only the detector's own masks are known."""
+    found = classify_frames(_frames(n=1), *BEAM)
+    assert found.n_frames == 1 and found.block_px == 0
+    assert masked_pixels(found.status)[160:167, :].all()
+    assert not (found.status == SHADED).any()
+
+
 def test_sweep_files_in_frame_order(tmp_path: Path) -> None:
     """The images of the sweep, sorted, without other sweeps."""
     for i in (3, 1, 2):
@@ -169,5 +197,14 @@ def test_canvas_and_session_toggle() -> None:
     assert canvas._show_beamstop is True
     canvas.set_beamstop(None)
     assert not canvas.has_beamstop()
+    canvas.set_masked_pixels(np.eye(8, dtype=bool))
+    assert canvas.has_masked_pixels() and canvas._show_masked_pixels is False
+    canvas.set_masked_pixels_visible(True)
+    assert canvas._show_masked_pixels is True
+    canvas.set_masked_pixels(None)
+    assert not canvas.has_masked_pixels()
     assert viewer_from_dict(viewer_to_dict(ViewerState(show_beamstop=True))).show_beamstop is True
     assert viewer_from_dict({}).show_beamstop is False
+    restored = viewer_from_dict(viewer_to_dict(ViewerState(show_masked_pixels=True)))
+    assert restored.show_masked_pixels is True
+    assert viewer_from_dict({}).show_masked_pixels is False

@@ -26,6 +26,7 @@ class ViewerState:
     show_rings: bool = True
     show_ice_rings: bool = False
     show_beamstop: bool = False
+    show_masked_pixels: bool = False
     show_indexing_spots: bool = True
     image_inverted: bool = False
     contrast: int = 100

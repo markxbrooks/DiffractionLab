@@ -464,7 +464,27 @@ def classify_pixels(
     return status, s, halo_radius
 
 
-def detect_beamstop(
+#: Statuses ProcessingLab never integrates for reasons other than the
+#: beamstop: masked by the detector (gaps, bad pixels), overloaded in every
+#: sampled frame or flickering (defective), and hot.
+MASKED_STATUSES = (DETECTOR_MASKED, DEFECTIVE, HOT)
+
+
+@dataclass(frozen=True)
+class DefpixClassification:
+    """DEFPIX's verdict on every pixel of a sweep (see :func:`classify_frames`)."""
+
+    #: ProcessingLab ``PixelStatus`` per pixel, the shape of the image.
+    status: np.ndarray
+    #: Frames sampled.
+    n_frames: int
+    #: Edge of the shadow-test blocks (pixels); 0 if shading was not judged.
+    block_px: int = 0
+    #: Farthest halo pixel from the beam among regions at the beam (pixels).
+    halo_radius_px: float = 0.0
+
+
+def classify_frames(
     frames: Sequence[np.ndarray],
     beam_x: float,
     beam_y: float,
@@ -472,26 +492,52 @@ def detect_beamstop(
     saturation: float | None = None,
     row_scale: float = 1.0,
     find_defects: bool = True,
-) -> Beamstop | None:
-    """Return DEFPIX's shaded and halo pixels for *frames*.
+) -> DefpixClassification:
+    """Classify every pixel of *frames* as ProcessingLab's DEFPIX does.
+
+    With fewer than :data:`MIN_DETECT_FRAMES` frames only the detector's own
+    masks are known; shading, halo and defects need more.
 
     :param frames: The sampled frames, e.g. :data:`DEFPIX_FRAMES` picked by
-        :func:`defpix_frames`; at least :data:`MIN_DETECT_FRAMES`.
+        :func:`defpix_frames`.
     :param beam_x: Beam position along the fast axis (pixels), as
         ProcessingLab's ``BEAM`` x ÷ pixel size.
     :param beam_y: Beam position along the slow axis (pixels).
     :param saturation: The detector's overload level, or ``None`` if unknown.
     :param row_scale: Slow pixel size over fast pixel size.
-    :param find_defects: Exclude defective and hot pixels from the test.
-    :returns: The shaded and halo pixels, or ``None`` if there are neither.
+    :param find_defects: Look for defective and hot pixels.
+    :returns: The classification.
+    :raises ValueError: If *frames* is empty or the frames differ in shape.
     """
     sums = pixel_sums(frames, saturation)
-    if sums.n_frames < MIN_DETECT_FRAMES:
-        logger.info("Beamstop: DEFPIX needs %d frames, got %d", MIN_DETECT_FRAMES, sums.n_frames)
-        return None
     status, block_px, halo_radius = classify_pixels(
         sums, beam_x, beam_y, row_scale=row_scale, find_defects=find_defects
     )
+    return DefpixClassification(
+        status=status, n_frames=sums.n_frames, block_px=block_px, halo_radius_px=halo_radius
+    )
+
+
+def masked_pixels(status: np.ndarray) -> np.ndarray:
+    """Return the pixels with one of :data:`MASKED_STATUSES`.
+
+    :param status: ProcessingLab ``PixelStatus`` per pixel.
+    :returns: Boolean image.
+    """
+    return np.isin(status, MASKED_STATUSES)
+
+
+def beamstop_from(classification: DefpixClassification) -> Beamstop | None:
+    """Return the shaded and halo pixels of *classification*.
+
+    :param classification: From :func:`classify_frames`.
+    :returns: The shaded and halo pixels, or ``None`` if there are neither
+        (always with fewer than :data:`MIN_DETECT_FRAMES` frames).
+    """
+    if classification.n_frames < MIN_DETECT_FRAMES:
+        logger.info("Beamstop: DEFPIX needs %d frames, got %d", MIN_DETECT_FRAMES, classification.n_frames)
+        return None
+    status = classification.status
     mask = status == SHADED
     halo = status == HALO
     if not mask.any() and not halo.any():
@@ -504,15 +550,36 @@ def detect_beamstop(
         bbox=(int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())),
         halo=halo,
         n_halo=int(halo.sum()),
-        block_px=block_px,
-        halo_radius_px=halo_radius,
+        block_px=classification.block_px,
+        halo_radius_px=classification.halo_radius_px,
     )
     x0, y0, x1, y1 = found.bbox
     logger.info(
         "Beamstop: %d shaded and %d halo pixels, x %d–%d, y %d–%d (%d frames, %d px blocks)",
-        found.n_pixels, found.n_halo, x0, x1, y0, y1, sums.n_frames, block_px,
+        found.n_pixels, found.n_halo, x0, x1, y0, y1, classification.n_frames, classification.block_px,
     )
     return found
+
+
+def detect_beamstop(
+    frames: Sequence[np.ndarray],
+    beam_x: float,
+    beam_y: float,
+    *,
+    saturation: float | None = None,
+    row_scale: float = 1.0,
+    find_defects: bool = True,
+) -> Beamstop | None:
+    """Return DEFPIX's shaded and halo pixels for *frames*.
+
+    :func:`classify_frames` then :func:`beamstop_from`; the parameters are
+    those of :func:`classify_frames`.
+
+    :returns: The shaded and halo pixels, or ``None`` if there are neither.
+    """
+    return beamstop_from(classify_frames(
+        frames, beam_x, beam_y, saturation=saturation, row_scale=row_scale, find_defects=find_defects
+    ))
 
 
 def sweep_files(path: Path) -> list[Path]:

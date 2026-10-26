@@ -229,6 +229,8 @@ class DiffractionImageCanvas(ZoomableCanvas if _HAS_ZOOMABLE else QWidget):
         self._show_ice_rings = False
         self._beamstop_mask = QImage()
         self._show_beamstop = False
+        self._masked_pixels = QImage()
+        self._show_masked_pixels = False
         self._beam_center: tuple[float, float] | None = None
         self._show_beam_marker = True
         self._show_crosshair = True
@@ -378,6 +380,44 @@ class DiffractionImageCanvas(ZoomableCanvas if _HAS_ZOOMABLE else QWidget):
         """Whether a beamstop shadow is set."""
         return not self._beamstop_mask.isNull()
 
+    def set_masked_pixels(
+        self,
+        mask: np.ndarray | None,
+        *,
+        color: tuple[int, int, int, int] = (0, 200, 255, 150),
+        visible: bool | None = None,
+    ) -> None:
+        """Tint masked pixels: detector gaps, bad, defective and hot pixels.
+
+        :param mask: Boolean array, ``(height, width)`` of the image; drawn
+            only while the image has that size. ``None`` clears it.
+        :param color: RGBA tint.
+        :param visible: Show or hide it (``None``: unchanged).
+        """
+        if mask is None:
+            self._masked_pixels = QImage()
+        else:
+            mask = np.asarray(mask, dtype=bool)
+            rgba = np.zeros((*mask.shape, 4), dtype=np.uint8)
+            rgba[mask] = color
+            h, w = mask.shape
+            self._masked_pixels = QImage(rgba.data, w, h, 4 * w, QImage.Format.Format_RGBA8888).copy()
+        if visible is not None:
+            self._show_masked_pixels = bool(visible)
+        self.update()
+
+    def set_masked_pixels_visible(self, visible: bool) -> None:
+        """Show or hide the masked pixels without rebuilding them.
+
+        :param visible: Whether to draw them.
+        """
+        self._show_masked_pixels = bool(visible)
+        self.update()
+
+    def has_masked_pixels(self) -> bool:
+        """Whether masked pixels are set."""
+        return not self._masked_pixels.isNull()
+
     def set_ice_rings(
         self,
         rings: list[IceRing] | None,
@@ -493,6 +533,15 @@ class DiffractionImageCanvas(ZoomableCanvas if _HAS_ZOOMABLE else QWidget):
             painter.drawImage(
                 QRectF(min(x0, x1), min(y0, y1), dest_w, dest_h),
                 self._pixel_mask,
+                QRectF(0.0, 0.0, float(src_w), float(src_h)),
+            )
+
+        if (self._show_masked_pixels and not self._masked_pixels.isNull()
+                and self._masked_pixels.size() == self._pixmap.size()):
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
+            painter.drawImage(
+                QRectF(min(x0, x1), min(y0, y1), dest_w, dest_h),
+                self._masked_pixels,
                 QRectF(0.0, 0.0, float(src_w), float(src_h)),
             )
 
