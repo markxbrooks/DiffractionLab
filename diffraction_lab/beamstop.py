@@ -16,10 +16,11 @@ first summed into groups (:func:`frame_groups`), and the median of the groups
 is binned until the smoothing kernel holds :data:`TARGET_KERNEL_COUNTS`.
 
 The opposite happens beside the stop: where the direct beam is not fully
-blocked it flares, leaving pixels far brighter than the rest of their ring.
-That flare is the bright region, joined to the shadow or the beam, above
-:data:`FLARE_FACTOR` × its ring's normal level (the median of its unshadowed
-pixels).
+blocked it flares into a halo, pixels far brighter than the rest of their
+ring. The halo is the bright region, joined to the shadow or the beam, above
+:data:`HALO_FACTOR` × its ring's normal level (the median of its unshadowed
+pixels) by :data:`HALO_SIGNIFICANCE` σ. ProcessingLab's DEFPIX uses the same
+test (``find_beam_halo``) and leaves the halo out of integration.
 """
 
 from __future__ import annotations
@@ -57,13 +58,13 @@ MAX_BIN_PX = 16
 #: A pixel can only be shadow if its ring's lit level puts this many counts
 #: in the smoothing kernel.
 MIN_LIT_COUNTS = 30.0
-#: A pixel is in the flare above this multiple of its ring's normal level.
-FLARE_FACTOR = 2.0
+#: A pixel is in the halo above this multiple of its ring's normal level.
+HALO_FACTOR = 2.0
 #: …and its excess counts in the smoothing kernel must exceed this many σ.
-FLARE_SIGNIFICANCE = 5.0
-#: Flare must lie within this distance (pixels) of the shadow or the beam;
-#: the step from shadow to flare spans a smoothing width or so.
-FLARE_REACH_PX = 18
+HALO_SIGNIFICANCE = 5.0
+#: The halo must lie within this distance (pixels) of the shadow or the beam;
+#: the step from shadow to halo spans a smoothing width or so.
+HALO_REACH_PX = 18
 #: Sum consecutive frames into a group until it averages this many counts per
 #: pixel, or :data:`GROUP_MAX_FRAMES` frames.
 GROUP_TARGET_COUNTS = 1.0
@@ -72,18 +73,18 @@ GROUP_MAX_FRAMES = 16
 
 @dataclass(frozen=True)
 class Beamstop:
-    """A detected beamstop shadow and beam flare (image-pixel coordinates)."""
+    """A detected beamstop shadow and beam halo (image-pixel coordinates)."""
 
     #: ``True`` on shadowed pixels, the shape of the image.
     mask: np.ndarray
     #: Shadowed pixel count.
     n_pixels: int
-    #: Bounding box ``(x0, y0, x1, y1)`` of shadow and flare, inclusive.
+    #: Bounding box ``(x0, y0, x1, y1)`` of shadow and halo, inclusive.
     bbox: tuple[int, int, int, int]
-    #: ``True`` where the unblocked beam flares beside the stop.
-    flare: np.ndarray | None = None
-    #: Flared pixel count.
-    n_flare: int = 0
+    #: ``True`` where the unblocked beam flares beside the stop (the halo).
+    halo: np.ndarray | None = None
+    #: Halo pixel count.
+    n_halo: int = 0
 
 
 def valid_pixels(frame: np.ndarray) -> np.ndarray:
@@ -223,7 +224,7 @@ def ring_level(
     """Return each pixel's ring level: a percentile of its 1-pixel ring.
 
     Each ring's level is then the maximum (or minimum) over it and the rings
-    up to *window* further out, so rings filled by the shadow (or the flare)
+    up to *window* further out, so rings filled by the shadow (or the halo)
     take their level from clearer rings outside.
 
     :param image: Smoothed image, NaN where invalid.
@@ -269,7 +270,7 @@ def lit_level(image: np.ndarray, radius: np.ndarray, window: int = LIT_WINDOW_PX
     return ring_level(image, radius, LIT_PERCENTILE, window=window, reduce="max")
 
 
-def _flare(
+def find_halo(
     image: np.ndarray,
     radius: np.ndarray,
     shadow: np.ndarray,
@@ -279,10 +280,22 @@ def _flare(
     reach: int,
     beam_disc: np.ndarray,
 ) -> np.ndarray:
-    """Return the flare: bright regions joined to the shadow or the beam.
+    """Return the halo: bright regions joined to the shadow or the beam.
 
     A ring's normal level is the median of its unshadowed pixels, taking the
-    smallest over the window further out (rings near the beam are flare).
+    smallest over the window further out (rings near the beam are halo). A
+    pixel is halo above :data:`HALO_FACTOR` × that level when its excess in the
+    smoothing kernel exceeds :data:`HALO_SIGNIFICANCE` σ. ProcessingLab's
+    ``find_beam_halo`` (DEFPIX) is the same test.
+
+    :param image: Binned, smoothed counts, NaN where invalid.
+    :param radius: Distance of each bin from the beam (bins).
+    :param shadow: Shadowed bins.
+    :param kernel_px: Pixels in the smoothing kernel (its 2σ disc).
+    :param window: Rings further out that set a ring's normal level.
+    :param reach: Bins from the shadow a halo region may start.
+    :param beam_disc: Bins near enough the beam to anchor a halo region.
+    :returns: Halo bins.
     """
     valid = np.isfinite(image)
     normal = ring_level(image, radius, 50.0, window=window, use=~shadow, reduce="min")
@@ -290,8 +303,8 @@ def _flare(
         excess = (image - normal) * kernel_px
         noise = np.sqrt(np.maximum(normal, 0.0) * kernel_px)
         bright = (
-            valid & ~shadow & (image > FLARE_FACTOR * normal)
-            & (excess > FLARE_SIGNIFICANCE * np.maximum(noise, 1.0))
+            valid & ~shadow & (image > HALO_FACTOR * normal)
+            & (excess > HALO_SIGNIFICANCE * np.maximum(noise, 1.0))
         )
     labels, n = ndimage.label(bright)
     if n == 0:
@@ -321,13 +334,13 @@ def detect_beamstop(
     beam_x: float,
     beam_y: float,
 ) -> Beamstop | None:
-    """Detect the beamstop shadow, and the beam flaring past it, at the beam centre.
+    """Detect the beamstop shadow, and the beam halo past it, at the beam centre.
 
     :param frames: One or more raw frames, or summed frame groups from
         :func:`frame_groups` (more remove more spots).
     :param beam_x: Beam centre x (pixels).
     :param beam_y: Beam centre y (pixels).
-    :returns: The shadow and flare, or ``None`` if neither is at the beam.
+    :returns: The shadow and halo, or ``None`` if neither is at the beam.
     """
     combined = median_frame(frames)
     full_shape = combined.shape
@@ -352,34 +365,34 @@ def detect_beamstop(
     # Holes (pixels invalid in some frame, the attenuated direct beam) are
     # part of the shadow too.
     mask = ndimage.binary_fill_holes(np.isin(labels, ids) & valid) if ids.size else np.zeros_like(valid)
-    flare = _flare(
+    halo = find_halo(
         image, radius, mask,
         kernel_px=kernel_px,
         window=max(2, LIT_WINDOW_PX // size),
-        reach=max(2, math.ceil(FLARE_REACH_PX / size)),
+        reach=max(2, math.ceil(HALO_REACH_PX / size)),
         beam_disc=beam_disc,
     )
-    mask &= ~flare
-    if not mask.any() and not flare.any():
-        logger.info("Beamstop: no shadow or flare within %.0f px of the beam", BEAM_SEARCH_PX)
+    mask &= ~halo
+    if not mask.any() and not halo.any():
+        logger.info("Beamstop: no shadow or halo within %.0f px of the beam", BEAM_SEARCH_PX)
         return None
     if size > 1:
-        mask, flare = (
+        mask, halo = (
             np.repeat(np.repeat(m, size, axis=0), size, axis=1)[: full_shape[0], : full_shape[1]]
-            for m in (mask, flare)
+            for m in (mask, halo)
         )
-    ys, xs = np.nonzero(mask | flare)
+    ys, xs = np.nonzero(mask | halo)
     found = Beamstop(
         mask=mask,
         n_pixels=int(mask.sum()),
         bbox=(int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())),
-        flare=flare,
-        n_flare=int(flare.sum()),
+        halo=halo,
+        n_halo=int(halo.sum()),
     )
     x0, y0, x1, y1 = found.bbox
     logger.info(
-        "Beamstop: %d shadowed and %d flared pixels, x %d–%d, y %d–%d (%.2f counts/pixel, %d px bins)",
-        found.n_pixels, found.n_flare, x0, x1, y0, y1, level, size,
+        "Beamstop: %d shadowed and %d halo pixels, x %d–%d, y %d–%d (%.2f counts/pixel, %d px bins)",
+        found.n_pixels, found.n_halo, x0, x1, y0, y1, level, size,
     )
     return found
 

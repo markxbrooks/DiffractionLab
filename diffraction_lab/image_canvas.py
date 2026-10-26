@@ -334,18 +334,18 @@ class DiffractionImageCanvas(ZoomableCanvas if _HAS_ZOOMABLE else QWidget):
         self,
         mask: np.ndarray | None,
         *,
-        flare: np.ndarray | None = None,
+        halo: np.ndarray | None = None,
         color: tuple[int, int, int, int] = (255, 140, 0, 110),
-        flare_color: tuple[int, int, int, int] = (170, 80, 255, 120),
+        halo_color: tuple[int, int, int, int] = (170, 80, 255, 120),
         visible: bool | None = None,
     ) -> None:
-        """Tint the beamstop shadow, and the beam flaring past it, with outlines.
+        """Tint the beamstop shadow, and the beam halo past it, with outlines.
 
         :param mask: Boolean shadow, ``(height, width)`` of the image; drawn
             only while the image has that size. ``None`` clears it.
-        :param flare: Boolean flare of the same shape, or ``None``.
+        :param halo: Boolean halo of the same shape, or ``None``.
         :param color: RGBA tint of the shadow; its outline is opaque.
-        :param flare_color: RGBA tint of the flare; its outline is opaque.
+        :param halo_color: RGBA tint of the halo; its outline is opaque.
         :param visible: Show or hide it (``None``: unchanged).
         """
         if mask is None:
@@ -354,8 +354,8 @@ class DiffractionImageCanvas(ZoomableCanvas if _HAS_ZOOMABLE else QWidget):
             mask = np.asarray(mask, dtype=bool)
             rgba = np.zeros((*mask.shape, 4), dtype=np.uint8)
             layers = [(mask, color)]
-            if flare is not None:
-                layers.append((np.asarray(flare, dtype=bool), flare_color))
+            if halo is not None:
+                layers.append((np.asarray(halo, dtype=bool), halo_color))
             for region, tint in layers:
                 edge = region & ~ndimage.binary_erosion(region, iterations=2)
                 rgba[region] = tint

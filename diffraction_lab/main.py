@@ -806,7 +806,7 @@ class DiffractionLabApp(QMainWindow):
         )
         self._act_beamstop.setCheckable(True)
         self._act_beamstop.setChecked(self.show_beamstop)
-        self._act_beamstop.setStatusTip("Detect and tint the beamstop shadow (orange) and beam flare (violet)")
+        self._act_beamstop.setStatusTip("Detect and tint the beamstop shadow (orange) and beam halo (violet)")
         self._act_beamstop.toggled.connect(self.set_beamstop_shown)
 
         self._act_indexing_spots = QAction(
@@ -1488,7 +1488,7 @@ class DiffractionLabApp(QMainWindow):
         self.beamstop_checkbox = QCheckBox("Show beamstop")
         self.beamstop_checkbox.setIcon(_registry_icon(_icon_key("BEAMSTOP", "mdi.circle-slice-8")))
         self.beamstop_checkbox.setChecked(self.show_beamstop)
-        self.beamstop_checkbox.setStatusTip("Detect and tint the beamstop shadow (orange) and beam flare (violet)")
+        self.beamstop_checkbox.setStatusTip("Detect and tint the beamstop shadow (orange) and beam halo (violet)")
         self.beamstop_checkbox.toggled.connect(self.set_beamstop_shown)
         button_layout.addWidget(self.beamstop_checkbox)
 
@@ -1595,7 +1595,7 @@ class DiffractionLabApp(QMainWindow):
         self.image_canvas.set_ice_rings_visible(self.show_ice_rings)
 
     def set_beamstop_shown(self, checked: bool) -> None:
-        """Show or hide the beamstop shadow and flare, keeping the checkbox and action in step.
+        """Show or hide the beamstop shadow and halo, keeping the checkbox and action in step.
 
         They are detected the first time they are shown for an image.
 
@@ -1648,12 +1648,12 @@ class DiffractionLabApp(QMainWindow):
             QApplication.restoreOverrideCursor()
         if found is None:
             self.image_canvas.set_beamstop(None)
-            self.statusBar().showMessage("Beamstop: no shadow or flare found at the beam centre.", 5000)
+            self.statusBar().showMessage("Beamstop: no shadow or halo found at the beam centre.", 5000)
         else:
-            self.image_canvas.set_beamstop(found.mask, flare=found.flare)
+            self.image_canvas.set_beamstop(found.mask, halo=found.halo)
             x0, y0, x1, y1 = found.bbox
             self.statusBar().showMessage(
-                f"Beamstop: {found.n_pixels} shadowed and {found.n_flare} flared pixels, "
+                f"Beamstop: {found.n_pixels} shadowed and {found.n_halo} halo pixels, "
                 f"x {x0}–{x1}, y {y0}–{y1}.",
                 8000,
             )
