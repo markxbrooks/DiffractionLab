@@ -87,7 +87,7 @@ def format_record(record: RunRecord) -> str:
     if record.defpix_pixels:
         d = record.defpix_pixels
         ignored = [f"{d[k]:,} {label}" for k, label in (
-            ("shaded", "shaded"), ("defective", "defective"), ("hot", "hot"),
+            ("shaded", "shaded"), ("halo", "in the beam halo"), ("defective", "defective"), ("hot", "hot"),
             ("untrusted_region", "in untrusted regions"), ("excluded_resolution", "in excluded resolution"),
         ) if d.get(k)]
         rows.append(("Ignored pixels", ", ".join(ignored) or "none (besides the detector's gaps)"))

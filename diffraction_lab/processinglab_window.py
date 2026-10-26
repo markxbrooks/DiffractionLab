@@ -368,7 +368,7 @@ class ProcessingLabWindow(ProcessingWindowBase):
         spec = self.specs.integrate
         self.space_group_combo = create_editable_combo(spec.space_group)
         self.integrate_btn = create_button(spec.integrate)
-        note = QLabel("Shaded (beamstop), defective and hot pixels are found automatically. "
+        note = QLabel("Shaded (beamstop), beam-halo, defective and hot pixels are found automatically. "
                       "Add regions and resolution ranges to ignore as well:")
         note.setWordWrap(True)
         self.untrusted_edit = create_text_field(spec.untrusted)
