@@ -1,4 +1,4 @@
-"""Tests for beamstop shadow detection and its overlay."""
+"""Tests for the DEFPIX beamstop port and its overlay."""
 
 from __future__ import annotations
 
@@ -8,18 +8,22 @@ import numpy as np
 import pytest
 
 from diffraction_lab.beamstop import (
-    bin_size,
+    DEFPIX_FRAMES,
+    HALO,
+    SHADED,
+    classify_pixels,
+    defpix_frames,
     detect_beamstop,
-    frame_groups,
-    median_frame,
-    sibling_frames,
+    pixel_classes,
+    pixel_sums,
+    sweep_files,
 )
 
 BEAM = (150.0, 120.0)
 
 
-def _frames(*, shadow: bool = True, n: int = 3, scale: float = 1.0) -> list[np.ndarray]:
-    """Synthetic frames: falling background, a disc-and-arm shadow, a gap row, spots.
+def _frames(*, shadow: bool = True, n: int = DEFPIX_FRAMES, scale: float = 1.0) -> list[np.ndarray]:
+    """Synthetic frames: falling background, a disc-and-arm shadow, gaps, moving spots.
 
     *scale* multiplies the counts; 0.005 mimics fine-sliced Eiger frames.
     """
@@ -36,60 +40,39 @@ def _frames(*, shadow: bool = True, n: int = 3, scale: float = 1.0) -> list[np.n
         frame = rng.poisson(background).astype(np.int32)
         for _ in range(40):  # spots that move between frames
             sx, sy = rng.integers(5, 295), rng.integers(5, 235)
-            frame[sy - 1: sy + 2, sx - 1: sx + 2] += 500
+            frame[sy - 1: sy + 2, sx - 1: sx + 2] += rng.poisson(500 * scale, (3, 3))
         frame[160:167, :] = -1  # module gap
         frame[118:123, 250:254] = -1  # gap crossing the arm
         frames.append(frame)
     return frames
 
 
-def test_detects_disc_and_arm_across_gap() -> None:
-    """The disc and the whole arm are shadow; lit background is not."""
+def test_shades_disc_and_arm() -> None:
+    """Blocks over the disc and the arm are shaded; lit background and gaps are not."""
     found = detect_beamstop(_frames(), *BEAM)
-    assert found is not None
+    assert found is not None and found.block_px == 8
     mask = found.mask
     yy, xx = np.indices(mask.shape)
     r = np.hypot(xx - BEAM[0], yy - BEAM[1])
-    disc = r <= 14.0
-    assert mask[disc].mean() > 0.95
+    assert mask[r <= 10.0].mean() > 0.95
     arm = (np.abs(yy - BEAM[1]) <= 3) & (xx >= 175)
-    assert mask[arm].mean() > 0.9  # including beyond the gap at x 250–253
+    assert mask[arm].mean() > 0.9  # all but the gap pixels at x 250–253
+    assert not mask[118:123, 250:254].any()  # masked by the detector, not shaded
+    assert not mask[160:167, :].any()
     lit = (r >= 30.0) & (np.abs(yy - BEAM[1]) >= 15)
     assert mask[lit].mean() < 0.01
     assert found.bbox[2] >= 290  # the arm reaches the image edge
 
 
-def test_low_count_frames_grouped_and_binned() -> None:
-    """Fine-sliced frames (~0.1 count/pixel) still give the shadow, not noise."""
-    sweep = _frames(n=60, scale=0.005)
-    groups = frame_groups(lambda i: sweep[i], len(sweep), [0, 20, 40], max_frames=20)
-    assert len(groups) == 3
-    found = detect_beamstop(groups, *BEAM)
-    assert found is not None
-    yy, xx = np.indices(found.mask.shape)
-    r = np.hypot(xx - BEAM[0], yy - BEAM[1])
-    assert found.mask[r <= 12.0].mean() > 0.9
-    lit = (r >= 40.0) & (np.abs(yy - BEAM[1]) >= 25)
-    assert found.mask[lit].mean() < 0.02
-
-
-def test_bin_size_depends_on_counts() -> None:
-    """No binning with a few counts per pixel; coarser bins as counts fall."""
-    assert bin_size(2.0) == 1
-    assert 1 < bin_size(0.1) < bin_size(0.01) <= 16
-
-
-def test_frame_groups_stop_at_target() -> None:
-    """A group stops adding frames once it reaches the target counts."""
-    frames = [np.full((30, 30), 1, dtype=np.uint16) for _ in range(10)]
-    frames[0][3, 3] = np.iinfo(np.uint16).max  # Eiger gap value
-    groups = frame_groups(lambda i: frames[i], 10, [0, 5], target=3.0, max_frames=8)
-    assert [float(np.nanmax(g)) for g in groups] == [3.0, 3.0]
-    assert np.isnan(groups[0][3, 3])
+def test_low_counts_use_bigger_blocks() -> None:
+    """Fine-sliced frames (~0.1 count/pixel) are judged in blocks big enough to count."""
+    found = detect_beamstop(_frames(scale=0.005), *BEAM)
+    assert found is not None and found.block_px > 8
+    assert found.mask[int(BEAM[1]) + 5, int(BEAM[0])]
 
 
 def test_halo_beside_the_stop() -> None:
-    """Bright beam halo touching the shadow is halo; a bright patch far away is not."""
+    """A bright lobe touching the shadow is rejected; a bright patch far away is never halo."""
     rng = np.random.default_rng(3)
     yy, xx = np.indices((240, 300))
     r = np.hypot(xx - BEAM[0], yy - BEAM[1])
@@ -99,39 +82,74 @@ def test_halo_beside_the_stop() -> None:
     far = np.hypot(xx - 40.0, yy - 40.0) <= 7.0
     background = np.where(stop, 0.03 * background, background)
     background = np.where(lobe | far, 6.0 * background, background)
-    found = detect_beamstop([rng.poisson(background).astype(np.int32) for _ in range(3)], *BEAM)
+    frames = [rng.poisson(background).astype(np.int32) for _ in range(DEFPIX_FRAMES)]
+    found = detect_beamstop(frames, *BEAM)
     assert found is not None and found.halo is not None
-    assert found.halo[lobe].mean() > 0.8
+    # Too bright for its ring: shaded blocks (XDS value range) or halo.
+    assert (found.mask | found.halo)[lobe].mean() > 0.8
+    assert found.halo[lobe].any()
     assert not found.halo[far].any()
     assert not (found.halo & found.mask).any()
     assert found.n_halo == int(found.halo.sum())
 
 
 def test_no_shadow_returns_none() -> None:
-    """A detector with no beamstop gives no shadow."""
+    """A detector with no beamstop gives nothing to tint."""
     assert detect_beamstop(_frames(shadow=False), *BEAM) is None
 
 
-def test_median_frame_removes_moving_spots() -> None:
-    """Spots on one frame of three vanish from the median; gaps become NaN."""
-    a = np.full((4, 4), 10, dtype=np.int32)
-    b, c = a.copy(), a.copy()
-    b[1, 1] = 900
-    c[0, 0] = -1
-    med = median_frame([a, b, c])
-    assert med[1, 1] == 10
-    assert np.isnan(med[0, 0])
+def test_needs_three_frames() -> None:
+    """DEFPIX judges shading only with at least three sampled frames."""
+    assert detect_beamstop(_frames(n=2), *BEAM) is None
 
 
-def test_sibling_frames_spread_over_sweep(tmp_path: Path) -> None:
-    """Up to five images of the sweep, the given one first."""
-    for i in range(1, 21):
+def test_defpix_frames_match_processinglab() -> None:
+    """The frames ProcessingLab sampled on thaumatin (its DEFPIX control image headers)."""
+    assert defpix_frames(2, 31, 10) == [2, 5, 8, 12, 15, 18, 21, 25, 28, 31]
+    assert defpix_frames(2, 61, 10) == [2, 9, 15, 22, 28, 35, 41, 48, 54, 61]
+    assert defpix_frames(1, 4, 10) == [1, 2, 3, 4]
+    assert defpix_frames(5, 4, 10) == []
+
+
+def test_pixel_classes_follow_processinglab_sentinels() -> None:
+    """Negative is masked; all-ones is masked at 32 bits but overloaded at 16 bits."""
+    sixteen = np.array([0, 5, 65535], dtype=np.uint16)
+    valid, over = pixel_classes(sixteen, saturation=65535)
+    assert valid.tolist() == [True, True, False] and over.tolist() == [False, False, True]
+    thirty_two = np.array([7, np.iinfo(np.uint32).max], dtype=np.uint32)
+    valid, over = pixel_classes(thirty_two, saturation=1_000_000)
+    assert valid.tolist() == [True, False] and not over.any()
+    valid, _ = pixel_classes(np.array([-1, -2, 3], dtype=np.int32))
+    assert valid.tolist() == [False, False, True]
+
+
+def test_background_drops_each_pixels_largest_value() -> None:
+    """A spot in one sampled frame does not raise the background."""
+    frames = [np.full((2, 2), v, dtype=np.int32) for v in (1, 2, 100)]
+    frames[0][0, 0] = -1
+    sums = pixel_sums(frames)
+    background = sums.background()
+    assert background[1, 1] == pytest.approx(1.5)
+    assert background[0, 0] == pytest.approx(2.0)  # one value left after dropping 100
+
+
+def test_statuses_are_processinglab_codes() -> None:
+    """Shaded and halo carry ProcessingLab's PixelStatus values."""
+    status, block_px, _ = classify_pixels(pixel_sums(_frames()), *BEAM)
+    assert block_px == 8
+    assert (status == SHADED).any()
+    assert set(np.unique(status)) <= {0, 1, 4, 5, 6, 7}
+    assert SHADED == 4 and HALO == 7
+
+
+def test_sweep_files_in_frame_order(tmp_path: Path) -> None:
+    """The images of the sweep, sorted, without other sweeps."""
+    for i in (3, 1, 2):
         (tmp_path / f"x_1_{i:04d}.cbf").touch()
     (tmp_path / "other_0001.cbf").touch()
-    picks = sibling_frames(tmp_path / "x_1_0005.cbf", 5)
-    assert picks[0].name == "x_1_0005.cbf"
-    assert len(picks) == 5 and len(set(picks)) == 5
-    assert all(p.name.startswith("x_1_") for p in picks)
+    assert [p.name for p in sweep_files(tmp_path / "x_1_0002.cbf")] == [
+        "x_1_0001.cbf", "x_1_0002.cbf", "x_1_0003.cbf",
+    ]
 
 
 def test_canvas_and_session_toggle() -> None:

@@ -51,7 +51,7 @@ from PySide6.QtCore import Qt, QPoint, QSettings, QSize
 from diffraction_lab.beam import BeamParameters
 from diffraction_lab.cbf_header import CbfGeometry, read_cbf_geometry
 from diffraction_lab.detector import DetectorParameters
-from diffraction_lab.beamstop import GROUP_MAX_FRAMES, detect_beamstop, frame_groups, sibling_frames
+from diffraction_lab.beamstop import DEFPIX_FRAMES, MIN_DETECT_FRAMES, defpix_frames, detect_beamstop, sweep_files
 from diffraction_lab.image_canvas import DiffractionImageCanvas, build_ice_rings, build_resolution_rings
 from diffraction_lab.image_histogram import pixel_histogram, plot_pixel_histogram
 from diffraction_lab.indexing import IndexingGeometry, as_float
@@ -806,7 +806,9 @@ class DiffractionLabApp(QMainWindow):
         )
         self._act_beamstop.setCheckable(True)
         self._act_beamstop.setChecked(self.show_beamstop)
-        self._act_beamstop.setStatusTip("Detect and tint the beamstop shadow (orange) and beam halo (violet)")
+        self._act_beamstop.setStatusTip(
+            "Tint the pixels ProcessingLab's DEFPIX rejects: shaded (orange) and beam halo (violet)"
+        )
         self._act_beamstop.toggled.connect(self.set_beamstop_shown)
 
         self._act_indexing_spots = QAction(
@@ -1611,20 +1613,20 @@ class DiffractionLabApp(QMainWindow):
         self.image_canvas.set_beamstop_visible(self.show_beamstop)
 
     def _beamstop_frames(self) -> list[np.ndarray]:
-        """Return up to five frames, or frame groups, of the sweep for shadow detection.
+        """Return the frames ProcessingLab's DEFPIX would sample from this sweep.
 
-        An HDF5 sweep is often fine-sliced with few counts per frame, so each
-        of five evenly spaced starts sums consecutive frames into a group.
+        :data:`DEFPIX_FRAMES` frames spread evenly over the whole sweep, first
+        and last included, as PROCESS samples them.
 
-        :returns: Raw frames, or summed groups, spread over the sweep.
+        :returns: Raw frames (fewer than :data:`MIN_DETECT_FRAMES` if the sweep
+            is that short).
         """
         if self.dataset is not None:
             n = int(self.dataset.shape[0])
-            span = max(0, n - GROUP_MAX_FRAMES)
-            starts = sorted({int(i) for i in np.linspace(0, span, num=min(5, n)).round()})
-            return frame_groups(lambda i: np.asarray(self.dataset[i]), n, starts)
+            return [np.asarray(self.dataset[i]) for i in defpix_frames(0, n - 1, DEFPIX_FRAMES)]
         if self.current_file and str(self.current_file).lower().endswith(".cbf"):
-            return [fabio.open(str(p)).data for p in sibling_frames(Path(self.current_file))]
+            files = sweep_files(Path(self.current_file))
+            return [fabio.open(str(files[i])).data for i in defpix_frames(0, len(files) - 1, DEFPIX_FRAMES)]
         return [] if self._raw_frame is None else [self._raw_frame]
 
     def _refresh_beamstop(self) -> None:
@@ -1639,8 +1641,10 @@ class DiffractionLabApp(QMainWindow):
             self.statusBar().showMessage("Beamstop: no beam centre to search from.", 5000)
             return
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        frames: list[np.ndarray] = []
         try:
-            found = detect_beamstop(self._beamstop_frames(), float(center[0]), float(center[1]))
+            frames = self._beamstop_frames()
+            found = detect_beamstop(frames, float(center[0]), float(center[1]))
         except (OSError, ValueError) as ex:
             logging.warning("Beamstop detection failed: %s", ex)
             found = None
@@ -1648,13 +1652,17 @@ class DiffractionLabApp(QMainWindow):
             QApplication.restoreOverrideCursor()
         if found is None:
             self.image_canvas.set_beamstop(None)
-            self.statusBar().showMessage("Beamstop: no shadow or halo found at the beam centre.", 5000)
+            if len(frames) < MIN_DETECT_FRAMES:
+                message = f"Beamstop: DEFPIX needs {MIN_DETECT_FRAMES} frames of the sweep, found {len(frames)}."
+            else:
+                message = "Beamstop: DEFPIX found no shaded or halo pixels."
+            self.statusBar().showMessage(message, 5000)
         else:
             self.image_canvas.set_beamstop(found.mask, halo=found.halo)
             x0, y0, x1, y1 = found.bbox
             self.statusBar().showMessage(
-                f"Beamstop: {found.n_pixels} shadowed and {found.n_halo} halo pixels, "
-                f"x {x0}–{x1}, y {y0}–{y1}.",
+                f"Beamstop (DEFPIX, {len(frames)} frames, {found.block_px} px blocks): "
+                f"{found.n_pixels} shaded and {found.n_halo} halo pixels, x {x0}–{x1}, y {y0}–{y1}.",
                 8000,
             )
 

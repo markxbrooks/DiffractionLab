@@ -1,26 +1,25 @@
-"""Beamstop shadow detection.
+"""Beamstop shadow and beam halo, as ProcessingLab's DEFPIX finds them.
 
-MOSFLM's ``BACKSTOP AUTO`` keeps the lowest value of each pixel over a few
-images (spots move, the shadow does not), smooths, finds the edge of a
-circular backstop and then a straight arm. Real shadows are not always a disc
-on an arm (a rod across the detector casts a band), so the shadow here is
-found as XDS DEFPIX finds shaded regions: pixels much darker than the lit part
-of their resolution ring. The shadow is the connected region that covers the
-beam, bridged across detector gaps. Frames are combined by their median
-rather than MOSFLM's minimum: it removes spots just as well, but keeps the
-level of a weak background that the minimum drives to zero.
+The viewer tints exactly the pixels ProcessingLab leaves out of integration
+for the beamstop, so a wrong beam centre, axis convention or threshold shows
+up as a tint that misses the shadow on the image. This module is a port of
+ProcessingLab's ``run_defpix`` (``src/diffraction/Defpix.cpp``); keep the two
+in step.
 
-Fine-sliced data (an Eiger frame may hold 0.03 counts per pixel) has too few
-counts per pixel to tell shadow from background, so consecutive frames are
-first summed into groups (:func:`frame_groups`), and the median of the groups
-is binned until the smoothing kernel holds :data:`TARGET_KERNEL_COUNTS`.
+DEFPIX samples :data:`DEFPIX_FRAMES` frames spread over the sweep
+(:func:`defpix_frames`). Each pixel's background is its mean over them without
+its largest value, so a spot crossing it in one sampled frame does not count.
+Square blocks, sized so a typical block holds :data:`SHADOW_MIN_COUNTS`
+counts, are compared with the median block of their resolution ring, as the
+XDS ``VALUE_RANGE_FOR_TRUSTED_DETECTOR_PIXELS`` test: a block outside
+:data:`VALUE_RANGE_LOW`–:data:`VALUE_RANGE_HIGH` (× 10⁻⁴ of its ring) is
+shaded, wherever it lies. A ring wholly in shadow is judged against the
+brightest ring median up to 64 px further out.
 
-The opposite happens beside the stop: where the direct beam is not fully
-blocked it flares into a halo, pixels far brighter than the rest of their
-ring. The halo is the bright region, joined to the shadow or the beam, above
-:data:`HALO_FACTOR` × its ring's normal level (the median of its unshadowed
-pixels) by :data:`HALO_SIGNIFICANCE` σ. ProcessingLab's DEFPIX uses the same
-test (``find_beam_halo``) and leaves the halo out of integration.
+The beam halo, where the unblocked beam flares beside the stop, is found by
+:func:`find_beam_halo`: binned, smoothed counts above :data:`HALO_FACTOR` ×
+their ring's normal level by :data:`HALO_SIGNIFICANCE` σ, in regions that
+touch the beam or the shadow.
 """
 
 from __future__ import annotations
@@ -28,7 +27,7 @@ from __future__ import annotations
 import logging
 import math
 import re
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -37,350 +36,467 @@ from scipy import ndimage
 
 logger = logging.getLogger(__name__)
 
-#: Gaussian smoothing of the combined image (pixels).
-SMOOTH_SIGMA_PX = 3.0
-#: A pixel is in shadow below this fraction of its ring's lit level.
-SHADOW_FRACTION = 0.4
-#: Percentile of a resolution ring taken as its lit level.
-LIT_PERCENTILE = 75.0
-#: Rings this far out (pixels) also set a ring's lit level, so rings wholly
-#: inside the shadow still compare against lit pixels.
-LIT_WINDOW_PX = 100
-#: Shadow pixels within this distance (pixels) bridge a detector gap.
-GAP_BRIDGE_PX = 10
-#: The shadow must come within this distance (pixels) of the beam centre.
-BEAM_SEARCH_PX = 15.0
-#: Bin the combined image until the smoothing kernel (its 2σ disc) holds
-#: about this many counts.
-TARGET_KERNEL_COUNTS = 100.0
-#: Largest bin (pixels on a side).
-MAX_BIN_PX = 16
-#: A pixel can only be shadow if its ring's lit level puts this many counts
-#: in the smoothing kernel.
-MIN_LIT_COUNTS = 30.0
-#: A pixel is in the halo above this multiple of its ring's normal level.
+# ProcessingLab ``DefpixSettings`` defaults.
+#: Frames sampled across the sweep (PROCESS; FINDSPOTS samples 5).
+DEFPIX_FRAMES = 10
+#: Shading, hot and defective pixels need at least this many sampled frames.
+MIN_DETECT_FRAMES = 3
+#: XDS ``VALUE_RANGE_FOR_TRUSTED_DETECTOR_PIXELS``: block ÷ ring × 10⁴.
+VALUE_RANGE_LOW = 7000.0
+VALUE_RANGE_HIGH = 30000.0
+#: A block is judged only with this many counts over the sampled frames.
+SHADOW_MIN_COUNTS = 400.0
+#: Block edge limits (pixels).
+MIN_BLOCK_PX = 8
+MAX_BLOCK_PX = 32
+#: A ring wholly in shadow is compared with rings up to this far out (pixels).
+SHADED_RING_REACH_PX = 64
+#: Hot: every sampled frame at least this many counts and this × its ring.
+HOT_MIN_COUNTS = 10.0
+HOT_FACTOR = 20.0
+#: Halo thresholds (``halo_*`` in ``DefpixSettings``).
 HALO_FACTOR = 2.0
-#: …and its excess counts in the smoothing kernel must exceed this many σ.
 HALO_SIGNIFICANCE = 5.0
-#: The halo must lie within this distance (pixels) of the shadow or the beam;
-#: the step from shadow to halo spans a smoothing width or so.
-HALO_REACH_PX = 18
-#: Sum consecutive frames into a group until it averages this many counts per
-#: pixel, or :data:`GROUP_MAX_FRAMES` frames.
-GROUP_TARGET_COUNTS = 1.0
-GROUP_MAX_FRAMES = 16
+HALO_WINDOW_PX = 100
+HALO_SMOOTH_PX = 3.0
+HALO_KERNEL_COUNTS = 100.0
+HALO_MAX_BIN_PX = 16
+HALO_BEAM_PX = 15.0
+HALO_REACH_PX = 18.0
+
+# ProcessingLab ``PixelStatus`` values.
+TRUSTED = 0
+DETECTOR_MASKED = 1
+SHADED = 4
+DEFECTIVE = 5
+HOT = 6
+HALO = 7
 
 
 @dataclass(frozen=True)
 class Beamstop:
-    """A detected beamstop shadow and beam halo (image-pixel coordinates)."""
+    """DEFPIX's shaded and halo pixels (image-pixel coordinates)."""
 
-    #: ``True`` on shadowed pixels, the shape of the image.
+    #: ``True`` on shaded pixels (DEFPIX ``Shaded``), the shape of the image.
     mask: np.ndarray
-    #: Shadowed pixel count.
+    #: Shaded pixel count.
     n_pixels: int
-    #: Bounding box ``(x0, y0, x1, y1)`` of shadow and halo, inclusive.
+    #: Bounding box ``(x0, y0, x1, y1)`` of shaded and halo pixels, inclusive.
     bbox: tuple[int, int, int, int]
-    #: ``True`` where the unblocked beam flares beside the stop (the halo).
+    #: ``True`` on halo pixels (DEFPIX ``Halo``), or ``None``.
     halo: np.ndarray | None = None
     #: Halo pixel count.
     n_halo: int = 0
+    #: Edge of the blocks the shadow test judged (pixels).
+    block_px: int = 0
+    #: Farthest halo pixel from the beam among regions at the beam (pixels).
+    halo_radius_px: float = 0.0
 
 
-def valid_pixels(frame: np.ndarray) -> np.ndarray:
-    """Return ``True`` where a pixel holds data.
+@dataclass(frozen=True)
+class PixelSums:
+    """Per-pixel statistics over the sampled frames (ProcessingLab ``PixelSums``)."""
 
-    Negative values (Pilatus gaps and bad pixels) and the integer dtype's
-    maximum (Eiger module gaps) are invalid.
+    sum: np.ndarray
+    max: np.ndarray
+    min: np.ndarray
+    n_valid: np.ndarray
+    n_overloaded: np.ndarray
+    n_frames: int
+
+    def background(self) -> np.ndarray:
+        """Return each pixel's mean per frame without its largest value; −1 if none.
+
+        In float32, as ProcessingLab: block means are quantised, so ties at the
+        thresholds are exact and the rounding must match.
+
+        :returns: Float32 image.
+        """
+        n = self.n_valid
+        with np.errstate(invalid="ignore", divide="ignore"):
+            out = np.where(n > 1, (self.sum - self.max) / np.maximum(n - 1, 1).astype(np.float32), self.sum)
+        return np.where(n == 0, np.float32(-1.0), out).astype(np.float32)
+
+
+def pixel_classes(frame: np.ndarray, saturation: float | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """Return which pixels hold counts and which are overloaded.
+
+    As ProcessingLab's readers: negative values (Pilatus gaps, bad pixels) are
+    masked. An unsigned all-ones value (DECTRIS "no valid value") is masked
+    when it is 32-bit or above *saturation*; otherwise a gap and a saturated
+    pixel are the same value, and it is overloaded. Values at or above
+    *saturation* are overloaded.
 
     :param frame: Raw detector frame.
-    :returns: Boolean mask of measured pixels.
+    :param saturation: The detector's overload level, or ``None`` if unknown.
+    :returns: ``(valid, overloaded)`` boolean images.
     """
-    valid = np.isfinite(frame) & (frame >= 0)
-    if np.issubdtype(frame.dtype, np.integer):
-        valid &= frame < np.iinfo(frame.dtype).max
-    return valid
+    data = np.asarray(frame)
+    masked = ~np.isfinite(data) | (data < 0)
+    if np.issubdtype(data.dtype, np.unsignedinteger):
+        all_ones = np.iinfo(data.dtype).max
+        if data.dtype.itemsize >= 4 or saturation is None or saturation < all_ones:
+            masked |= data == all_ones
+    overloaded = ~masked & (data >= saturation) if saturation else np.zeros(data.shape, dtype=bool)
+    return ~masked & ~overloaded, overloaded
 
 
-def median_frame(frames: Iterable[np.ndarray]) -> np.ndarray:
-    """Return the per-pixel median over *frames*, with invalid pixels as NaN.
+def pixel_sums(frames: Sequence[np.ndarray], saturation: float | None = None) -> PixelSums:
+    """Accumulate :class:`PixelSums` over *frames*, one frame at a time.
 
     :param frames: Raw frames of one shape.
-    :returns: Float image; NaN where any frame is invalid.
-    :raises ValueError: If *frames* is empty.
+    :param saturation: The detector's overload level, or ``None`` if unknown.
+    :returns: The statistics.
+    :raises ValueError: If *frames* is empty or the frames differ in shape.
     """
-    stack = [np.where(valid_pixels(f), f, np.nan).astype(np.float32) for f in frames]
-    if not stack:
-        raise ValueError("No frames to combine")
-    return np.median(np.stack(stack), axis=0).astype(np.float64)
-
-
-def sum_frames(frames: Iterable[np.ndarray]) -> np.ndarray:
-    """Return the per-pixel sum of *frames*, with invalid pixels as NaN.
-
-    :param frames: Raw frames of one shape.
-    :returns: Float image; NaN where any frame is invalid.
-    :raises ValueError: If *frames* is empty.
-    """
-    total: np.ndarray | None = None
+    acc: dict[str, np.ndarray] | None = None
+    n_frames = 0
     for frame in frames:
-        data = np.where(valid_pixels(frame), frame, np.nan).astype(np.float32)
-        total = data if total is None else total + data
-    if total is None:
-        raise ValueError("No frames to sum")
+        data = np.asarray(frame)
+        valid, overloaded = pixel_classes(data, saturation)
+        values = np.where(valid, data, 0).astype(np.float32)
+        if acc is None:
+            acc = {
+                "sum": np.zeros(data.shape, dtype=np.float32),
+                "max": np.full(data.shape, -np.inf, dtype=np.float32),
+                "min": np.full(data.shape, np.inf, dtype=np.float32),
+                "n_valid": np.zeros(data.shape, dtype=np.int32),
+                "n_overloaded": np.zeros(data.shape, dtype=np.int32),
+            }
+        elif data.shape != acc["sum"].shape:
+            raise ValueError(f"Frame {n_frames} is {data.shape}, not {acc['sum'].shape}")
+        acc["sum"] += values
+        acc["max"] = np.where(valid, np.maximum(acc["max"], values), acc["max"])
+        acc["min"] = np.where(valid, np.minimum(acc["min"], values), acc["min"])
+        acc["n_valid"] += valid
+        acc["n_overloaded"] += overloaded
+        n_frames += 1
+    if acc is None:
+        raise ValueError("No frames to sample")
+    return PixelSums(n_frames=n_frames, **acc)
+
+
+def defpix_frames(first: int, last: int, n: int = DEFPIX_FRAMES) -> list[int]:
+    """Return *n* frames spread evenly over ``first``…``last`` (all if fewer).
+
+    :param first: First frame.
+    :param last: Last frame.
+    :param n: Frames wanted.
+    :returns: Frame numbers, ascending, both ends included.
+    """
+    total = last - first + 1
+    if total <= 0 or n <= 0:
+        return []
+    if n >= total:
+        return list(range(first, last + 1))
+    picks: list[int] = []
+    for k in range(n):
+        # C++ std::lround: halves away from zero.
+        f = first + int(math.floor(k * (total - 1) / (n - 1) + 0.5))
+        if not picks or picks[-1] != f:
+            picks.append(f)
+    return picks
+
+
+def _cpp_median(values: np.ndarray) -> float:
+    """``std::nth_element`` at ``size / 2``: the upper median; 0 if empty."""
+    if values.size == 0:
+        return 0.0
+    k = values.size // 2
+    return float(np.partition(values, k)[k])
+
+
+def _cpp_percentile(values: np.ndarray, p: float) -> float:
+    """ProcessingLab's ``percentile``: linear, ``v[lo] + f × (v[hi] − v[lo])``.
+
+    ``numpy.percentile`` interpolates from the upper value above the midpoint,
+    which can differ in the last bit.
+    """
+    v = np.sort(values)
+    pos = p / 100.0 * (v.size - 1)
+    lo = int(math.floor(pos))
+    hi = min(lo + 1, v.size - 1)
+    return float(v[lo] + (pos - lo) * (v[hi] - v[lo]))
+
+
+def _sequential_mean(values: np.ndarray) -> float:
+    """Mean with a left-to-right double sum, as ProcessingLab's loops."""
+    return float(np.cumsum(values, dtype=np.float64)[-1] / values.size)
+
+
+def _reflect(i: np.ndarray, n: int) -> np.ndarray:
+    """SciPy's ``reflect`` boundary index (d c b a | a b c d | d c b a)."""
+    if n == 1:
+        return np.zeros_like(i)
+    period = 2 * n
+    i = np.mod(i, period)
+    return np.where(i < n, i, period - i - 1)
+
+
+def _block_view(image: np.ndarray, size: int, fill: float) -> np.ndarray:
+    """Pad *image* to whole blocks with *fill* and view it as ``(bh, size, bw, size)``."""
+    h, w = image.shape
+    padded = np.full((-(-h // size) * size, -(-w // size) * size), fill, dtype=image.dtype)
+    padded[:h, :w] = image
+    return padded.reshape(padded.shape[0] // size, size, padded.shape[1] // size, size)
+
+
+def _block_sums(blocks: np.ndarray) -> np.ndarray:
+    """Sum each block of a ``(bh, size, bw, size)`` view in row-major order, in double.
+
+    The same order as ProcessingLab's loops (NumPy's pairwise ``sum`` can
+    differ in the last bit, which flips exact ties).
+    """
+    _, size, _, _ = blocks.shape
+    total = np.zeros((blocks.shape[0], blocks.shape[2]))
+    for r in range(size):
+        for c in range(size):
+            total += blocks[:, r, :, c]
     return total
 
 
-def background_level(image: np.ndarray) -> float:
-    """Return the mean counts per pixel, ignoring the brightest 1% (spots).
+def find_beam_halo(
+    counts: np.ndarray,
+    usable: np.ndarray,
+    shaded: np.ndarray,
+    beam_col: float,
+    beam_row: float,
+    row_scale: float = 1.0,
+) -> tuple[np.ndarray, float]:
+    """Find the beam halo (ProcessingLab ``find_beam_halo``).
 
-    Taken on every 7th pixel in each direction, which is plenty and keeps it
-    fast on 16M-pixel frames.
+    Bin the counts until the smoothing kernel holds :data:`HALO_KERNEL_COUNTS`,
+    smooth (NaN-aware Gaussian), and take each ring's normal level as the
+    median of its unshaded bins, or the lowest such median within
+    :data:`HALO_WINDOW_PX` further out. Halo bins are above :data:`HALO_FACTOR`
+    × that level with an excess over :data:`HALO_SIGNIFICANCE` σ, in
+    4-connected regions within :data:`HALO_BEAM_PX` of the beam or
+    :data:`HALO_REACH_PX` of a shaded bin.
 
-    :param image: Float image, NaN where invalid.
-    :returns: Mean of the valid sampled pixels at or below their 99th percentile.
+    :param counts: Spot-free background counts summed over the sampled
+        frames; < 0 if unknown.
+    :param usable: Pixels holding a usable value.
+    :param shaded: Shaded pixels.
+    :param beam_col: Beam position along the fast axis (pixels).
+    :param beam_row: Beam position along the slow axis (pixels).
+    :param row_scale: Slow pixel size over fast pixel size.
+    :returns: ``(halo, radius_px)``: halo pixels, and the farthest of those in
+        regions at the beam (0 if none).
     """
-    sample = image[::7, ::7]
-    sample = sample[np.isfinite(sample)]
-    if sample.size == 0:
-        return 0.0
-    return float(sample[sample <= np.percentile(sample, 99)].mean())
+    height, width = counts.shape
+    ok = usable & (counts >= 0)
+    empty = np.zeros(counts.shape, dtype=bool)
+    if not ok.any():
+        return empty, 0.0
+    level = _sequential_mean(counts[ok])
+    sigma = HALO_SMOOTH_PX
+    needed = math.sqrt(HALO_KERNEL_COUNTS / (4.0 * math.pi * max(level, 1e-9)))
+    size = 1 if needed <= sigma else min(HALO_MAX_BIN_PX, math.ceil(needed))
+    kernel_px = 4.0 * math.pi * max(sigma, float(size)) ** 2
 
-
-def frame_groups(
-    read_frame: Callable[[int], np.ndarray],
-    n_frames: int,
-    starts: Iterable[int],
-    *,
-    target: float = GROUP_TARGET_COUNTS,
-    max_frames: int = GROUP_MAX_FRAMES,
-) -> list[np.ndarray]:
-    """Sum runs of consecutive frames into groups with enough counts.
-
-    Each group starts at one of *starts* and adds frames until its
-    :func:`background_level` reaches *target*, *max_frames* frames, or the
-    sweep ends.
-
-    :param read_frame: Returns the raw frame at a 0-based index.
-    :param n_frames: Number of frames in the sweep.
-    :param starts: First frame of each group.
-    :param target: Mean counts per pixel to stop at.
-    :param max_frames: Most frames in one group.
-    :returns: One summed image per group (NaN where invalid).
-    """
-    groups = []
-    for start in starts:
-        total: np.ndarray | None = None
-        for index in range(start, min(start + max_frames, n_frames)):
-            frame = sum_frames([read_frame(index)])
-            total = frame if total is None else total + frame
-            if background_level(total) >= target:
-                break
-        if total is not None:
-            groups.append(total)
-    return groups
-
-
-def bin_image(image: np.ndarray, size: int) -> np.ndarray:
-    """Average *image* over ``size`` × ``size`` bins, ignoring NaN pixels.
-
-    :param image: Float image, NaN where invalid.
-    :param size: Bin edge (pixels).
-    :returns: Binned image; NaN where under half a bin is valid.
-    """
-    if size <= 1:
-        return image
-    h, w = image.shape
-    padded = np.full((-(-h // size) * size, -(-w // size) * size), np.nan)
-    padded[:h, :w] = image
-    blocks = padded.reshape(padded.shape[0] // size, size, padded.shape[1] // size, size)
-    count = np.isfinite(blocks).sum(axis=(1, 3))
+    blocks = _block_view(np.where(ok, counts, 0.0).astype(np.float64), size, 0.0)
+    n_ok = _block_view(ok, size, False).sum(axis=(1, 3))
+    n_shaded = _block_view(shaded, size, False).sum(axis=(1, 3))
     with np.errstate(invalid="ignore", divide="ignore"):
-        mean = np.nansum(blocks, axis=(1, 3)) / count
-    mean[count < size * size / 2] = np.nan
-    return mean
-
-
-def _smooth(image: np.ndarray, sigma: float = SMOOTH_SIGMA_PX) -> np.ndarray:
-    """Gaussian-smooth *image*, ignoring NaN pixels (normalised convolution)."""
-    valid = np.isfinite(image)
-    num = ndimage.gaussian_filter(np.where(valid, image, 0.0), sigma)
-    den = ndimage.gaussian_filter(valid.astype(np.float64), sigma)
+        img = np.where(2 * n_ok >= size * size, _block_sums(blocks) / n_ok, np.nan)
+    shadow = 2 * n_shaded > size * size
+    valid = np.isfinite(img)
+    s = max(1.0, sigma / size)
+    num = ndimage.gaussian_filter(np.where(valid, img, 0.0), s)
+    den = ndimage.gaussian_filter(valid.astype(np.float64), s)
     with np.errstate(invalid="ignore", divide="ignore"):
-        out = num / den
-    out[~valid] = np.nan
-    return out
+        img = np.where(valid, num / den, np.nan)
 
-
-def ring_level(
-    image: np.ndarray,
-    radius: np.ndarray,
-    percentile: float,
-    *,
-    window: int,
-    use: np.ndarray | None = None,
-    reduce: str = "max",
-) -> np.ndarray:
-    """Return each pixel's ring level: a percentile of its 1-pixel ring.
-
-    Each ring's level is then the maximum (or minimum) over it and the rings
-    up to *window* further out, so rings filled by the shadow (or the halo)
-    take their level from clearer rings outside.
-
-    :param image: Smoothed image, NaN where invalid.
-    :param radius: Distance of each pixel from the beam (pixels).
-    :param percentile: Percentile of each ring's pixels.
-    :param window: Rings further out that also count (pixels).
-    :param use: Pixels to include (default: every valid pixel).
-    :param reduce: ``"max"`` or ``"min"`` over the window.
-    :returns: Level per pixel (NaN where no ring data).
-    """
+    bh, bw = img.shape
+    by, bx = np.indices((bh, bw))
+    dc = bx * size + 0.5 * (size - 1) - beam_col
+    dr = (by * size + 0.5 * (size - 1) - beam_row) * row_scale
+    radius = np.hypot(dc, dr) / size
     ring = radius.astype(np.int64)
-    valid = np.isfinite(image) if use is None else np.isfinite(image) & use
     n_rings = int(ring.max()) + 1
-    level = np.full(n_rings, np.nan)
-    order = np.argsort(ring[valid], kind="stable")
-    values = image[valid][order]
-    bounds = np.searchsorted(ring[valid][order], np.arange(n_rings + 1))
-    for r in range(n_rings):
-        chunk = values[bounds[r]: bounds[r + 1]]
-        if chunk.size:
-            level[r] = np.percentile(chunk, percentile)
-    # Running extreme over a window of rings further out.
-    if reduce == "max":
-        filled = np.nan_to_num(level, nan=-np.inf)
-        windowed = ndimage.maximum_filter1d(filled, size=window + 1, origin=-(window // 2))
-    else:
-        filled = np.nan_to_num(level, nan=np.inf)
-        windowed = ndimage.minimum_filter1d(filled, size=window + 1, origin=-(window // 2))
-    windowed[~np.isfinite(windowed)] = np.nan
-    return windowed[ring]
+    ring_median = np.full(n_rings, np.inf)
+    use = np.isfinite(img) & ~shadow
+    for k in np.unique(ring[use]):
+        ring_median[k] = _cpp_percentile(img[use & (ring == k)], 50.0)
+    window = max(2, HALO_WINDOW_PX // size)
+    lo = window // 2 - (window + 1) // 2
+    ks = np.arange(n_rings)[:, None] + lo + np.arange(window + 1)[None, :]
+    normal = ring_median[_reflect(ks, n_rings)].min(axis=1)
+    normal[~np.isfinite(normal)] = np.nan
+    nl = normal[ring]
 
-
-def lit_level(image: np.ndarray, radius: np.ndarray, window: int = LIT_WINDOW_PX) -> np.ndarray:
-    """Return each pixel's lit level: the :data:`LIT_PERCENTILE` of its ring.
-
-    The largest level over the ring and those up to *window* further out.
-
-    :param image: Smoothed image, NaN where invalid.
-    :param radius: Distance of each pixel from the beam (pixels).
-    :param window: Rings further out that also count (pixels).
-    :returns: Lit level per pixel (NaN where no ring data).
-    """
-    return ring_level(image, radius, LIT_PERCENTILE, window=window, reduce="max")
-
-
-def find_halo(
-    image: np.ndarray,
-    radius: np.ndarray,
-    shadow: np.ndarray,
-    *,
-    kernel_px: float,
-    window: int,
-    reach: int,
-    beam_disc: np.ndarray,
-) -> np.ndarray:
-    """Return the halo: bright regions joined to the shadow or the beam.
-
-    A ring's normal level is the median of its unshadowed pixels, taking the
-    smallest over the window further out (rings near the beam are halo). A
-    pixel is halo above :data:`HALO_FACTOR` × that level when its excess in the
-    smoothing kernel exceeds :data:`HALO_SIGNIFICANCE` σ. ProcessingLab's
-    ``find_beam_halo`` (DEFPIX) is the same test.
-
-    :param image: Binned, smoothed counts, NaN where invalid.
-    :param radius: Distance of each bin from the beam (bins).
-    :param shadow: Shadowed bins.
-    :param kernel_px: Pixels in the smoothing kernel (its 2σ disc).
-    :param window: Rings further out that set a ring's normal level.
-    :param reach: Bins from the shadow a halo region may start.
-    :param beam_disc: Bins near enough the beam to anchor a halo region.
-    :returns: Halo bins.
-    """
-    valid = np.isfinite(image)
-    normal = ring_level(image, radius, 50.0, window=window, use=~shadow, reduce="min")
     with np.errstate(invalid="ignore"):
-        excess = (image - normal) * kernel_px
-        noise = np.sqrt(np.maximum(normal, 0.0) * kernel_px)
+        excess = (img - nl) * kernel_px
+        noise = np.sqrt(np.maximum(nl, 0.0) * kernel_px)
         bright = (
-            valid & ~shadow & (image > HALO_FACTOR * normal)
+            np.isfinite(img) & np.isfinite(nl) & ~shadow
+            & (img > HALO_FACTOR * nl)
             & (excess > HALO_SIGNIFICANCE * np.maximum(noise, 1.0))
         )
     labels, n = ndimage.label(bright)
     if n == 0:
-        return bright
-    anchor = ndimage.binary_dilation(shadow, iterations=reach) | beam_disc
-    ids = np.unique(labels[anchor & bright])
-    return np.isin(labels, ids[ids > 0])
+        return empty, 0.0
+    reach = max(2, math.ceil(HALO_REACH_PX / size))
+    near_shadow = ndimage.binary_dilation(shadow, iterations=reach) if shadow.any() else shadow
+    at_beam_ids = np.unique(labels[bright & (radius <= max(1.5, HALO_BEAM_PX / size))])
+    by_shadow_ids = np.unique(labels[bright & near_shadow])
+    keep = np.zeros(n + 1, dtype=np.uint8)
+    keep[by_shadow_ids] = 1
+    keep[at_beam_ids] = 2
+    keep[0] = 0
+    bin_keep = keep[labels]
+
+    rows = np.minimum(np.arange(height) // size, bh - 1)
+    cols = np.minimum(np.arange(width) // size, bw - 1)
+    pixel_keep = bin_keep[np.ix_(rows, cols)]
+    halo = usable & (pixel_keep > 0)
+    radius_px = 0.0
+    at_beam = usable & (pixel_keep == 2)
+    if at_beam.any():
+        rr, cc = np.nonzero(at_beam)
+        radius_px = float(np.hypot(cc - beam_col, (rr - beam_row) * row_scale).max())
+    return halo, radius_px
 
 
-def bin_size(level: float) -> int:
-    """Return the bin edge that gives the smoothing kernel enough counts.
+def classify_pixels(
+    sums: PixelSums,
+    beam_col: float,
+    beam_row: float,
+    *,
+    row_scale: float = 1.0,
+    find_defects: bool = True,
+) -> tuple[np.ndarray, int, float]:
+    """Classify every pixel as ProcessingLab's ``run_defpix`` does.
 
-    Smoothing with σ = :data:`SMOOTH_SIGMA_PX` already averages a 2σ disc, so
-    bins smaller than σ add nothing; above that the kernel is one bin wide.
+    No ``UNTRUSTED`` regions or excluded resolution ranges (the viewer has
+    none).
 
-    :param level: Mean counts per pixel of the combined image.
-    :returns: Bin edge in pixels, 1 when no binning is needed.
+    :param sums: Statistics over the sampled frames.
+    :param beam_col: Beam position along the fast axis (pixels).
+    :param beam_row: Beam position along the slow axis (pixels).
+    :param row_scale: Slow pixel size over fast pixel size.
+    :param find_defects: Look for defective and hot pixels (PROCESS skips
+        them when the sampled frames span under 5°).
+    :returns: ``(status, block_px, halo_radius_px)``: PixelStatus per pixel,
+        the shadow block edge (0 if not run) and the halo's radius.
     """
-    needed = math.sqrt(TARGET_KERNEL_COUNTS / (4.0 * math.pi * max(level, 1e-9)))
-    if needed <= SMOOTH_SIGMA_PX:
-        return 1
-    return int(min(MAX_BIN_PX, math.ceil(needed)))
+    nf = sums.n_frames
+    h, w = sums.sum.shape
+    n_valid, n_over = sums.n_valid, sums.n_overloaded
+    background = sums.background()
+    status = np.full((h, w), TRUSTED, dtype=np.uint8)
+    status[(n_valid == 0) & (n_over == 0)] = DETECTOR_MASKED
+    detect = nf >= MIN_DETECT_FRAMES
+    # Overloaded in every sampled frame: a gap or dead pixel at the saturation
+    # value (16-bit Eiger gaps read 65535), rejected even without the search.
+    if detect:
+        status[(status == TRUSTED) & (n_over == nf)] = DEFECTIVE
+    if find_defects and detect:
+        defective = (status == TRUSTED) & (n_over >= 2) & ((2 * n_over >= nf) | (sums.max < HOT_MIN_COUNTS))
+        status[defective] = DEFECTIVE
+    status[(status == TRUSTED) & (n_valid == 0)] = DETECTOR_MASKED  # overloaded throughout
+    if not detect:
+        return status, 0, 0.0
+
+    usable = (status == TRUSTED) & (n_valid >= 2)
+    if not usable.any():
+        return status, 0, 0.0
+    mean_b = _sequential_mean(background[usable])
+    s = int(np.clip(math.ceil(math.sqrt(SHADOW_MIN_COUNTS / max(mean_b * nf, 1e-6))), MIN_BLOCK_PX, MAX_BLOCK_PX))
+
+    rr, cc = np.indices((h, w))
+    radius_px = np.hypot(cc - beam_col, (rr - beam_row) * row_scale)
+    n_rings = int(math.hypot(w, h) / s) + 2
+    ring_px = np.minimum((radius_px / s).astype(np.int64), n_rings - 1)
+    ring_n = np.bincount(ring_px[usable], minlength=n_rings)
+    ring_sum = np.bincount(ring_px[usable], weights=background[usable], minlength=n_rings)
+    ring_mean = np.where(ring_n > 0, ring_sum / np.maximum(ring_n, 1), 0.0)
+
+    if find_defects:
+        hot = (
+            (status == TRUSTED) & (n_valid == nf)
+            & (sums.min >= np.maximum(HOT_MIN_COUNTS, HOT_FACTOR * ring_mean[ring_px]))
+        )
+        status[hot] = HOT
+
+    # Shadow: each block's mean background, pixels clipped at 10× their ring.
+    bh, bw = -(-h // s), -(-w // s)
+    by, bx = np.indices((bh, bw))
+    centre_r = np.minimum(by * s + s // 2, h - 1)
+    centre_c = np.minimum(bx * s + s // 2, w - 1)
+    block_ring = np.minimum(
+        (np.hypot(centre_c - beam_col, (centre_r - beam_row) * row_scale) / s).astype(np.int64), n_rings - 1
+    )
+    cap = 10.0 * ring_mean[block_ring] + 2.0
+    use = (status == TRUSTED) & (n_valid >= 2)
+    clipped = np.minimum(
+        _block_view(np.where(use, background, 0.0).astype(np.float64), s, 0.0), cap[:, None, :, None]
+    )
+    n_block = _block_view(use, s, False).sum(axis=(1, 3))
+    judged = 2 * n_block >= s * s
+    with np.errstate(invalid="ignore", divide="ignore"):
+        value = np.where(judged, _block_sums(clipped) / np.maximum(n_block, 1), 0.0)
+
+    ring_median = np.zeros(n_rings)
+    for k in np.unique(block_ring[judged]):
+        ring_median[k] = _cpp_median(value[judged & (block_ring == k)])
+    reach = max(1, SHADED_RING_REACH_PX // s)
+    ks = np.minimum(np.arange(n_rings)[:, None] + np.arange(reach + 1)[None, :], n_rings - 1)
+    outer = ring_median[ks].max(axis=1)
+    expected = np.where(10000.0 * ring_median < VALUE_RANGE_LOW * outer, outer, ring_median)
+    e = expected[block_ring]
+    with np.errstate(invalid="ignore", divide="ignore"):
+        ratio = 10000.0 * value / e
+    shaded_block = (
+        judged & (e > 0) & (e * nf * n_block >= SHADOW_MIN_COUNTS)
+        & ((ratio < VALUE_RANGE_LOW) | (ratio > VALUE_RANGE_HIGH))
+    )
+    shaded_px = np.repeat(np.repeat(shaded_block, s, axis=0), s, axis=1)[:h, :w]
+    status[shaded_px & (status == TRUSTED)] = SHADED
+
+    # Halo on the counts summed over the sampled frames (background × (n − 1)).
+    usable = (status == TRUSTED) & (n_valid >= 2)
+    counts = np.where(
+        usable & (background >= 0), background * (n_valid - 1).astype(np.float32), np.float32(-1.0)
+    ).astype(np.float32)
+    halo, halo_radius = find_beam_halo(counts, usable, status == SHADED, beam_col, beam_row, row_scale)
+    status[halo & (status == TRUSTED)] = HALO
+    return status, s, halo_radius
 
 
 def detect_beamstop(
     frames: Sequence[np.ndarray],
     beam_x: float,
     beam_y: float,
+    *,
+    saturation: float | None = None,
+    row_scale: float = 1.0,
+    find_defects: bool = True,
 ) -> Beamstop | None:
-    """Detect the beamstop shadow, and the beam halo past it, at the beam centre.
+    """Return DEFPIX's shaded and halo pixels for *frames*.
 
-    :param frames: One or more raw frames, or summed frame groups from
-        :func:`frame_groups` (more remove more spots).
-    :param beam_x: Beam centre x (pixels).
-    :param beam_y: Beam centre y (pixels).
-    :returns: The shadow and halo, or ``None`` if neither is at the beam.
+    :param frames: The sampled frames, e.g. :data:`DEFPIX_FRAMES` picked by
+        :func:`defpix_frames`; at least :data:`MIN_DETECT_FRAMES`.
+    :param beam_x: Beam position along the fast axis (pixels), as
+        ProcessingLab's ``BEAM`` x ÷ pixel size.
+    :param beam_y: Beam position along the slow axis (pixels).
+    :param saturation: The detector's overload level, or ``None`` if unknown.
+    :param row_scale: Slow pixel size over fast pixel size.
+    :param find_defects: Exclude defective and hot pixels from the test.
+    :returns: The shaded and halo pixels, or ``None`` if there are neither.
     """
-    combined = median_frame(frames)
-    full_shape = combined.shape
-    level = float(np.nanmean(combined)) if np.isfinite(combined).any() else 0.0
-    size = bin_size(level)
-    kernel_px = 4.0 * math.pi * max(SMOOTH_SIGMA_PX, size) ** 2
-    image = _smooth(bin_image(combined, size), max(1.0, SMOOTH_SIGMA_PX / size))
-    valid = np.isfinite(image)
-    yy, xx = np.indices(image.shape)
-    # Bin centres, in binned pixels.
-    radius = np.hypot(xx + 0.5 - beam_x / size, yy + 0.5 - beam_y / size)
-    lit = lit_level(image, radius, max(2, LIT_WINDOW_PX // size))
-    with np.errstate(invalid="ignore"):
-        shadow = valid & (image < SHADOW_FRACTION * lit) & (lit * kernel_px >= MIN_LIT_COUNTS)
-    shadow = ndimage.binary_opening(shadow, iterations=2 if size < 4 else 1)
-    # Gap pixels next to shadow join it, so a band crossing a gap stays whole.
-    near = ndimage.binary_dilation(shadow, iterations=max(2, math.ceil(GAP_BRIDGE_PX / size)))
-    labels, n = ndimage.label(shadow | (~valid & near))
-    beam_disc = radius <= max(1.5, BEAM_SEARCH_PX / size)
-    ids = np.unique(labels[beam_disc & shadow]) if n else np.array([], dtype=int)
-    ids = ids[ids > 0]
-    # Holes (pixels invalid in some frame, the attenuated direct beam) are
-    # part of the shadow too.
-    mask = ndimage.binary_fill_holes(np.isin(labels, ids) & valid) if ids.size else np.zeros_like(valid)
-    halo = find_halo(
-        image, radius, mask,
-        kernel_px=kernel_px,
-        window=max(2, LIT_WINDOW_PX // size),
-        reach=max(2, math.ceil(HALO_REACH_PX / size)),
-        beam_disc=beam_disc,
-    )
-    mask &= ~halo
-    if not mask.any() and not halo.any():
-        logger.info("Beamstop: no shadow or halo within %.0f px of the beam", BEAM_SEARCH_PX)
+    sums = pixel_sums(frames, saturation)
+    if sums.n_frames < MIN_DETECT_FRAMES:
+        logger.info("Beamstop: DEFPIX needs %d frames, got %d", MIN_DETECT_FRAMES, sums.n_frames)
         return None
-    if size > 1:
-        mask, halo = (
-            np.repeat(np.repeat(m, size, axis=0), size, axis=1)[: full_shape[0], : full_shape[1]]
-            for m in (mask, halo)
-        )
+    status, block_px, halo_radius = classify_pixels(
+        sums, beam_x, beam_y, row_scale=row_scale, find_defects=find_defects
+    )
+    mask = status == SHADED
+    halo = status == HALO
+    if not mask.any() and not halo.any():
+        logger.info("Beamstop: no shaded or halo pixels")
+        return None
     ys, xs = np.nonzero(mask | halo)
     found = Beamstop(
         mask=mask,
@@ -388,34 +504,30 @@ def detect_beamstop(
         bbox=(int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())),
         halo=halo,
         n_halo=int(halo.sum()),
+        block_px=block_px,
+        halo_radius_px=halo_radius,
     )
     x0, y0, x1, y1 = found.bbox
     logger.info(
-        "Beamstop: %d shadowed and %d halo pixels, x %d–%d, y %d–%d (%.2f counts/pixel, %d px bins)",
-        found.n_pixels, found.n_halo, x0, x1, y0, y1, level, size,
+        "Beamstop: %d shaded and %d halo pixels, x %d–%d, y %d–%d (%d frames, %d px blocks)",
+        found.n_pixels, found.n_halo, x0, x1, y0, y1, sums.n_frames, block_px,
     )
     return found
 
 
-def sibling_frames(path: Path, count: int = 5) -> list[Path]:
-    """Return up to *count* evenly spaced images from *path*'s sweep.
+def sweep_files(path: Path) -> list[Path]:
+    """Return the images of *path*'s sweep, in frame order.
 
     The sweep is the files sharing *path*'s name with a different frame
-    number (the last run of digits in the stem); *path* is always included.
+    number (the last run of digits in the stem), *path* included.
 
     :param path: One image of the sweep.
-    :param count: Maximum number of images to return.
-    :returns: Image paths, *path* first.
+    :returns: Image paths sorted by name.
     """
     match = re.search(r"(\d+)(?!.*\d)", path.stem)
-    if match is None or count <= 1:
+    if match is None:
         return [path]
     prefix, suffix = path.stem[: match.start()], path.stem[match.end():]
     pattern = re.compile(rf"{re.escape(prefix)}\d{{{len(match.group(1))}}}{re.escape(suffix)}")
-    others = sorted(
-        p for p in path.parent.glob(f"{prefix}*{path.suffix}") if p != path and pattern.fullmatch(p.stem)
-    )
-    if not others:
-        return [path]
-    picks = np.linspace(len(others) - 1, 0, num=min(count - 1, len(others)))
-    return [path, *(others[int(round(i))] for i in picks)]
+    files = sorted(p for p in path.parent.glob(f"{prefix}*{path.suffix}") if pattern.fullmatch(p.stem))
+    return files or [path]
