@@ -9,13 +9,9 @@ batch (image) number. Here:
   spot-finding wedge. ``NSTRONG`` is drawn with ``NEWALD`` (reflections
   predicted on the image) for reference. The table is printed once per
   refinement block; the last row for each image wins.
-* **R_meas by image** is computed from Aimless's scaled, unmerged output
-  (``OUTPUT MERGED UNMERGED`` → ``aimless_unmerged.mtz``): each observation
-  contributes ``√(n/(n−1))·|I − ⟨I⟩|`` (⟨I⟩ over its *n* symmetry
-  equivalents in the whole data set, *n* ≥ 2) to its image, divided by the
-  image's ``Σ I``. Blocks of images pool numerators and denominators, so a
-  block's value is exactly the R_meas of its observations. Aimless itself
-  reports only Rmerge per batch.
+* **R_meas by image** comes from ProcessingLab's ``IMAGE_RMEAS`` table in
+  ``process.log``. It is computed from all integrated observations before
+  scaling, grouped by image.
 """
 
 from __future__ import annotations
@@ -36,6 +32,8 @@ logger = logging.getLogger(__name__)
 BLOCK_IMAGES = 25
 
 _IMAGE_HEADER = re.compile(r"^\s*IMAGE\s+IER\s+")
+_IMAGE_RMEAS_HEADER = re.compile(r"^\s*IMAGE_RMEAS\s+columns=(.+)$")
+_IMAGE_RMEAS_END = "IMAGE_RMEAS_END"
 
 
 @dataclass(frozen=True)
@@ -94,7 +92,156 @@ def read_image_table(path: Path) -> ImageTable | None:
 
 
 @dataclass(frozen=True)
+class ImageRmeasTable:
+    """ProcessingLab's R_meas statistics for each integrated image."""
+
+    images: np.ndarray
+    n_accepted: np.ndarray
+    n_compared: np.ndarray
+    rmeas_pct: np.ndarray
+
+
+def read_image_rmeas(path: Path) -> ImageRmeasTable | None:
+    """Read the ``IMAGE_RMEAS`` table from a ProcessingLab ``process.log``."""
+    try:
+        lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    rows: dict[int, tuple[int, int, float]] = {}
+    in_table = False
+    for line in lines:
+        header = _IMAGE_RMEAS_HEADER.match(line)
+        if header:
+            in_table = header.group(1).strip() == "image,n_accepted,n_compared,rmeas_pct"
+            continue
+        if not in_table:
+            continue
+        if line.strip() == _IMAGE_RMEAS_END:
+            in_table = False
+            continue
+        fields = line.split(",")
+        if len(fields) != 4:
+            continue
+        try:
+            image, accepted, compared = map(int, fields[:3])
+            rmeas = float(fields[3])
+        except ValueError:
+            continue
+        rows[image] = (accepted, compared, rmeas)
+    if not rows:
+        return None
+    images = np.array(sorted(rows), dtype=int)
+    values = [rows[i] for i in images]
+    return ImageRmeasTable(
+        images=images,
+        n_accepted=np.array([row[0] for row in values], dtype=int),
+        n_compared=np.array([row[1] for row in values], dtype=int),
+        rmeas_pct=np.array([row[2] for row in values], dtype=float),
+    )
+
+
+@dataclass(frozen=True)
 class RmeasByImage:
+    """Per-image R_meas contributions from scaled unmerged observations."""
+
+    batches: np.ndarray
+    numerator: np.ndarray
+    denominator: np.ndarray
+    n_obs: np.ndarray
+
+    def __post_init__(self) -> None:
+        arrays = {
+            "batches": np.array(self.batches, copy=True),
+            "numerator": np.array(self.numerator, dtype=float, copy=True),
+            "denominator": np.array(self.denominator, dtype=float, copy=True),
+            "n_obs": np.array(self.n_obs, copy=True),
+        }
+
+        shapes = {a.shape for a in arrays.values()}
+        if len(shapes) != 1:
+            raise ValueError("All arrays must have the same shape")
+
+        batches = arrays["batches"]
+        if batches.ndim != 1:
+            raise ValueError("Arrays must be one-dimensional")
+
+        if not np.issubdtype(batches.dtype, np.integer):
+            raise TypeError("batches must contain integer image numbers")
+
+        if np.any(batches < 1):
+            raise ValueError("Image numbers must be positive and one-based")
+
+        if np.any(np.diff(batches) <= 0):
+            raise ValueError("batches must be strictly increasing")
+
+        for name, array in arrays.items():
+            array.setflags(write=False)
+            object.__setattr__(self, name, array)
+
+    @staticmethod
+    def _ratio(
+        numerator: np.ndarray,
+        denominator: np.ndarray,
+    ) -> np.ndarray:
+        valid = (
+            np.isfinite(numerator)
+            & np.isfinite(denominator)
+            & (denominator > 0)
+        )
+        result = np.full(numerator.shape, np.nan, dtype=float)
+        np.divide(numerator, denominator, out=result, where=valid)
+        return result
+
+    @property
+    def rmeas(self) -> np.ndarray:
+        """R_meas per image; NaN for invalid denominators or inputs."""
+        return self._ratio(self.numerator, self.denominator)
+
+    @property
+    def overall(self) -> float:
+        """Pooled R_meas across all images."""
+        numerator = float(self.numerator.sum())
+        denominator = float(self.denominator.sum())
+
+        if not np.isfinite(numerator) or not np.isfinite(denominator):
+            return float("nan")
+        if denominator <= 0:
+            return float("nan")
+
+        return numerator / denominator
+
+    def blocks(
+        self,
+        size: int = BLOCK_IMAGES,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Pool consecutive one-based image numbers into blocks."""
+        if not isinstance(size, (int, np.integer)) or isinstance(
+            size, (bool, np.bool_)
+        ):
+            raise TypeError("size must be an integer")
+
+        if size <= 0:
+            raise ValueError("size must be positive")
+
+        block_index = (self.batches - 1) // size
+        keys, inverse = np.unique(block_index, return_inverse=True)
+
+        num = np.bincount(
+            inverse, weights=self.numerator, minlength=len(keys)
+        )
+        den = np.bincount(
+            inverse, weights=self.denominator, minlength=len(keys)
+        )
+
+        return (
+            keys * size + 1,
+            keys * size + size,
+            self._ratio(num, den),
+        )
+
+
+@dataclass(frozen=True)
+class RmeasByImageOld:
     """R_meas per image (batch) from scaled unmerged observations."""
 
     #: Batch (image) numbers, ascending.
@@ -242,28 +389,22 @@ class RmeasPerImageCanvas(_Chart):
     """R_meas per image, with blocks of :data:`BLOCK_IMAGES` and the overall value."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__("R_meas by image: scale with Aimless first", parent)
+        super().__init__("R_meas by image: integrate first", parent)
 
-    def show_rmeas(self, result: RmeasByImage, block: int = BLOCK_IMAGES) -> None:
-        """Draw per-image R_meas, its block values and the overall line."""
+    def show_rmeas(self, result: ImageRmeasTable) -> None:
+        """Draw ProcessingLab's per-image R_meas values."""
         self.figure.clear()
         ax = self.figure.subplots()
-        per_image = result.rmeas
-        ax.plot(result.batches, per_image, color="C3", lw=0.6, alpha=0.45, label="per image")
-        first, last, values = result.blocks(block)
-        steps_x = np.column_stack([first - 0.5, last + 0.5]).ravel()
-        ax.plot(steps_x, np.repeat(values, 2), color="C3", lw=2.0, label=f"blocks of {block} images")
-        overall = result.overall
-        ax.axhline(overall, color="0.3", ls="--", lw=1.0, label=f"overall {overall:.3f}")
-        finite = per_image[np.isfinite(per_image)]
-        top = max(np.nanmax(values) if np.isfinite(values).any() else 0.0,
-                  np.percentile(finite, 99) if finite.size else 0.0)
+        per_image = result.rmeas_pct
+        ax.plot(result.images, per_image, color="C3", lw=0.8, label="per image")
+        finite = per_image[np.isfinite(per_image) & (per_image >= 0)]
+        top = np.percentile(finite, 99) if finite.size else 0.0
         ax.set_ylim(0, 1.1 * top if top > 0 else 1.0)
-        ax.set_xlim(result.batches.min() - 0.5, result.batches.max() + 0.5)
-        ax.set_xlabel("image (batch)")
-        ax.set_ylabel("R_meas")
+        ax.set_xlim(result.images.min() - 0.5, result.images.max() + 0.5)
+        ax.set_xlabel("image")
+        ax.set_ylabel("R_meas (%)")
         ax.legend(loc="best", fontsize=7, framealpha=0.6)
-        ax.set_title("R_meas by image (Aimless-scaled, unmerged)", fontsize=9)
+        ax.set_title("R_meas by image (ProcessingLab)", fontsize=9)
         self.draw_idle()
 
 
@@ -289,10 +430,11 @@ class ReportsWidget(QWidget):
         except OSError:
             return (str(path), None)
 
-    def load(self, process_log: Path | None, unmerged_mtz: Path | None, *, anomalous: bool = False) -> None:
-        """Redraw from a run's ``process.log`` and Aimless's unmerged MTZ (either may be ``None``).
+    def load(self, process_log: Path | None, unmerged_mtz: Path | None = None, *, anomalous: bool = False) -> None:
+        """Redraw from a run's ``process.log``.
 
         Files already drawn (same path and modification time) are not re-read.
+        ``unmerged_mtz`` and ``anomalous`` remain accepted for older callers.
         """
         notes: list[str] = []
         key = self._stamp(process_log)
@@ -303,18 +445,11 @@ class ReportsWidget(QWidget):
                 self.spots_chart.clear("Spots per image: integrate first")
             else:
                 self.spots_chart.show_table(table)
-        key = (*self._stamp(unmerged_mtz), anomalous)
-        if key != self._loaded.get("mtz"):
-            self._loaded["mtz"] = key
-            if unmerged_mtz is None or not unmerged_mtz.is_file():
-                self.rmeas_chart.clear("R_meas by image: scale with Aimless first")
-                if unmerged_mtz is not None:
-                    notes.append(f"No {unmerged_mtz.name}: re-run Aimless to write the unmerged data.")
+        if key != self._loaded.get("image_rmeas"):
+            self._loaded["image_rmeas"] = key
+            table = read_image_rmeas(process_log) if process_log else None
+            if table is None:
+                self.rmeas_chart.clear("R_meas by image: integrate first")
             else:
-                try:
-                    result = rmeas_by_image(unmerged_mtz, anomalous=anomalous)
-                    self.rmeas_chart.show_rmeas(result)
-                except (OSError, KeyError, ValueError, RuntimeError) as ex:
-                    logger.warning("R_meas by image failed: %s", ex)
-                    self.rmeas_chart.clear(f"R_meas by image: {ex}")
+                self.rmeas_chart.show_rmeas(table)
         self.note.setText(" ".join(notes))
