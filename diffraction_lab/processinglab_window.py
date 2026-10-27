@@ -70,6 +70,7 @@ from diffraction_lab.jobs.jobs_tab import JobsTab
 from diffraction_lab.jobs.service import SCHEDARRAY_DB_NAME, JobService, use_schedarray
 from diffraction_lab.processing_sweep import Frames, ProcessingSweep
 from diffraction_lab.processinglab_charts import IntegrationChartsWidget, StrategyCanvas
+from diffraction_lab.reports import ReportsWidget, unmerged_path
 from diffraction_lab.processinglab_specs import (
     ProcessingLabSpecs,
     create_button,
@@ -119,6 +120,9 @@ from picoui.widget.helper import create_double_spinbox_from_spec, create_spinbox
 logger = logging.getLogger(__name__)
 
 _SOLUTION_COLUMNS = ("No", "Lattice", "Penalty", "a", "b", "c", "α", "β", "γ", "Metric dev %", "Space groups")
+#: Aimless also writes its scaled, unmerged data (``aimless_unmerged.mtz``),
+#: which the Reports tab's R_meas-by-image chart reads.
+AIMLESS_UNMERGED = "OUTPUT MERGED UNMERGED"
 
 
 def format_pointless(p: PointlessRunResult) -> str:
@@ -229,6 +233,7 @@ class ProcessingLabWindow(ProcessingWindowBase):
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
 
+        self._build_widgets()
         self._build_setup_tab()
         self._build_spots_tab()
         self._build_index_tab()
@@ -237,9 +242,15 @@ class ProcessingLabWindow(ProcessingWindowBase):
         self._build_symmetry_tab()
         self._build_scale_tab()
         self._build_dimple_tab()
+        self._build_reports_tab()
         self._build_jobs_tab()
 
-    def _build_setup_tab(self) -> None:
+    def _build_reports_tab(self) -> None:
+        """Spots per image (integration) and R_meas by image (Aimless), as autoPROC plots them."""
+        self.reports = ReportsWidget(self)
+        self.tabs.addTab(self.reports, "Reports")
+
+    def _build_widgets(self):
         spec = self.specs.setup
         self.image_label = QLabel("(no image loaded)")
         self.image_label.setWordWrap(True)
@@ -247,11 +258,10 @@ class ProcessingLabWindow(ProcessingWindowBase):
         self.sweep_last = create_spinbox_from_spec(spec.frames)
         self.sweep_label = QLabel("")
         self.work_edit = create_text_field(spec.work_folder)
-        browse = create_button(spec.browse)
+
         self.session_label = QLabel("(none yet: created by the first step)")
         self.session_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        new_btn = create_button(spec.new_session)
-        reveal_btn = create_button(spec.reveal)
+
         self.tool_labels = {name: QLabel() for name in ("ProcessingLab", "Pointless", "Aimless")}
         self.pipeline_labels = {}
         for key, text in (("spots", "Find spots (ProcessingLab)"), ("index", "Index (ProcessingLab)"),
@@ -263,6 +273,11 @@ class ProcessingLabWindow(ProcessingWindowBase):
             self.pipeline_labels[key] = (label, text)
         self.run_all_btn = create_button(spec.run_all)
 
+    def _build_setup_tab(self):
+        spec = self.specs.setup
+        browse = create_button(spec.browse)
+        new_btn = create_button(spec.new_session)
+        reveal_btn = create_button(spec.reveal)
         box = build_group("Sweep and session", _form(
             ("Image", self.image_label),
             ("Frames to process", _row(self.sweep_first, QLabel("to"), self.sweep_last)),
@@ -717,7 +732,7 @@ class ProcessingLabWindow(ProcessingWindowBase):
         def task(emit: Callable[[str], None]) -> AimlessRunResult:
             emit(f"Aimless on {hklin}")
             return run_aimless(hklin, work / "aimless.mtz", work_dir=work, resolution_high=dmin,
-                               anomalous=anomalous, job_service=service)
+                               anomalous=anomalous, custom=AIMLESS_UNMERGED, job_service=service)
 
         self._start("Running Aimless…", task, self._aimless_done)
 
@@ -755,7 +770,8 @@ class ProcessingLabWindow(ProcessingWindowBase):
                 if find_aimless() is not None:
                     emit("=== Aimless")
                     s.aimless = run_aimless(s.pointless.hklout, out / "aimless.mtz", work_dir=out,
-                                            resolution_high=dmin, anomalous=anomalous, job_service=service)
+                                            resolution_high=dmin, anomalous=anomalous,
+                                            custom=AIMLESS_UNMERGED, job_service=service)
             return s
 
         self._start("Running all steps…", task, self._all_done, charts=True)
@@ -826,6 +842,11 @@ class ProcessingLabWindow(ProcessingWindowBase):
             self.integrate_label.setText("Not integrated yet.")
         self.pointless_label.setText(format_pointless(s.pointless) if s.pointless else "")
         self.aimless_label.setText(format_aimless(s.aimless.summary) if s.aimless else "")
+        self.reports.load(
+            s.integrated.directory / "process.log" if s.integrated is not None else None,
+            unmerged_path(s.aimless.hklout) if s.aimless is not None else None,
+            anomalous=self.aimless_anomalous.isChecked(),
+        )
 
         marks = {
             "spots": (s.spots, f"{n_spots} spots" if n_spots is not None else ""),
@@ -1106,6 +1127,9 @@ class ProcessingLabWindow(ProcessingWindowBase):
         """Pick up a newly opened image when the window is shown again."""
         super().showEvent(event)
         self.refresh_dataset()
+
+    def _build_setup_tab_old(self):
+        pass
 
 
 def _form(*rows: tuple[str, QWidget | QLayout] | QWidget | QLayout) -> QFormLayout:

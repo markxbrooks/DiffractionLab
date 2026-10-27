@@ -866,8 +866,8 @@ class ProcessingWizard(ProcessingWindowBase):
         layout.addWidget(self.pipeline_tabs, stretch=1)
 
         # ----- Tab: Setup -----
-        setup_page = QWidget()
-        setup_layout = QVBoxLayout(setup_page)
+        self.setup_page = QWidget()
+        setup_layout = QVBoxLayout(self.setup_page)
 
         self.dials_input_box = QGroupBox("HDF5 input & work directory")
         dials_input_form = QFormLayout(self.dials_input_box)
@@ -1053,7 +1053,7 @@ class ProcessingWizard(ProcessingWindowBase):
         self.backend_label.setWordWrap(True)
         setup_layout.addWidget(self.backend_label)
         setup_layout.addStretch(1)
-        self.pipeline_tabs.addTab(setup_page, "1. Setup")
+        self.pipeline_tabs.addTab(self.setup_page, "1. Setup")
 
         # ----- Tab: Find spots -----
         spots_page = QWidget()
