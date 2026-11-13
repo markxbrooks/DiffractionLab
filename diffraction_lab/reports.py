@@ -240,46 +240,6 @@ class RmeasByImage:
         )
 
 
-@dataclass(frozen=True)
-class RmeasByImageOld:
-    """R_meas per image (batch) from scaled unmerged observations."""
-
-    #: Batch (image) numbers, ascending.
-    batches: np.ndarray
-    #: ``Σ √(n/(n−1))·|I − ⟨I⟩|`` per batch.
-    numerator: np.ndarray
-    #: ``Σ I`` per batch (observations with *n* ≥ 2).
-    denominator: np.ndarray
-    #: Observations per batch with *n* ≥ 2.
-    n_obs: np.ndarray
-
-    @property
-    def rmeas(self) -> np.ndarray:
-        """R_meas per batch (NaN where ``Σ I`` ≤ 0)."""
-        with np.errstate(invalid="ignore", divide="ignore"):
-            return np.where(self.denominator > 0, self.numerator / self.denominator, np.nan)
-
-    @property
-    def overall(self) -> float:
-        """R_meas over every batch."""
-        den = float(self.denominator.sum())
-        return float(self.numerator.sum()) / den if den > 0 else float("nan")
-
-    def blocks(self, size: int = BLOCK_IMAGES) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Pool consecutive images into blocks of *size* (images 1–size, …).
-
-        :param size: Images per block.
-        :returns: ``(first, last, rmeas)`` per block that holds observations.
-        """
-        index = (self.batches - 1) // size
-        keys = np.unique(index)
-        num = np.array([self.numerator[index == k].sum() for k in keys])
-        den = np.array([self.denominator[index == k].sum() for k in keys])
-        with np.errstate(invalid="ignore", divide="ignore"):
-            values = np.where(den > 0, num / den, np.nan)
-        return keys * size + 1, keys * size + size, values
-
-
 def rmeas_from_observations(
     hkl: np.ndarray,
     isym: np.ndarray,
